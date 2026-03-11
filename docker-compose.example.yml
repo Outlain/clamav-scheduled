@@ -1,0 +1,32 @@
+services:
+  clamav-scheduled:
+    image: ghcr.io/YOUR_GITHUB_USERNAME/clamav-scheduled:latest
+    container_name: clamav-scheduled
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+      MAXTHREADS: 13
+      SCAN_PATHS: /downloads
+      FULL_SCAN_PARALLEL_JOBS: 8
+      CHANGED_SCAN_PARALLEL_JOBS: 8
+      FULL_PROGRESS_STEPS: 100
+      CHANGED_PROGRESS_STEPS: 25
+      CHANGED_SCAN_INTERVAL: 3600
+      FULL_SCAN_INTERVAL: 259200
+      PATH_CHECK_TIMEOUT: 10
+      PATH_ENUMERATION_TIMEOUT: 300
+      PATH_UNAVAILABLE_RETRY_INTERVAL: 300
+      DOWNLOADS_DIR: /downloads
+      QUARANTINE_DIR: /downloads/quarantine
+      STATE_DIR: /state
+      SCANLOG: /var/log/clamav/clamav_scheduled.log
+      FORCE_FULL_FLAG: /downloads/.clamav_force_full_scan.flag
+    volumes:
+      - ./downloads:/downloads:rw
+      # Mount additional scan roots and append them to SCAN_PATHS as needed.
+      # - ./archive:/archive:rw
+      - ./defs:/var/lib/clamav:rw
+      - ./logs:/var/log/clamav:rw
+      - ./state:/state:rw
+    security_opt:
+      - no-new-privileges:true

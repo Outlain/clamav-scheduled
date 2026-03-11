@@ -1,0 +1,10 @@
+.git
+.github
+README.md
+.env
+.env.*
+downloads
+state
+defs
+logs
+quarantine

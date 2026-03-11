@@ -1,0 +1,9 @@
+*.log
+.env
+.env.*
+downloads/
+state/
+defs/
+logs/
+quarantine/
+__pycache__/
