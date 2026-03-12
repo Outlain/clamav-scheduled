@@ -11,12 +11,14 @@ services:
       CHANGED_SCAN_PARALLEL_JOBS: 8
       FULL_PROGRESS_STEPS: 100
       CHANGED_PROGRESS_STEPS: 25
-      CHANGED_SCAN_INTERVAL: 3600
-      FULL_SCAN_INTERVAL: 259200
+      CHANGED_SCAN_DAYS: mon,tue,wed,thu,fri,sat,sun
+      CHANGED_SCAN_TIMES: 01:00,13:00
+      FULL_SCAN_DAYS: sun
+      FULL_SCAN_TIMES: 03:30
+      SCAN_FAILURE_RETRY_INTERVAL: 300
       PATH_CHECK_TIMEOUT: 10
       PATH_ENUMERATION_TIMEOUT: 300
       PATH_UNAVAILABLE_RETRY_INTERVAL: 300
-      DOWNLOADS_DIR: /downloads
       QUARANTINE_DIR: /downloads/quarantine
       STATE_DIR: /state
       SCANLOG: /var/log/clamav/clamav_scheduled.log

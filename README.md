@@ -5,8 +5,8 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 ## Features
 
 - Runs `clamd` inside the container
-- Configurable full-scan cadence using `FULL_SCAN_INTERVAL`
-- Configurable changed-files scan cadence using `CHANGED_SCAN_INTERVAL`
+- Time-based full-scan schedule using `FULL_SCAN_DAYS` and `FULL_SCAN_TIMES`
+- Time-based changed-files schedule using `CHANGED_SCAN_DAYS` and `CHANGED_SCAN_TIMES`
 - Incremental changed-files scans between full scans
 - Supports multiple scan roots with `SCAN_PATHS`
 - Quarantines infected files
@@ -31,8 +31,11 @@ This container is designed for trusted local/server use. Review paths, permissio
 - `CHANGED_PROGRESS_STEPS` - target number of progress updates used to derive changed-scan chunk sizes
 - `FULL_CHUNK_SIZE` - optional fixed full-scan chunk size override; `0` keeps dynamic chunk sizing
 - `CHANGED_CHUNK_SIZE` - optional fixed changed-scan chunk size override; `0` keeps dynamic chunk sizing
-- `FULL_SCAN_INTERVAL` - seconds between full scans
-- `CHANGED_SCAN_INTERVAL` - seconds between changed-file scans
+- `FULL_SCAN_DAYS` - comma-separated days for scheduled full scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`
+- `FULL_SCAN_TIMES` - comma-separated `HH:MM` times for scheduled full scans in the container timezone
+- `CHANGED_SCAN_DAYS` - comma-separated days for scheduled changed-file scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`
+- `CHANGED_SCAN_TIMES` - comma-separated `HH:MM` times for scheduled changed-file scans in the container timezone
+- `SCAN_FAILURE_RETRY_INTERVAL` - seconds to wait before retrying a scheduled scan after a non-path-related failure
 - `PATH_CHECK_TIMEOUT` - seconds allowed for each scan-root health check before treating the path as unavailable
 - `PATH_ENUMERATION_TIMEOUT` - seconds allowed for each per-root `find` pass before treating the path as unavailable
 - `PATH_UNAVAILABLE_RETRY_INTERVAL` - seconds to wait before retrying when a configured scan root is unavailable
@@ -48,7 +51,23 @@ Legacy compatibility:
 - `DOWNLOADS_DIR` still provides the default for `SCAN_PATHS`
 - `PARALLEL_JOBS` still provides the default for both `FULL_SCAN_PARALLEL_JOBS` and `CHANGED_SCAN_PARALLEL_JOBS`
 - `CHUNK_SIZE` still provides the default for both `FULL_CHUNK_SIZE` and `CHANGED_CHUNK_SIZE`
-- `SCAN_INTERVAL` still provides the default for `CHANGED_SCAN_INTERVAL`
+- `CHANGED_SCAN_INTERVAL` still works as a fallback if `CHANGED_SCAN_TIMES` is not set
+- `FULL_SCAN_INTERVAL` still works as a fallback if `FULL_SCAN_TIMES` is not set
+
+## Scan schedules
+
+Use `*_SCAN_DAYS` plus `*_SCAN_TIMES` to define when scans should run.
+
+Examples:
+
+- `CHANGED_SCAN_DAYS=mon,tue,wed,thu,fri`
+- `CHANGED_SCAN_TIMES=09:00,13:00,17:00`
+- `FULL_SCAN_DAYS=sun`
+- `FULL_SCAN_TIMES=03:30`
+
+Schedules are evaluated in the container timezone from `TZ`.
+
+If a scheduled scan fails, the scheduler retries after `SCAN_FAILURE_RETRY_INTERVAL` until the scan succeeds or a newer scheduled slot becomes due.
 
 ## Multiple scan roots
 

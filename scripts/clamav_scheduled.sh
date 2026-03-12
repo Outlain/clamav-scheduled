@@ -12,9 +12,14 @@ set -eu
 : "${CHANGED_CHUNK_SIZE:=${CHUNK_SIZE}}"
 : "${FULL_PROGRESS_STEPS:=100}"
 : "${CHANGED_PROGRESS_STEPS:=25}"
+: "${CHANGED_SCAN_TIMES:=}"
+: "${CHANGED_SCAN_DAYS:=*}"
+: "${FULL_SCAN_TIMES:=}"
+: "${FULL_SCAN_DAYS:=sun}"
 : "${SCAN_INTERVAL:=3600}"
 : "${CHANGED_SCAN_INTERVAL:=${SCAN_INTERVAL}}"
 : "${FULL_SCAN_INTERVAL:=259200}"
+: "${SCAN_FAILURE_RETRY_INTERVAL:=300}"
 : "${DOWNLOADS_DIR:=/downloads}"
 : "${SCAN_PATHS:=${DOWNLOADS_DIR}}"
 : "${STATE_DIR:=/state}"
@@ -44,6 +49,84 @@ get_primary_scan_path() {
   printf '%s\n' "${1:-}"
 }
 
+normalize_schedule_times() {
+  RAW_VALUE=$(printf '%s' "$1" | tr -d ' ')
+
+  [ -n "$RAW_VALUE" ] || {
+    printf '\n'
+    return 0
+  }
+
+  NORMALIZED=""
+  OLD_IFS="$IFS"
+  IFS=','
+  set -- $RAW_VALUE
+  IFS="$OLD_IFS"
+
+  for TOKEN do
+    case "$TOKEN" in
+      [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9])
+        case ",$NORMALIZED," in
+          *,"$TOKEN",*)
+            ;;
+          *)
+            NORMALIZED="${NORMALIZED}${NORMALIZED:+,}${TOKEN}"
+            ;;
+        esac
+        ;;
+      *)
+        echo "[ERROR] Invalid schedule time '$TOKEN'. Use HH:MM in 24-hour format." >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  printf '%s\n' "$NORMALIZED"
+}
+
+normalize_schedule_days() {
+  RAW_VALUE=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+
+  [ -n "$RAW_VALUE" ] || RAW_VALUE='*'
+
+  if [ "$RAW_VALUE" = "*" ]; then
+    printf '1,2,3,4,5,6,7\n'
+    return 0
+  fi
+
+  NORMALIZED=""
+  OLD_IFS="$IFS"
+  IFS=','
+  set -- $RAW_VALUE
+  IFS="$OLD_IFS"
+
+  for TOKEN do
+    case "$TOKEN" in
+      1|mon|monday) DAY_NUMBER=1 ;;
+      2|tue|tues|tuesday) DAY_NUMBER=2 ;;
+      3|wed|weds|wednesday) DAY_NUMBER=3 ;;
+      4|thu|thur|thurs|thursday) DAY_NUMBER=4 ;;
+      5|fri|friday) DAY_NUMBER=5 ;;
+      6|sat|saturday) DAY_NUMBER=6 ;;
+      7|sun|sunday) DAY_NUMBER=7 ;;
+      *)
+        echo "[ERROR] Invalid schedule day '$TOKEN'. Use mon-sun, monday-sunday, 1-7, or *." >&2
+        exit 1
+        ;;
+    esac
+
+    case ",$NORMALIZED," in
+      *,"$DAY_NUMBER",*)
+        ;;
+      *)
+        NORMALIZED="${NORMALIZED}${NORMALIZED:+,}${DAY_NUMBER}"
+        ;;
+    esac
+  done
+
+  printf '%s\n' "$NORMALIZED"
+}
+
 : "${SCANLOG:=/var/log/clamav/clamav_scheduled.log}"
 
 validate_scan_paths_config "$SCAN_PATHS"
@@ -56,10 +139,27 @@ PRIMARY_SCAN_PATH=$(get_primary_scan_path "$SCAN_PATHS")
 : "${QUARANTINE_DIR:=${PRIMARY_SCAN_PATH}/quarantine}"
 : "${FORCE_FULL_FLAG:=${PRIMARY_SCAN_PATH}/.clamav_force_full_scan.flag}"
 
+CHANGED_SCAN_TIMES=$(normalize_schedule_times "$CHANGED_SCAN_TIMES")
+CHANGED_SCAN_DAYS=$(normalize_schedule_days "$CHANGED_SCAN_DAYS")
+FULL_SCAN_TIMES=$(normalize_schedule_times "$FULL_SCAN_TIMES")
+FULL_SCAN_DAYS=$(normalize_schedule_days "$FULL_SCAN_DAYS")
+
+if [ -n "$CHANGED_SCAN_TIMES" ]; then
+  CHANGED_SCHEDULE_MODE="time"
+else
+  CHANGED_SCHEDULE_MODE="interval"
+fi
+
+if [ -n "$FULL_SCAN_TIMES" ]; then
+  FULL_SCHEDULE_MODE="time"
+else
+  FULL_SCHEDULE_MODE="interval"
+fi
+
 mkdir -p "$QUARANTINE_DIR" "$STATE_DIR" "$TMP_DIR" /var/log/clamav /var/lib/clamav
 
 echo "=== Starting scheduled ClamAV scanner ===" | tee -a "$SCANLOG"
-echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_INTERVAL=$CHANGED_SCAN_INTERVAL FULL_SCAN_INTERVAL=$FULL_SCAN_INTERVAL SCAN_PATHS=$SCAN_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER" | tee -a "$SCANLOG"
+echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCHEDULE_MODE=$CHANGED_SCHEDULE_MODE CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES CHANGED_SCAN_INTERVAL=$CHANGED_SCAN_INTERVAL FULL_SCHEDULE_MODE=$FULL_SCHEDULE_MODE FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES FULL_SCAN_INTERVAL=$FULL_SCAN_INTERVAL SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL SCAN_PATHS=$SCAN_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER" | tee -a "$SCANLOG"
 
 validate_positive_int() {
   NAME="$1"
@@ -97,6 +197,7 @@ validate_positive_int "FULL_PROGRESS_STEPS" "$FULL_PROGRESS_STEPS"
 validate_positive_int "CHANGED_PROGRESS_STEPS" "$CHANGED_PROGRESS_STEPS"
 validate_positive_int "CHANGED_SCAN_INTERVAL" "$CHANGED_SCAN_INTERVAL"
 validate_positive_int "FULL_SCAN_INTERVAL" "$FULL_SCAN_INTERVAL"
+validate_positive_int "SCAN_FAILURE_RETRY_INTERVAL" "$SCAN_FAILURE_RETRY_INTERVAL"
 validate_positive_int "PATH_CHECK_TIMEOUT" "$PATH_CHECK_TIMEOUT"
 validate_positive_int "PATH_ENUMERATION_TIMEOUT" "$PATH_ENUMERATION_TIMEOUT"
 validate_positive_int "PATH_UNAVAILABLE_RETRY_INTERVAL" "$PATH_UNAVAILABLE_RETRY_INTERVAL"
@@ -164,6 +265,8 @@ fi
 
 LAST_CHANGED="$STATE_DIR/last_changed_scan_epoch"
 LAST_FULL="$STATE_DIR/last_full_scan_epoch"
+NEXT_CHANGED_RETRY_EPOCH=0
+NEXT_FULL_RETRY_EPOCH=0
 
 run_clamdscan_chunk() {
   CHUNK_FILE="$1"
@@ -215,6 +318,172 @@ get_chunk_size() {
   [ "$CHUNK_SIZE_AUTO" -lt 1 ] && CHUNK_SIZE_AUTO=1
   [ "$CHUNK_SIZE_AUTO" -lt "$PARALLEL_JOBS" ] && CHUNK_SIZE_AUTO="$PARALLEL_JOBS"
   echo "$CHUNK_SIZE_AUTO"
+}
+
+schedule_day_allowed() {
+  WEEKDAY="$1"
+  SCHEDULE_DAYS="$2"
+
+  case ",$SCHEDULE_DAYS," in
+    *,"$WEEKDAY",*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+get_relative_date() {
+  BASE_DATE="$1"
+  DAY_OFFSET="$2"
+
+  if [ "$DAY_OFFSET" -ge 0 ]; then
+    date -d "$BASE_DATE +${DAY_OFFSET} day" +%F
+  else
+    date -d "$BASE_DATE ${DAY_OFFSET} day" +%F
+  fi
+}
+
+get_last_scheduled_epoch() {
+  SCHEDULE_DAYS="$1"
+  SCHEDULE_TIMES="$2"
+  REFERENCE_EPOCH="$3"
+  BASE_DATE=$(date -d "@$REFERENCE_EPOCH" +%F)
+  LAST_EPOCH=0
+  DAY_OFFSET=0
+
+  while [ "$DAY_OFFSET" -ge -7 ]; do
+    CANDIDATE_DATE=$(get_relative_date "$BASE_DATE" "$DAY_OFFSET")
+    WEEKDAY=$(date -d "$CANDIDATE_DATE" +%u)
+
+    if schedule_day_allowed "$WEEKDAY" "$SCHEDULE_DAYS"; then
+      OLD_IFS="$IFS"
+      IFS=','
+      set -- $SCHEDULE_TIMES
+      IFS="$OLD_IFS"
+
+      for TIME_VALUE do
+        CANDIDATE_EPOCH=$(date -d "$CANDIDATE_DATE ${TIME_VALUE}:00" +%s)
+        if [ "$CANDIDATE_EPOCH" -le "$REFERENCE_EPOCH" ] && [ "$CANDIDATE_EPOCH" -gt "$LAST_EPOCH" ]; then
+          LAST_EPOCH="$CANDIDATE_EPOCH"
+        fi
+      done
+    fi
+
+    DAY_OFFSET=$((DAY_OFFSET - 1))
+  done
+
+  printf '%s\n' "$LAST_EPOCH"
+}
+
+get_next_scheduled_epoch() {
+  SCHEDULE_DAYS="$1"
+  SCHEDULE_TIMES="$2"
+  REFERENCE_EPOCH="$3"
+  BASE_DATE=$(date -d "@$REFERENCE_EPOCH" +%F)
+  NEXT_EPOCH=0
+  DAY_OFFSET=0
+
+  while [ "$DAY_OFFSET" -le 7 ]; do
+    CANDIDATE_DATE=$(get_relative_date "$BASE_DATE" "$DAY_OFFSET")
+    WEEKDAY=$(date -d "$CANDIDATE_DATE" +%u)
+
+    if schedule_day_allowed "$WEEKDAY" "$SCHEDULE_DAYS"; then
+      OLD_IFS="$IFS"
+      IFS=','
+      set -- $SCHEDULE_TIMES
+      IFS="$OLD_IFS"
+
+      for TIME_VALUE do
+        CANDIDATE_EPOCH=$(date -d "$CANDIDATE_DATE ${TIME_VALUE}:00" +%s)
+        if [ "$CANDIDATE_EPOCH" -gt "$REFERENCE_EPOCH" ] && { [ "$NEXT_EPOCH" -eq 0 ] || [ "$CANDIDATE_EPOCH" -lt "$NEXT_EPOCH" ]; }; then
+          NEXT_EPOCH="$CANDIDATE_EPOCH"
+        fi
+      done
+    fi
+
+    DAY_OFFSET=$((DAY_OFFSET + 1))
+  done
+
+  printf '%s\n' "$NEXT_EPOCH"
+}
+
+evaluate_changed_trigger() {
+  CHANGED_DUE=0
+
+  if [ "$CHANGED_SCHEDULE_MODE" = "time" ]; then
+    CHANGED_LAST_SLOT_EPOCH=$(get_last_scheduled_epoch "$CHANGED_SCAN_DAYS" "$CHANGED_SCAN_TIMES" "$NOW")
+    CHANGED_NEXT_SLOT_EPOCH=$(get_next_scheduled_epoch "$CHANGED_SCAN_DAYS" "$CHANGED_SCAN_TIMES" "$NOW")
+
+    if [ "$NEXT_CHANGED_RETRY_EPOCH" -gt "$NOW" ]; then
+      CHANGED_NEXT_WAKE_EPOCH="$NEXT_CHANGED_RETRY_EPOCH"
+    elif [ "$CHANGED_LAST_SLOT_EPOCH" -gt "$LAST_CHANGED_EPOCH" ]; then
+      CHANGED_DUE=1
+      CHANGED_NEXT_WAKE_EPOCH="$NOW"
+    else
+      CHANGED_NEXT_WAKE_EPOCH="$CHANGED_NEXT_SLOT_EPOCH"
+    fi
+  else
+    CHANGED_DUE_EPOCH=$((LAST_CHANGED_EPOCH + CHANGED_SCAN_INTERVAL))
+
+    if [ "$NEXT_CHANGED_RETRY_EPOCH" -gt "$NOW" ]; then
+      CHANGED_NEXT_WAKE_EPOCH="$NEXT_CHANGED_RETRY_EPOCH"
+    elif [ "$NOW" -ge "$CHANGED_DUE_EPOCH" ]; then
+      CHANGED_DUE=1
+      CHANGED_NEXT_WAKE_EPOCH="$NOW"
+    else
+      CHANGED_NEXT_WAKE_EPOCH="$CHANGED_DUE_EPOCH"
+    fi
+  fi
+}
+
+evaluate_full_trigger() {
+  FULL_DUE=0
+
+  if [ "$FORCE" -eq 1 ]; then
+    if [ "$NEXT_FULL_RETRY_EPOCH" -gt "$NOW" ]; then
+      FULL_NEXT_WAKE_EPOCH="$NEXT_FULL_RETRY_EPOCH"
+    else
+      FULL_DUE=1
+      FULL_NEXT_WAKE_EPOCH="$NOW"
+    fi
+    return 0
+  fi
+
+  if [ "$FULL_SCHEDULE_MODE" = "time" ]; then
+    FULL_LAST_SLOT_EPOCH=$(get_last_scheduled_epoch "$FULL_SCAN_DAYS" "$FULL_SCAN_TIMES" "$NOW")
+    FULL_NEXT_SLOT_EPOCH=$(get_next_scheduled_epoch "$FULL_SCAN_DAYS" "$FULL_SCAN_TIMES" "$NOW")
+
+    if [ "$NEXT_FULL_RETRY_EPOCH" -gt "$NOW" ]; then
+      FULL_NEXT_WAKE_EPOCH="$NEXT_FULL_RETRY_EPOCH"
+    elif [ "$FULL_LAST_SLOT_EPOCH" -gt "$LAST_FULL_EPOCH" ]; then
+      FULL_DUE=1
+      FULL_NEXT_WAKE_EPOCH="$NOW"
+    else
+      FULL_NEXT_WAKE_EPOCH="$FULL_NEXT_SLOT_EPOCH"
+    fi
+  else
+    FULL_DUE_EPOCH=$((LAST_FULL_EPOCH + FULL_SCAN_INTERVAL))
+
+    if [ "$NEXT_FULL_RETRY_EPOCH" -gt "$NOW" ]; then
+      FULL_NEXT_WAKE_EPOCH="$NEXT_FULL_RETRY_EPOCH"
+    elif [ "$NOW" -ge "$FULL_DUE_EPOCH" ]; then
+      FULL_DUE=1
+      FULL_NEXT_WAKE_EPOCH="$NOW"
+    else
+      FULL_NEXT_WAKE_EPOCH="$FULL_DUE_EPOCH"
+    fi
+  fi
+}
+
+sleep_until_epoch() {
+  TARGET_EPOCH="$1"
+  CURRENT_EPOCH="$2"
+
+  SLEEP_SECONDS=$((TARGET_EPOCH - CURRENT_EPOCH))
+  [ "$SLEEP_SECONDS" -lt 1 ] && SLEEP_SECONDS=1
+  echo "Sleeping ${SLEEP_SECONDS}s..." | tee -a "$SCANLOG"
+  sleep "$SLEEP_SECONDS"
 }
 
 check_scan_path_health() {
@@ -376,18 +645,17 @@ while true; do
   fi
 
   NOW=$(date +%s)
-  [ -f "$LAST_CHANGED" ] || echo $((NOW - CHANGED_SCAN_INTERVAL)) > "$LAST_CHANGED"
+  if [ ! -f "$LAST_CHANGED" ]; then
+    if [ "$CHANGED_SCHEDULE_MODE" = "time" ]; then
+      echo 0 > "$LAST_CHANGED"
+    else
+      echo $((NOW - CHANGED_SCAN_INTERVAL)) > "$LAST_CHANGED"
+    fi
+  fi
   [ -f "$LAST_FULL" ] || echo 0 > "$LAST_FULL"
 
   LAST_CHANGED_EPOCH=$(cat "$LAST_CHANGED" 2>/dev/null || echo 0)
   LAST_FULL_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
-  NEXT_CHANGED_SCHEDULE_EPOCH="$LAST_CHANGED_EPOCH"
-  NEXT_FULL_SCHEDULE_EPOCH="$LAST_FULL_EPOCH"
-
-  DO_CHANGED=0
-  if [ $((NOW - LAST_CHANGED_EPOCH)) -ge "$CHANGED_SCAN_INTERVAL" ]; then
-    DO_CHANGED=1
-  fi
 
   FORCE=0
   if [ -f "$FORCE_FULL_FLAG" ]; then
@@ -395,32 +663,23 @@ while true; do
     echo "[FORCE] Full scan requested (flag detected): $FORCE_FULL_FLAG" | tee -a "$SCANLOG"
   fi
 
-  DO_FULL=0
-  if [ "$FORCE" -eq 1 ] || [ $((NOW - LAST_FULL_EPOCH)) -ge "$FULL_SCAN_INTERVAL" ]; then
-    DO_FULL=1
-  fi
+  evaluate_changed_trigger
+  evaluate_full_trigger
 
   CYCLE_ABORT=0
-  CYCLE_SLEEP_OVERRIDE=""
 
-  if [ "$DO_FULL" -eq 0 ] && [ "$DO_CHANGED" -eq 0 ]; then
-    UNTIL_CHANGED=$((CHANGED_SCAN_INTERVAL - (NOW - LAST_CHANGED_EPOCH)))
-    UNTIL_FULL=$((FULL_SCAN_INTERVAL - (NOW - LAST_FULL_EPOCH)))
-    [ "$UNTIL_CHANGED" -lt 1 ] && UNTIL_CHANGED=1
-    [ "$UNTIL_FULL" -lt 1 ] && UNTIL_FULL=1
-
-    SLEEP="$UNTIL_CHANGED"
-    [ "$UNTIL_FULL" -lt "$SLEEP" ] && SLEEP="$UNTIL_FULL"
-
+  if [ "$FULL_DUE" -eq 0 ] && [ "$CHANGED_DUE" -eq 0 ]; then
+    NEXT_WAKE_EPOCH="$CHANGED_NEXT_WAKE_EPOCH"
+    [ "$FULL_NEXT_WAKE_EPOCH" -lt "$NEXT_WAKE_EPOCH" ] && NEXT_WAKE_EPOCH="$FULL_NEXT_WAKE_EPOCH"
     release_lock
-    echo "=== $(date) No scans due. Sleeping ${SLEEP}s... ===" | tee -a "$SCANLOG"
-    sleep "$SLEEP"
+    echo "=== $(date) No scans due. Next wake at $(date -d "@$NEXT_WAKE_EPOCH") ===" | tee -a "$SCANLOG"
+    sleep_until_epoch "$NEXT_WAKE_EPOCH" "$NOW"
     continue
   fi
 
-  echo "=== $(date) Scan cycle starting (full_due=${DO_FULL} changed_due=${DO_CHANGED}) ===" | tee -a "$SCANLOG"
+  echo "=== $(date) Scan cycle starting (full_due=${FULL_DUE} changed_due=${CHANGED_DUE}) ===" | tee -a "$SCANLOG"
 
-  if [ "$DO_FULL" -eq 1 ]; then
+  if [ "$FULL_DUE" -eq 1 ]; then
     echo "=== FULL SCAN starting ===" | tee -a "$SCANLOG"
 
     FULL_LIST="$TMP_DIR/full_list.txt"
@@ -428,7 +687,7 @@ while true; do
     if build_scan_list "FULL" "$FULL_LIST" 0; then
       if run_scan_list "$FULL_LIST" "FULL" "$FULL_SCAN_PARALLEL_JOBS" "$FULL_CHUNK_SIZE" "$FULL_PROGRESS_STEPS"; then
         date +%s > "$LAST_FULL" || true
-        NEXT_FULL_SCHEDULE_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo "$NOW")
+        NEXT_FULL_RETRY_EPOCH=0
         echo "=== FULL SCAN finished ===" | tee -a "$SCANLOG"
 
         if [ "$FORCE" -eq 1 ] && [ -f "$FORCE_FULL_FLAG" ]; then
@@ -436,25 +695,25 @@ while true; do
           echo "[FORCE] Flag consumed (deleted): $FORCE_FULL_FLAG" | tee -a "$SCANLOG"
         fi
       else
-        NEXT_FULL_SCHEDULE_EPOCH=$(date +%s)
-        echo "[WARN] Full scan did not complete. Will retry next cycle." | tee -a "$SCANLOG"
+        NEXT_FULL_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
+        echo "[WARN] Full scan did not complete. Retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
       fi
     else
       RC=$?
-      NEXT_FULL_SCHEDULE_EPOCH=$(date +%s)
 
       if [ "$RC" -eq 2 ]; then
         CYCLE_ABORT=1
-        CYCLE_SLEEP_OVERRIDE="$PATH_UNAVAILABLE_RETRY_INTERVAL"
-        NEXT_CHANGED_SCHEDULE_EPOCH="$NEXT_FULL_SCHEDULE_EPOCH"
+        NEXT_FULL_RETRY_EPOCH=$(( $(date +%s) + PATH_UNAVAILABLE_RETRY_INTERVAL ))
+        NEXT_CHANGED_RETRY_EPOCH="$NEXT_FULL_RETRY_EPOCH"
         echo "[WARN] Full scan paused because a scan path is unavailable. Retrying in ${PATH_UNAVAILABLE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
       else
-        echo "[WARN] Full scan file-list build failed. Will retry next cycle." | tee -a "$SCANLOG"
+        NEXT_FULL_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
+        echo "[WARN] Full scan file-list build failed. Retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
       fi
     fi
   fi
 
-  if [ "$DO_CHANGED" -eq 1 ] && [ "$CYCLE_ABORT" -eq 0 ]; then
+  if [ "$CHANGED_DUE" -eq 1 ] && [ "$CYCLE_ABORT" -eq 0 ]; then
     echo "=== CHANGED-FILES scan starting ===" | tee -a "$SCANLOG"
     CHANGED_LIST="$TMP_DIR/changed_list.txt"
     CHANGED_SCAN_CUTOFF=$(date +%s)
@@ -462,22 +721,22 @@ while true; do
     if build_scan_list "CHANGED" "$CHANGED_LIST" "$LAST_CHANGED_EPOCH"; then
       if run_scan_list "$CHANGED_LIST" "CHANGED" "$CHANGED_SCAN_PARALLEL_JOBS" "$CHANGED_CHUNK_SIZE" "$CHANGED_PROGRESS_STEPS"; then
         echo "$CHANGED_SCAN_CUTOFF" > "$LAST_CHANGED" || true
-        NEXT_CHANGED_SCHEDULE_EPOCH="$CHANGED_SCAN_CUTOFF"
+        NEXT_CHANGED_RETRY_EPOCH=0
       else
-        NEXT_CHANGED_SCHEDULE_EPOCH=$(date +%s)
-        echo "[WARN] Changed-files scan did not complete. Keeping previous changed-scan checkpoint." | tee -a "$SCANLOG"
+        NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
+        echo "[WARN] Changed-files scan did not complete. Keeping previous changed-scan checkpoint and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
       fi
     else
       RC=$?
-      NEXT_CHANGED_SCHEDULE_EPOCH=$(date +%s)
 
       if [ "$RC" -eq 2 ]; then
         CYCLE_ABORT=1
-        CYCLE_SLEEP_OVERRIDE="$PATH_UNAVAILABLE_RETRY_INTERVAL"
-        NEXT_FULL_SCHEDULE_EPOCH="$NEXT_CHANGED_SCHEDULE_EPOCH"
+        NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + PATH_UNAVAILABLE_RETRY_INTERVAL ))
+        NEXT_FULL_RETRY_EPOCH="$NEXT_CHANGED_RETRY_EPOCH"
         echo "[WARN] Changed-files scan paused because a scan path is unavailable. Retrying in ${PATH_UNAVAILABLE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
       else
-        echo "[WARN] Changed-files scan file-list build failed. Keeping previous changed-scan checkpoint." | tee -a "$SCANLOG"
+        NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
+        echo "[WARN] Changed-files scan file-list build failed. Keeping previous changed-scan checkpoint and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
       fi
     fi
   fi
@@ -491,15 +750,14 @@ while true; do
   release_lock
 
   END=$(date +%s)
-  UNTIL_CHANGED=$((CHANGED_SCAN_INTERVAL - (END - NEXT_CHANGED_SCHEDULE_EPOCH)))
-  UNTIL_FULL=$((FULL_SCAN_INTERVAL - (END - NEXT_FULL_SCHEDULE_EPOCH)))
-  [ "$UNTIL_CHANGED" -lt 1 ] && UNTIL_CHANGED=1
-  [ "$UNTIL_FULL" -lt 1 ] && UNTIL_FULL=1
-  SLEEP="$UNTIL_CHANGED"
-  [ "$UNTIL_FULL" -lt "$SLEEP" ] && SLEEP="$UNTIL_FULL"
-  if [ -n "$CYCLE_SLEEP_OVERRIDE" ] && [ "$CYCLE_SLEEP_OVERRIDE" -lt "$SLEEP" ]; then
-    SLEEP="$CYCLE_SLEEP_OVERRIDE"
-  fi
-  echo "Sleeping ${SLEEP}s..." | tee -a "$SCANLOG"
-  sleep "$SLEEP"
+  NOW="$END"
+  LAST_CHANGED_EPOCH=$(cat "$LAST_CHANGED" 2>/dev/null || echo 0)
+  LAST_FULL_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
+  FORCE=0
+  [ -f "$FORCE_FULL_FLAG" ] && FORCE=1
+  evaluate_changed_trigger
+  evaluate_full_trigger
+  NEXT_WAKE_EPOCH="$CHANGED_NEXT_WAKE_EPOCH"
+  [ "$FULL_NEXT_WAKE_EPOCH" -lt "$NEXT_WAKE_EPOCH" ] && NEXT_WAKE_EPOCH="$FULL_NEXT_WAKE_EPOCH"
+  sleep_until_epoch "$NEXT_WAKE_EPOCH" "$END"
 done
