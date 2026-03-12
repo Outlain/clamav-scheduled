@@ -24,39 +24,30 @@ This container is designed for trusted local/server use. Review paths, permissio
 
 - `TZ` - timezone
 - `MAXTHREADS` - clamd thread count
-- `SCAN_PATHS` - colon-separated scan roots inside the container; every listed path must be mounted and healthy before a scan runs
+- `SCAN_PATHS` - colon-separated scan roots inside the container; defaults to `/downloads` and every listed path must be mounted and healthy before a scan runs
 - `FULL_SCAN_PARALLEL_JOBS` - parallel `clamdscan` processes for full scans
 - `CHANGED_SCAN_PARALLEL_JOBS` - parallel `clamdscan` processes for changed-file scans
 - `FULL_PROGRESS_STEPS` - target number of progress updates used to derive full-scan chunk sizes
 - `CHANGED_PROGRESS_STEPS` - target number of progress updates used to derive changed-scan chunk sizes
 - `FULL_CHUNK_SIZE` - optional fixed full-scan chunk size override; `0` keeps dynamic chunk sizing
 - `CHANGED_CHUNK_SIZE` - optional fixed changed-scan chunk size override; `0` keeps dynamic chunk sizing
-- `FULL_SCAN_DAYS` - comma-separated days for scheduled full scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`
-- `FULL_SCAN_TIMES` - comma-separated `HH:MM` times for scheduled full scans in the container timezone
-- `CHANGED_SCAN_DAYS` - comma-separated days for scheduled changed-file scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`
-- `CHANGED_SCAN_TIMES` - comma-separated `HH:MM` times for scheduled changed-file scans in the container timezone
+- `FULL_SCAN_DAYS` - comma-separated days for scheduled full scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`; defaults to `sun`
+- `FULL_SCAN_TIMES` - required comma-separated `HH:MM` times for scheduled full scans in the container timezone
+- `CHANGED_SCAN_DAYS` - comma-separated days for scheduled changed-file scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`; defaults to `*`
+- `CHANGED_SCAN_TIMES` - required comma-separated `HH:MM` times for scheduled changed-file scans in the container timezone
 - `SCAN_FAILURE_RETRY_INTERVAL` - seconds to wait before retrying a scheduled scan after a non-path-related failure
 - `PATH_CHECK_TIMEOUT` - seconds allowed for each scan-root health check before treating the path as unavailable
 - `PATH_ENUMERATION_TIMEOUT` - seconds allowed for each per-root `find` pass before treating the path as unavailable
 - `PATH_UNAVAILABLE_RETRY_INTERVAL` - seconds to wait before retrying when a configured scan root is unavailable
 - `SCAN_PATH_MARKER` - optional file or directory name expected inside every scan root; use this to detect missing NFS mounts that fall back to an empty local directory
-- `DOWNLOADS_DIR` - legacy single-root default used when `SCAN_PATHS` is not set
 - `QUARANTINE_DIR` - infected file destination
 - `STATE_DIR` - persistent state directory
 - `SCANLOG` - log file path
 - `FORCE_FULL_FLAG` - full-scan trigger flag file path; defaults to the first path in `SCAN_PATHS`
 
-Legacy compatibility:
-
-- `DOWNLOADS_DIR` still provides the default for `SCAN_PATHS`
-- `PARALLEL_JOBS` still provides the default for both `FULL_SCAN_PARALLEL_JOBS` and `CHANGED_SCAN_PARALLEL_JOBS`
-- `CHUNK_SIZE` still provides the default for both `FULL_CHUNK_SIZE` and `CHANGED_CHUNK_SIZE`
-- `CHANGED_SCAN_INTERVAL` still works as a fallback if `CHANGED_SCAN_TIMES` is not set
-- `FULL_SCAN_INTERVAL` still works as a fallback if `FULL_SCAN_TIMES` is not set
-
 ## Scan schedules
 
-Use `*_SCAN_DAYS` plus `*_SCAN_TIMES` to define when scans should run.
+Use `*_SCAN_DAYS` plus `*_SCAN_TIMES` to define when scans should run. `CHANGED_SCAN_TIMES` and `FULL_SCAN_TIMES` are required.
 
 Examples:
 
@@ -68,6 +59,8 @@ Examples:
 Schedules are evaluated in the container timezone from `TZ`.
 
 If a scheduled scan fails, the scheduler retries after `SCAN_FAILURE_RETRY_INTERVAL` until the scan succeeds or a newer scheduled slot becomes due.
+
+Deprecated environment variables such as `DOWNLOADS_DIR`, `PARALLEL_JOBS`, `CHUNK_SIZE`, `SCAN_INTERVAL`, `CHANGED_SCAN_INTERVAL`, and `FULL_SCAN_INTERVAL` are no longer accepted.
 
 ## Multiple scan roots
 
