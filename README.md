@@ -25,6 +25,7 @@ This container is designed for trusted local/server use. Review paths, permissio
 - `TZ` - timezone
 - `MAXTHREADS` - clamd thread count
 - `SCAN_PATHS` - colon-separated scan roots inside the container; defaults to `/downloads` and every listed path must be mounted and healthy before a scan runs
+- `EXCLUDE_PATHS` - optional colon-separated in-container file or directory paths to skip during both full and changed scans
 - `FULL_SCAN_PARALLEL_JOBS` - parallel `clamdscan` processes for full scans
 - `CHANGED_SCAN_PARALLEL_JOBS` - parallel `clamdscan` processes for changed-file scans
 - `FULL_PROGRESS_STEPS` - target number of progress updates used to derive full-scan chunk sizes
@@ -79,6 +80,17 @@ volumes:
 If any configured scan root fails its health check or file enumeration, the current scan cycle is paused and retried after `PATH_UNAVAILABLE_RETRY_INTERVAL`.
 
 For NFS-backed roots, set `SCAN_PATH_MARKER` to the name of a file or directory that must exist in every scan root. That prevents the scanner from quietly treating an empty fallback directory as a healthy mount.
+
+## Excluding paths
+
+Set `EXCLUDE_PATHS` to a colon-separated list of absolute in-container paths you want skipped.
+
+Examples:
+
+- `EXCLUDE_PATHS=/downloads/private:/downloads/tmp`
+- `EXCLUDE_PATHS=/downloads/ignore-me.txt:/archive/large-file.iso`
+
+If an entry points to a directory, everything under that directory is skipped. If an entry points to a specific file, only that file is skipped. Directory entries with a trailing `/` are accepted.
 
 ## Docker Compose
 

@@ -16,6 +16,7 @@ set -eu
 : "${FULL_SCAN_DAYS:=sun}"
 : "${SCAN_FAILURE_RETRY_INTERVAL:=300}"
 : "${SCAN_PATHS:=/downloads}"
+: "${EXCLUDE_PATHS:=}"
 : "${STATE_DIR:=/state}"
 : "${TMP_DIR:=/tmp/clamav}"
 : "${PATH_CHECK_TIMEOUT:=10}"
@@ -43,6 +44,56 @@ validate_scan_paths_config() {
       exit 1
       ;;
   esac
+}
+
+validate_optional_path_list_config() {
+  NAME="$1"
+  VALUE="$2"
+
+  [ -n "$VALUE" ] || return 0
+
+  case "$VALUE" in
+    :*|*::|*:)
+      echo "[ERROR] ${NAME} must be a colon-separated list with no empty entries (got: ${VALUE})" >&2
+      exit 1
+      ;;
+  esac
+}
+
+normalize_absolute_path_list() {
+  NAME="$1"
+  VALUE="$2"
+
+  [ -n "$VALUE" ] || {
+    printf '\n'
+    return 0
+  }
+
+  NORMALIZED=""
+  OLD_IFS="$IFS"
+  IFS=':'
+  set -- $VALUE
+  IFS="$OLD_IFS"
+
+  for PATH_ENTRY do
+    case "$PATH_ENTRY" in
+      /*)
+        ;;
+      *)
+        echo "[ERROR] ${NAME} entries must be absolute paths (got: ${PATH_ENTRY})" >&2
+        exit 1
+        ;;
+    esac
+
+    NORMALIZED_ENTRY="$PATH_ENTRY"
+    while [ "$NORMALIZED_ENTRY" != "/" ] && [ "${NORMALIZED_ENTRY%/}" != "$NORMALIZED_ENTRY" ]; do
+      NORMALIZED_ENTRY=${NORMALIZED_ENTRY%/}
+    done
+
+    NORMALIZED="${NORMALIZED}${NORMALIZED:+:}${NORMALIZED_ENTRY}"
+  done
+
+  printf '%s\n' "$NORMALIZED"
 }
 
 get_primary_scan_path() {
@@ -142,6 +193,8 @@ reject_deprecated_env "CHANGED_SCAN_INTERVAL" "Use CHANGED_SCAN_DAYS and CHANGED
 reject_deprecated_env "FULL_SCAN_INTERVAL" "Use FULL_SCAN_DAYS and FULL_SCAN_TIMES."
 
 validate_scan_paths_config "$SCAN_PATHS"
+validate_optional_path_list_config "EXCLUDE_PATHS" "$EXCLUDE_PATHS"
+EXCLUDE_PATHS=$(normalize_absolute_path_list "EXCLUDE_PATHS" "$EXCLUDE_PATHS")
 PRIMARY_SCAN_PATH=$(get_primary_scan_path "$SCAN_PATHS")
 [ -n "$PRIMARY_SCAN_PATH" ] || {
   echo "[ERROR] Unable to determine a primary scan path from SCAN_PATHS=${SCAN_PATHS}" >&2
@@ -159,7 +212,7 @@ FULL_SCAN_DAYS=$(normalize_schedule_days "$FULL_SCAN_DAYS")
 mkdir -p "$QUARANTINE_DIR" "$STATE_DIR" "$TMP_DIR" /var/log/clamav /var/lib/clamav
 
 echo "=== Starting scheduled ClamAV scanner ===" | tee -a "$SCANLOG"
-echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL SCAN_PATHS=$SCAN_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER" | tee -a "$SCANLOG"
+echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL SCAN_PATHS=$SCAN_PATHS EXCLUDE_PATHS=$EXCLUDE_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER" | tee -a "$SCANLOG"
 
 validate_positive_int() {
   NAME="$1"
@@ -500,23 +553,65 @@ check_scan_path_health() {
   return 1
 }
 
+path_is_excluded() {
+  FILE_PATH="$1"
+  OLD_IFS="$IFS"
+
+  [ -n "$EXCLUDE_PATHS" ] || return 1
+
+  IFS=':'
+  set -- $EXCLUDE_PATHS
+  IFS="$OLD_IFS"
+
+  for EXCLUDED_PATH do
+    case "$FILE_PATH" in
+      "$EXCLUDED_PATH"|"$EXCLUDED_PATH"/*)
+        return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+append_filtered_scan_list() {
+  RAW_LIST_FILE="$1"
+  LIST_FILE="$2"
+
+  while IFS= read -r FILE_PATH || [ -n "$FILE_PATH" ]; do
+    if path_is_excluded "$FILE_PATH"; then
+      continue
+    fi
+
+    printf '%s\n' "$FILE_PATH" >> "$LIST_FILE"
+  done < "$RAW_LIST_FILE"
+}
+
 append_scan_path_list() {
   LABEL="$1"
   SCAN_PATH="$2"
   LIST_FILE="$3"
   REFERENCE_EPOCH="$4"
+  RAW_LIST_FILE="$TMP_DIR/${LABEL}_raw_list.txt"
+
+  : > "$RAW_LIST_FILE"
 
   if [ "$LABEL" = "CHANGED" ]; then
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" -newermt "@${REFERENCE_EPOCH}" >> "$LIST_FILE" 2>>"$SCANLOG"; then
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" -newermt "@${REFERENCE_EPOCH}" > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
+      rm -f "$RAW_LIST_FILE"
       return 0
     fi
   else
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" >> "$LIST_FILE" 2>>"$SCANLOG"; then
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
+      rm -f "$RAW_LIST_FILE"
       return 0
     fi
   fi
 
   RC=$?
+  rm -f "$RAW_LIST_FILE"
   if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
     echo "[WARN] [$LABEL] Timed out while enumerating files under $SCAN_PATH. The mount may be unavailable." | tee -a "$SCANLOG"
     return 2

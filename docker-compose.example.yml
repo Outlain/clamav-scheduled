@@ -7,6 +7,7 @@ services:
       TZ: UTC
       MAXTHREADS: 13
       SCAN_PATHS: /downloads
+      EXCLUDE_PATHS: /downloads/private:/downloads/tmp
       FULL_SCAN_PARALLEL_JOBS: 8
       CHANGED_SCAN_PARALLEL_JOBS: 8
       FULL_PROGRESS_STEPS: 100
