@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ClamAV Scheduled UI</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+    <main class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">ClamAV Scheduled</p>
+          <h1>Scanner Control Room</h1>
+          <p class="hero-copy">
+            Configure schedules, inspect scan health, and force a full scan without editing environment variables.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="force-full-button" class="action-button accent">Force Full Scan</button>
+          <button id="restart-button" class="action-button ghost">Restart Scheduler</button>
+          <button id="toggle-settings-button" class="action-button soft">Settings</button>
+        </div>
+      </header>
+
+      <section class="status-strip">
+        <div class="status-pill">
+          <span id="phase-dot" class="status-dot"></span>
+          <span id="phase-label">Loading UI status...</span>
+        </div>
+        <div class="status-meta">
+          <span id="scheduler-meta">Scheduler: unknown</span>
+          <span id="next-wake-meta">Next wake: unknown</span>
+          <span id="flag-meta">Force flag: unknown</span>
+        </div>
+      </section>
+
+      <section id="setup-banner" class="setup-banner hidden">
+        <div>
+          <h2>Initial Setup Required</h2>
+          <p>The scheduler will stay idle until this UI has a valid saved configuration.</p>
+        </div>
+      </section>
+
+      <section class="dashboard-grid">
+        <article class="panel spotlight">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Current Scan</p>
+              <h2 id="scan-title">No active scan</h2>
+            </div>
+            <span id="scan-kind-badge" class="badge hidden">Idle</span>
+          </div>
+
+          <div id="progress-wrap" class="progress-wrap">
+            <div class="progress-track">
+              <div id="progress-bar" class="progress-bar"></div>
+            </div>
+            <div class="progress-stats">
+              <strong id="progress-percent">0%</strong>
+              <span id="progress-numbers">0 / 0 files</span>
+            </div>
+          </div>
+
+          <div class="metric-grid">
+            <div class="metric-card">
+              <span class="metric-label">Processed Bytes</span>
+              <strong id="bytes-progress">0 / 0</strong>
+            </div>
+            <div class="metric-card">
+              <span class="metric-label">Elapsed</span>
+              <strong id="elapsed-value">n/a</strong>
+            </div>
+            <div class="metric-card">
+              <span class="metric-label">Average Throughput</span>
+              <strong id="avg-throughput-value">n/a</strong>
+            </div>
+            <div class="metric-card">
+              <span class="metric-label">Window Throughput</span>
+              <strong id="window-throughput-value">n/a</strong>
+            </div>
+            <div class="metric-card">
+              <span class="metric-label">Average Data Rate</span>
+              <strong id="avg-data-rate-value">n/a</strong>
+            </div>
+            <div class="metric-card">
+              <span class="metric-label">Window Data Rate</span>
+              <strong id="window-data-rate-value">n/a</strong>
+            </div>
+          </div>
+
+          <div class="count-row">
+            <div><span>Clean</span><strong id="clean-count">0</strong></div>
+            <div><span>Infected</span><strong id="infected-count">0</strong></div>
+            <div><span>Vanished</span><strong id="vanished-count">0</strong></div>
+            <div><span>Errors</span><strong id="error-count">0</strong></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Scheduler Health</p>
+              <h2>Runtime State</h2>
+            </div>
+          </div>
+          <dl class="definition-grid">
+            <div>
+              <dt>Last Event</dt>
+              <dd id="last-event-value">Waiting for status...</dd>
+            </div>
+            <div>
+              <dt>Last Warning</dt>
+              <dd id="last-warning-value">None</dd>
+            </div>
+            <div>
+              <dt>PID</dt>
+              <dd id="pid-value">n/a</dd>
+            </div>
+            <div>
+              <dt>Scan Log</dt>
+              <dd id="scanlog-value">n/a</dd>
+            </div>
+            <div>
+              <dt>Progress Interval</dt>
+              <dd id="progress-interval-value">n/a</dd>
+            </div>
+            <div>
+              <dt>Workers</dt>
+              <dd id="workers-value">n/a</dd>
+            </div>
+          </dl>
+        </article>
+
+        <article class="panel chart-panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Recent Scans</p>
+              <h2>History</h2>
+            </div>
+          </div>
+          <canvas id="history-chart" width="640" height="220"></canvas>
+          <div id="history-empty" class="empty-state">Recent summaries will appear here after completed scans.</div>
+          <div id="history-list" class="history-list"></div>
+        </article>
+
+        <article class="panel log-panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Recent Activity</p>
+              <h2>Log Tail</h2>
+            </div>
+          </div>
+          <pre id="recent-log-output" class="log-output">Waiting for log data...</pre>
+        </article>
+      </section>
+
+      <aside id="settings-drawer" class="settings-drawer hidden">
+        <div class="settings-header">
+          <div>
+            <p class="panel-kicker">Configuration</p>
+            <h2>Scanner Settings</h2>
+          </div>
+          <button id="close-settings-button" class="action-button ghost">Close</button>
+        </div>
+
+        <form id="config-form" class="config-form">
+          <section class="form-section">
+            <h3>General</h3>
+            <div class="field-grid">
+              <label>
+                <span>Timezone</span>
+                <input name="tz" type="text" required placeholder="America/New_York">
+              </label>
+              <label>
+                <span>ClamAV Threads</span>
+                <input name="maxthreads" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Quarantine Directory</span>
+                <input name="quarantine_dir" type="text" required placeholder="/downloads/quarantine">
+              </label>
+              <label>
+                <span>Scan Log Path</span>
+                <input name="scanlog" type="text" required placeholder="/var/log/clamav/clamav_scheduled.log">
+              </label>
+              <label>
+                <span>Force Full Flag Path</span>
+                <input name="force_full_flag" type="text" placeholder="/downloads/.clamav_force_full_scan.flag">
+              </label>
+              <label>
+                <span>Required Marker Name</span>
+                <input name="scan_path_marker" type="text" placeholder=".clamav-root-marker">
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <h3>Paths</h3>
+            <div class="field-grid single">
+              <label>
+                <span>Scan Paths</span>
+                <textarea name="scan_paths" rows="4" placeholder="/downloads&#10;/archive"></textarea>
+                <small>One absolute in-container path per line.</small>
+              </label>
+              <label>
+                <span>Excluded Paths</span>
+                <textarea name="exclude_paths" rows="4" placeholder="/downloads/private&#10;/downloads/tmp"></textarea>
+                <small>Optional. One absolute in-container path per line.</small>
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <h3>Changed-File Schedule</h3>
+            <div class="day-picker" data-field="changed_scan_days"></div>
+            <label class="full-width">
+              <span>Changed Scan Times</span>
+              <input name="changed_scan_times" type="text" required placeholder="07:00,14:00,20:00">
+            </label>
+          </section>
+
+          <section class="form-section">
+            <h3>Full Scan Schedule</h3>
+            <div class="day-picker" data-field="full_scan_days"></div>
+            <label class="full-width">
+              <span>Full Scan Times</span>
+              <input name="full_scan_times" type="text" required placeholder="03:30">
+            </label>
+          </section>
+
+          <section class="form-section">
+            <h3>Performance</h3>
+            <div class="field-grid">
+              <label>
+                <span>Full Scan Workers</span>
+                <input name="full_scan_parallel_jobs" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Changed Scan Workers</span>
+                <input name="changed_scan_parallel_jobs" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Full Progress Steps</span>
+                <input name="full_progress_steps" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Changed Progress Steps</span>
+                <input name="changed_progress_steps" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Full Fixed Progress Interval</span>
+                <input name="full_chunk_size" type="number" min="0" required>
+              </label>
+              <label>
+                <span>Changed Fixed Progress Interval</span>
+                <input name="changed_chunk_size" type="number" min="0" required>
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <h3>Recovery and Polling</h3>
+            <div class="field-grid">
+              <label>
+                <span>Scan Failure Retry Seconds</span>
+                <input name="scan_failure_retry_interval" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Force Flag Poll Seconds</span>
+                <input name="force_full_poll_interval" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Path Check Timeout</span>
+                <input name="path_check_timeout" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Path Enumeration Timeout</span>
+                <input name="path_enumeration_timeout" type="number" min="1" required>
+              </label>
+              <label>
+                <span>Unavailable Path Retry Seconds</span>
+                <input name="path_unavailable_retry_interval" type="number" min="1" required>
+              </label>
+            </div>
+          </section>
+
+          <div class="form-actions">
+            <p id="form-status" class="form-status">UI mode ignores scheduler env vars and uses this saved configuration.</p>
+            <button type="submit" class="action-button accent">Save Configuration</button>
+          </div>
+        </form>
+      </aside>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

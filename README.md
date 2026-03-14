@@ -4,6 +4,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 
 ## Features
 
+- Dual-mode startup: headless env-driven mode or browser-based UI mode
 - Runs `clamd` inside the container
 - Uses a persistent socket-based scan client instead of spawning one `clamdscan` process per file
 - Time-based full-scan schedule using `FULL_SCAN_DAYS` and `FULL_SCAN_TIMES`
@@ -24,7 +25,28 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 
 This container is designed for trusted local/server use. Review paths, permissions, and quarantine behavior before using it on production data.
 
+## Modes
+
+The container can run in one of two modes:
+
+- `APP_MODE=headless` - the current behavior; scanner settings come directly from environment variables
+- `APP_MODE=ui` - starts a built-in web UI on port `8080`; scanner settings are loaded from `/config/ui-config.json` instead of from environment variables
+
+In UI mode, scheduler configuration environment variables are intentionally ignored. Only bootstrap variables such as `APP_MODE`, `UI_PORT`, `CONFIG_DIR`, and `STATE_DIR` are used directly from the container environment.
+
 ## Environment Variables
+
+### Bootstrap / container mode
+
+- `APP_MODE` - `headless` or `ui`; defaults to `headless`
+- `UI_BIND` - bind address for the UI server in UI mode; defaults to `0.0.0.0`
+- `UI_PORT` - UI port in UI mode; defaults to `8080`
+- `CONFIG_DIR` - persistent UI configuration directory in UI mode; defaults to `/config`
+- `STATE_DIR` - persistent runtime state directory; defaults to `/state`
+
+### Headless scanner configuration
+
+These variables apply directly only in `APP_MODE=headless`. In `APP_MODE=ui`, the browser UI stores these settings persistently and the scheduler uses that saved config instead.
 
 - `TZ` - timezone
 - `MAXTHREADS` - clamd thread count
@@ -47,9 +69,39 @@ This container is designed for trusted local/server use. Review paths, permissio
 - `PATH_UNAVAILABLE_RETRY_INTERVAL` - seconds to wait before retrying when a configured scan root is unavailable
 - `SCAN_PATH_MARKER` - optional file or directory name expected inside every scan root; use this to detect missing NFS mounts that fall back to an empty local directory
 - `QUARANTINE_DIR` - infected file destination
-- `STATE_DIR` - persistent state directory
 - `SCANLOG` - log file path
 - `FORCE_FULL_FLAG` - full-scan trigger flag file path; defaults to the first path in `SCAN_PATHS`
+
+## UI mode
+
+In UI mode the container exposes a browser UI on port `8080` by default.
+
+On first run:
+
+1. Open the UI.
+2. Fill in the required scan settings.
+3. Save the configuration.
+4. The scheduler starts from the saved UI config and keeps using it across restarts.
+
+The UI currently includes:
+
+- initial setup and settings editing
+- live scheduler state
+- current scan progress
+- running-average and since-last-update throughput/data rates
+- recent scan history
+- recent log tail
+- force-full-scan and restart actions
+
+Recommended UI-mode mounts:
+
+```yaml
+volumes:
+  - ./config:/config:rw
+  - ./state:/state:rw
+  - ./logs:/var/log/clamav:rw
+  - ./defs:/var/lib/clamav:rw
+```
 
 ## Scan schedules
 

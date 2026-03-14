@@ -3,7 +3,15 @@ services:
     image: ghcr.io/YOUR_GITHUB_USERNAME/clamav-scheduled:latest
     container_name: clamav-scheduled
     restart: unless-stopped
+    ports:
+      - "8080:8080"
     environment:
+      APP_MODE: ui
+      UI_PORT: 8080
+      CONFIG_DIR: /config
+      STATE_DIR: /state
+      # Headless-only scanner env vars below are ignored when APP_MODE=ui.
+      # Set APP_MODE=headless if you want to keep managing the scanner from environment variables.
       TZ: UTC
       MAXTHREADS: 13
       SCAN_PATHS: /downloads
@@ -22,13 +30,13 @@ services:
       PATH_ENUMERATION_TIMEOUT: 300
       PATH_UNAVAILABLE_RETRY_INTERVAL: 300
       QUARANTINE_DIR: /downloads/quarantine
-      STATE_DIR: /state
       SCANLOG: /var/log/clamav/clamav_scheduled.log
       FORCE_FULL_FLAG: /downloads/.clamav_force_full_scan.flag
     volumes:
       - ./downloads:/downloads:rw
       # Mount additional scan roots and append them to SCAN_PATHS as needed.
       # - ./archive:/archive:rw
+      - ./config:/config:rw
       - ./defs:/var/lib/clamav:rw
       - ./logs:/var/log/clamav:rw
       - ./state:/state:rw

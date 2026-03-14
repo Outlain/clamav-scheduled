@@ -11,6 +11,15 @@ RUN apk add --no-cache \
 
 COPY scripts/clamav_scheduled.sh /usr/local/bin/clamav_scheduled.sh
 COPY scripts/clamd_session_scan.py /usr/local/bin/clamd_session_scan.py
-RUN chmod +x /usr/local/bin/clamav_scheduled.sh /usr/local/bin/clamd_session_scan.py
+COPY scripts/clamav_entrypoint.py /usr/local/bin/clamav_entrypoint.py
+COPY scripts/clamav_ui_server.py /usr/local/bin/clamav_ui_server.py
+COPY ui /usr/local/share/clamav-ui
+RUN chmod +x \
+    /usr/local/bin/clamav_scheduled.sh \
+    /usr/local/bin/clamd_session_scan.py \
+    /usr/local/bin/clamav_entrypoint.py \
+    /usr/local/bin/clamav_ui_server.py
 
-CMD ["/bin/sh", "/usr/local/bin/clamav_scheduled.sh"]
+EXPOSE 8080
+
+CMD ["python3", "/usr/local/bin/clamav_entrypoint.py"]
