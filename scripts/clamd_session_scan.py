@@ -150,7 +150,6 @@ class SessionScanner:
     def __init__(self, socket_path: str) -> None:
         self.socket_path = socket_path
         self.sock: socket.socket | None = None
-        self.reader = None
 
     def connect(self) -> None:
         self.close()
@@ -158,7 +157,6 @@ class SessionScanner:
         sock.connect(self.socket_path)
         sock.sendall(b"zIDSESSION\0")
         self.sock = sock
-        self.reader = sock.makefile("rb")
 
     def close(self) -> None:
         if self.sock is not None:
@@ -166,26 +164,35 @@ class SessionScanner:
                 self.sock.sendall(b"zEND\0")
             except OSError:
                 pass
-            try:
-                if self.reader is not None:
-                    self.reader.close()
-            finally:
-                self.sock.close()
+            self.sock.close()
         self.sock = None
-        self.reader = None
+
+    def read_reply(self) -> bytes:
+        if self.sock is None:
+            raise ConnectionError("clamd session is not connected")
+
+        chunks: list[bytes] = []
+        while True:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("clamd session closed unexpectedly")
+
+            terminator_index = chunk.find(b"\0")
+            if terminator_index >= 0:
+                chunks.append(chunk[:terminator_index])
+                return b"".join(chunks)
+
+            chunks.append(chunk)
 
     def scan_path(self, path: str) -> tuple[str, str]:
-        if self.sock is None or self.reader is None:
+        if self.sock is None:
             self.connect()
 
         assert self.sock is not None
-        assert self.reader is not None
 
         payload = b"zSCAN " + os.fsencode(path) + b"\0"
         self.sock.sendall(payload)
-        reply = self.reader.readline()
-        if not reply:
-            raise ConnectionError("clamd session closed unexpectedly")
+        reply = self.read_reply()
 
         decoded = reply.decode("utf-8", "replace").rstrip("\n")
         decoded = SESSION_PREFIX_RE.sub("", decoded, count=1)
