@@ -39,6 +39,7 @@ This container is designed for trusted local/server use. Review paths, permissio
 - `CHANGED_SCAN_DAYS` - comma-separated days for scheduled changed-file scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`; defaults to `*`
 - `CHANGED_SCAN_TIMES` - required comma-separated `HH:MM` times for scheduled changed-file scans in the container timezone
 - `SCAN_FAILURE_RETRY_INTERVAL` - seconds to wait before retrying a scheduled scan after a non-path-related failure
+- `FORCE_FULL_POLL_INTERVAL` - seconds between force-full flag checks while the scheduler is otherwise idle; lower values make forced full scans start sooner
 - `PATH_CHECK_TIMEOUT` - seconds allowed for each scan-root health check before treating the path as unavailable
 - `PATH_ENUMERATION_TIMEOUT` - seconds allowed for each per-root `find` pass before treating the path as unavailable
 - `PATH_UNAVAILABLE_RETRY_INTERVAL` - seconds to wait before retrying when a configured scan root is unavailable
@@ -111,6 +112,8 @@ Create the configured flag file, for example:
 ```
 
 The flag is consumed and deleted after a successful forced full scan.
+
+While the scheduler is idle, it polls for the force flag every `FORCE_FULL_POLL_INTERVAL` seconds, so adding the file wakes the loop early instead of waiting until the next scheduled scan time.
 
 ## Container registry
 
