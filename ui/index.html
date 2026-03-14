@@ -175,8 +175,9 @@
                 <input name="tz" type="text" required placeholder="America/New_York">
               </label>
               <label>
-                <span>ClamAV Threads</span>
+                <span>Max ClamAV Scan Threads</span>
                 <input name="maxthreads" type="number" min="1" required>
+                <small>Maximum internal `clamd` scan threads. Usually keep this near your full-scan worker count.</small>
               </label>
               <label>
                 <span>Quarantine Directory</span>
@@ -187,12 +188,14 @@
                 <input name="scanlog" type="text" required placeholder="/var/log/clamav/clamav_scheduled.log">
               </label>
               <label>
-                <span>Force Full Flag Path</span>
+                <span>Force Full Trigger File (Exact Path)</span>
                 <input name="force_full_flag" type="text" placeholder="/downloads/.clamav_force_full_scan.flag">
+                <small>Optional absolute in-container file path. The scanner checks only this exact file and does not search all storage for matching names.</small>
               </label>
               <label>
-                <span>Required Marker Name</span>
+                <span>Required Entry In Each Scan Path</span>
                 <input name="scan_path_marker" type="text" placeholder=".clamav-root-marker">
+                <small>Optional file or directory name expected inside every scan path. Helps detect missing mounts or the wrong directory.</small>
               </label>
             </div>
           </section>
@@ -233,30 +236,39 @@
 
           <section class="form-section">
             <h3>Performance</h3>
+            <p class="section-copy">
+              Workers control concurrent scanning. Progress settings only control how often progress logs and UI updates are emitted.
+            </p>
             <div class="field-grid">
               <label>
-                <span>Full Scan Workers</span>
+                <span>Full Scan Concurrent Workers</span>
                 <input name="full_scan_parallel_jobs" type="number" min="1" required>
+                <small>How many persistent scan workers are active during full scans.</small>
               </label>
               <label>
-                <span>Changed Scan Workers</span>
+                <span>Changed Scan Concurrent Workers</span>
                 <input name="changed_scan_parallel_jobs" type="number" min="1" required>
+                <small>How many persistent scan workers are active during changed-file scans.</small>
               </label>
               <label>
-                <span>Full Progress Steps</span>
+                <span>Full Target Progress Updates</span>
                 <input name="full_progress_steps" type="number" min="1" required>
+                <small>Used only in auto mode to derive how many progress updates a full scan should roughly produce.</small>
               </label>
               <label>
-                <span>Changed Progress Steps</span>
+                <span>Changed Target Progress Updates</span>
                 <input name="changed_progress_steps" type="number" min="1" required>
+                <small>Used only in auto mode to derive how many progress updates a changed-files scan should roughly produce.</small>
               </label>
               <label>
-                <span>Full Fixed Progress Interval</span>
+                <span>Full Progress Log Interval (files)</span>
                 <input name="full_chunk_size" type="number" min="0" required>
+                <small>`0` = auto. If set, log progress after this many completed files during full scans.</small>
               </label>
               <label>
-                <span>Changed Fixed Progress Interval</span>
+                <span>Changed Progress Log Interval (files)</span>
                 <input name="changed_chunk_size" type="number" min="0" required>
+                <small>`0` = auto. If set, log progress after this many completed files during changed-file scans.</small>
               </label>
             </div>
           </section>
@@ -265,23 +277,24 @@
             <h3>Recovery and Polling</h3>
             <div class="field-grid">
               <label>
-                <span>Scan Failure Retry Seconds</span>
+                <span>Retry Delay After Scan Failure</span>
                 <input name="scan_failure_retry_interval" type="number" min="1" required>
               </label>
               <label>
-                <span>Force Flag Poll Seconds</span>
+                <span>Force Trigger Poll Seconds</span>
                 <input name="force_full_poll_interval" type="number" min="1" required>
+                <small>How often the idle scheduler checks for the force-full trigger file.</small>
               </label>
               <label>
-                <span>Path Check Timeout</span>
+                <span>Scan Path Health Check Timeout</span>
                 <input name="path_check_timeout" type="number" min="1" required>
               </label>
               <label>
-                <span>Path Enumeration Timeout</span>
+                <span>File Listing Timeout Per Path</span>
                 <input name="path_enumeration_timeout" type="number" min="1" required>
               </label>
               <label>
-                <span>Unavailable Path Retry Seconds</span>
+                <span>Retry Delay When Path Unavailable</span>
                 <input name="path_unavailable_retry_interval" type="number" min="1" required>
               </label>
             </div>

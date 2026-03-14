@@ -440,6 +440,12 @@ body {
   font-size: 1.05rem;
 }
 
+.section-copy {
+  margin: 0 0 0.9rem;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
