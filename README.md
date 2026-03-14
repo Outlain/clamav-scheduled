@@ -91,7 +91,10 @@ The UI currently includes:
 - running-average and since-last-update throughput/data rates
 - recent scan history
 - recent log tail
-- force-full-scan and restart actions
+- force-full-scan action
+- on-demand changed-file scans using either "since last successful checkpoint" or a custom recent lookback window
+- optional path-scoped on-demand changed scans for specific files or directories
+- restart-scanner action for restarting only the scanner process inside the container
 
 Recommended UI-mode mounts:
 

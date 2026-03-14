@@ -328,6 +328,7 @@ fi
 
 LAST_CHANGED="$STATE_DIR/last_changed_scan_epoch"
 LAST_FULL="$STATE_DIR/last_full_scan_epoch"
+MANUAL_CHANGED_REQUEST_FILE="$STATE_DIR/manual_changed_scan_request.env"
 NEXT_CHANGED_RETRY_EPOCH=0
 NEXT_FULL_RETRY_EPOCH=0
 
@@ -357,6 +358,124 @@ get_progress_interval() {
   [ "$CHUNK_SIZE_AUTO" -lt 1 ] && CHUNK_SIZE_AUTO=1
   [ "$CHUNK_SIZE_AUTO" -lt "$PARALLEL_JOBS" ] && CHUNK_SIZE_AUTO="$PARALLEL_JOBS"
   echo "$CHUNK_SIZE_AUTO"
+}
+
+validate_nonnegative_numeric_string() {
+  VALUE="$1"
+  case "$VALUE" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+path_in_quarantine() {
+  TARGET_PATH="$1"
+
+  case "$TARGET_PATH" in
+    "$QUARANTINE_DIR"|"$QUARANTINE_DIR"/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+path_under_scan_root() {
+  TARGET_PATH="$1"
+  ROOT_PATH="$2"
+
+  case "$TARGET_PATH" in
+    "$ROOT_PATH"|"$ROOT_PATH"/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+get_scan_root_for_path() {
+  TARGET_PATH="$1"
+  MATCHED_ROOT=""
+  MATCHED_LENGTH=0
+  OLD_IFS="$IFS"
+
+  IFS=':'
+  set -- $SCAN_PATHS
+  IFS="$OLD_IFS"
+
+  for ROOT_PATH do
+    if path_under_scan_root "$TARGET_PATH" "$ROOT_PATH"; then
+      ROOT_LENGTH=$(printf '%s' "$ROOT_PATH" | wc -c | tr -d ' ')
+      if [ "$ROOT_LENGTH" -gt "$MATCHED_LENGTH" ]; then
+        MATCHED_ROOT="$ROOT_PATH"
+        MATCHED_LENGTH="$ROOT_LENGTH"
+      fi
+    fi
+  done
+
+  printf '%s\n' "$MATCHED_ROOT"
+}
+
+load_manual_changed_request() {
+  MANUAL_CHANGED_REQUEST_MODE=""
+  MANUAL_CHANGED_REFERENCE_EPOCH=""
+  MANUAL_CHANGED_LOOKBACK_SECONDS=0
+  MANUAL_CHANGED_REQUEST_PATHS=""
+  MANUAL_CHANGED_REQUEST_CREATED_AT=""
+
+  [ -f "$MANUAL_CHANGED_REQUEST_FILE" ] || return 1
+
+  while IFS='=' read -r KEY VALUE || [ -n "$KEY" ]; do
+    case "$KEY" in
+      REQUEST_MODE)
+        MANUAL_CHANGED_REQUEST_MODE="$VALUE"
+        ;;
+      REQUEST_REFERENCE_EPOCH)
+        MANUAL_CHANGED_REFERENCE_EPOCH="$VALUE"
+        ;;
+      REQUEST_LOOKBACK_SECONDS)
+        MANUAL_CHANGED_LOOKBACK_SECONDS="$VALUE"
+        ;;
+      REQUEST_PATHS)
+        MANUAL_CHANGED_REQUEST_PATHS="$VALUE"
+        ;;
+      REQUEST_CREATED_AT)
+        MANUAL_CHANGED_REQUEST_CREATED_AT="$VALUE"
+        ;;
+    esac
+  done < "$MANUAL_CHANGED_REQUEST_FILE"
+
+  case "$MANUAL_CHANGED_REQUEST_MODE" in
+    since_last|relative)
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+
+  validate_nonnegative_numeric_string "$MANUAL_CHANGED_REFERENCE_EPOCH" || return 2
+  validate_nonnegative_numeric_string "$MANUAL_CHANGED_LOOKBACK_SECONDS" || return 2
+
+  validate_optional_path_list_config "MANUAL_CHANGED_REQUEST_PATHS" "$MANUAL_CHANGED_REQUEST_PATHS"
+  MANUAL_CHANGED_REQUEST_PATHS=$(normalize_absolute_path_list "MANUAL_CHANGED_REQUEST_PATHS" "$MANUAL_CHANGED_REQUEST_PATHS")
+
+  return 0
+}
+
+manual_changed_request_should_wake() {
+  CURRENT_EPOCH="$1"
+
+  [ -f "$MANUAL_CHANGED_REQUEST_FILE" ] || return 1
+  [ "$NEXT_CHANGED_RETRY_EPOCH" -le "$CURRENT_EPOCH" ]
+}
+
+force_full_should_wake() {
+  CURRENT_EPOCH="$1"
+
+  [ -f "$FORCE_FULL_FLAG" ] || return 1
+  [ "$NEXT_FULL_RETRY_EPOCH" -le "$CURRENT_EPOCH" ]
 }
 
 schedule_day_allowed() {
@@ -449,6 +568,19 @@ get_next_scheduled_epoch() {
 
 evaluate_changed_trigger() {
   CHANGED_DUE=0
+  CHANGED_MANUAL_REQUEST=0
+
+  if [ "$MANUAL_CHANGED_REQUEST" -eq 1 ]; then
+    if [ "$NEXT_CHANGED_RETRY_EPOCH" -gt "$NOW" ]; then
+      CHANGED_NEXT_WAKE_EPOCH="$NEXT_CHANGED_RETRY_EPOCH"
+    else
+      CHANGED_DUE=1
+      CHANGED_MANUAL_REQUEST=1
+      CHANGED_NEXT_WAKE_EPOCH="$NOW"
+    fi
+    return 0
+  fi
+
   CHANGED_LAST_SLOT_EPOCH=$(get_last_scheduled_epoch "$CHANGED_SCAN_DAYS" "$CHANGED_SCAN_TIMES" "$NOW")
   CHANGED_NEXT_SLOT_EPOCH=$(get_next_scheduled_epoch "$CHANGED_SCAN_DAYS" "$CHANGED_SCAN_TIMES" "$NOW")
 
@@ -497,8 +629,13 @@ sleep_until_epoch() {
   echo "Sleeping ${SLEEP_SECONDS}s..." | tee -a "$SCANLOG"
 
   while [ "$CURRENT_EPOCH" -lt "$TARGET_EPOCH" ]; do
-    if [ -f "$FORCE_FULL_FLAG" ]; then
+    if force_full_should_wake "$CURRENT_EPOCH"; then
       echo "[FORCE] Force-full flag detected during sleep; waking early." | tee -a "$SCANLOG"
+      return 0
+    fi
+
+    if manual_changed_request_should_wake "$CURRENT_EPOCH"; then
+      echo "[MANUAL] On-demand changed scan request detected during sleep; waking early." | tee -a "$SCANLOG"
       return 0
     fi
 
@@ -650,6 +787,89 @@ build_scan_list() {
   echo "[$LABEL] Built file list from ${PATH_COUNT} scan path(s)." | tee -a "$SCANLOG"
 }
 
+append_target_scan_path_list() {
+  LABEL="$1"
+  TARGET_PATH="$2"
+  LIST_FILE="$3"
+  REFERENCE_EPOCH="$4"
+  TARGET_TOKEN=$(printf '%s' "$TARGET_PATH" | tr '/:' '__')
+  RAW_LIST_FILE="$TMP_DIR/${LABEL}_${TARGET_TOKEN}_raw_list.txt"
+  REFERENCE_FILE="$TMP_DIR/${LABEL}_${TARGET_TOKEN}_reference.timestamp"
+
+  if [ ! -e "$TARGET_PATH" ]; then
+    echo "[WARN] [$LABEL] Requested target no longer exists: $TARGET_PATH" | tee -a "$SCANLOG"
+    return 0
+  fi
+
+  : > "$RAW_LIST_FILE"
+
+  if [ "$LABEL" = "CHANGED" ]; then
+    touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f -not -path "$QUARANTINE_DIR/*" \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
+      rm -f "$RAW_LIST_FILE" "$REFERENCE_FILE"
+      return 0
+    fi
+  else
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f -not -path "$QUARANTINE_DIR/*" > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
+      rm -f "$RAW_LIST_FILE"
+      return 0
+    fi
+  fi
+
+  RC=$?
+  rm -f "$RAW_LIST_FILE" "$REFERENCE_FILE"
+  if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
+    echo "[WARN] [$LABEL] Timed out while enumerating requested target $TARGET_PATH. The mount may be unavailable." | tee -a "$SCANLOG"
+    return 2
+  fi
+
+  echo "[WARN] [$LABEL] Failed enumerating requested target $TARGET_PATH (exit=${RC})." | tee -a "$SCANLOG"
+  return 1
+}
+
+build_targeted_scan_list() {
+  LABEL="$1"
+  LIST_FILE="$2"
+  REFERENCE_EPOCH="$3"
+  TARGET_PATHS="$4"
+  TARGET_COUNT=0
+  OLD_IFS="$IFS"
+
+  : > "$LIST_FILE"
+
+  IFS=':'
+  set -- $TARGET_PATHS
+  IFS="$OLD_IFS"
+
+  for TARGET_PATH do
+    [ -n "$TARGET_PATH" ] || continue
+
+    SCAN_ROOT=$(get_scan_root_for_path "$TARGET_PATH")
+    if [ -z "$SCAN_ROOT" ]; then
+      echo "[WARN] [$LABEL] Requested target is outside configured scan roots and will not be scanned: $TARGET_PATH" | tee -a "$SCANLOG"
+      return 1
+    fi
+
+    if check_scan_path_health "$LABEL" "$SCAN_ROOT"; then
+      :
+    else
+      return 2
+    fi
+
+    if append_target_scan_path_list "$LABEL" "$TARGET_PATH" "$LIST_FILE" "$REFERENCE_EPOCH"; then
+      TARGET_COUNT=$((TARGET_COUNT + 1))
+    else
+      RC=$?
+      [ "$RC" -eq 2 ] && return 2
+      return 1
+    fi
+  done
+
+  echo "[$LABEL] Built file list from ${TARGET_COUNT} requested target path(s)." | tee -a "$SCANLOG"
+}
+
 run_scan_list() {
   LIST_FILE="$1"
   LABEL="$2"
@@ -714,9 +934,23 @@ while true; do
   LAST_FULL_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
 
   FORCE=0
+  MANUAL_CHANGED_REQUEST=0
   if [ -f "$FORCE_FULL_FLAG" ]; then
     FORCE=1
     echo "[FORCE] Full scan requested (flag detected): $FORCE_FULL_FLAG" | tee -a "$SCANLOG"
+  fi
+
+  if load_manual_changed_request; then
+    MANUAL_CHANGED_REQUEST=1
+    TARGET_DESC="$MANUAL_CHANGED_REQUEST_PATHS"
+    [ -n "$TARGET_DESC" ] || TARGET_DESC="$SCAN_PATHS"
+    echo "[MANUAL] On-demand changed scan requested (mode=${MANUAL_CHANGED_REQUEST_MODE} reference_epoch=${MANUAL_CHANGED_REFERENCE_EPOCH} lookback_seconds=${MANUAL_CHANGED_LOOKBACK_SECONDS} target_paths=${TARGET_DESC})" | tee -a "$SCANLOG"
+  else
+    RC=$?
+    if [ "$RC" -eq 2 ] && [ -f "$MANUAL_CHANGED_REQUEST_FILE" ]; then
+      echo "[WARN] [MANUAL] Ignoring invalid on-demand changed scan request and deleting ${MANUAL_CHANGED_REQUEST_FILE}." | tee -a "$SCANLOG"
+      rm -f -- "$MANUAL_CHANGED_REQUEST_FILE"
+    fi
   fi
 
   evaluate_changed_trigger
@@ -753,7 +987,7 @@ while true; do
         NEXT_FULL_RETRY_EPOCH=0
         echo "=== FULL SCAN finished ===" | tee -a "$SCANLOG"
 
-        if [ "$CHANGED_DUE" -eq 1 ]; then
+        if [ "$CHANGED_DUE" -eq 1 ] && [ "$CHANGED_MANUAL_REQUEST" -eq 0 ]; then
           CHANGED_DUE=0
           echo "[CHANGED] Skipping changed-files scan because the successful full scan already covered files through $(date -d "@$FULL_SCAN_CUTOFF")." | tee -a "$SCANLOG"
         fi
@@ -785,14 +1019,34 @@ while true; do
     echo "=== CHANGED-FILES scan starting ===" | tee -a "$SCANLOG"
     CHANGED_LIST="$TMP_DIR/changed_list.txt"
     CHANGED_SCAN_CUTOFF=$(date +%s)
+    CHANGED_REFERENCE_EPOCH="$LAST_CHANGED_EPOCH"
+    CHANGED_TARGET_PATHS="$SCAN_PATHS"
 
-    if build_scan_list "CHANGED" "$CHANGED_LIST" "$LAST_CHANGED_EPOCH"; then
+    if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
+      CHANGED_REFERENCE_EPOCH="$MANUAL_CHANGED_REFERENCE_EPOCH"
+      [ -n "$MANUAL_CHANGED_REQUEST_PATHS" ] && CHANGED_TARGET_PATHS="$MANUAL_CHANGED_REQUEST_PATHS"
+      echo "[MANUAL] Starting on-demand changed scan from reference epoch ${CHANGED_REFERENCE_EPOCH} over target paths ${CHANGED_TARGET_PATHS}." | tee -a "$SCANLOG"
+      BUILD_FN="build_targeted_scan_list"
+    else
+      BUILD_FN="build_scan_list"
+    fi
+
+    if $BUILD_FN "CHANGED" "$CHANGED_LIST" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_TARGET_PATHS"; then
       if run_scan_list "$CHANGED_LIST" "CHANGED" "$CHANGED_SCAN_PARALLEL_JOBS" "$CHANGED_CHUNK_SIZE" "$CHANGED_PROGRESS_STEPS"; then
-        echo "$CHANGED_SCAN_CUTOFF" > "$LAST_CHANGED" || true
         NEXT_CHANGED_RETRY_EPOCH=0
+        if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
+          rm -f -- "$MANUAL_CHANGED_REQUEST_FILE"
+          echo "[MANUAL] On-demand changed scan finished successfully; request consumed." | tee -a "$SCANLOG"
+        else
+          echo "$CHANGED_SCAN_CUTOFF" > "$LAST_CHANGED" || true
+        fi
       else
         NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
-        echo "[WARN] Changed-files scan did not complete. Keeping previous changed-scan checkpoint and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
+          echo "[WARN] On-demand changed scan did not complete. Keeping the manual request and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        else
+          echo "[WARN] Changed-files scan did not complete. Keeping previous changed-scan checkpoint and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        fi
       fi
     else
       RC=$?
@@ -801,10 +1055,18 @@ while true; do
         CYCLE_ABORT=1
         NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + PATH_UNAVAILABLE_RETRY_INTERVAL ))
         NEXT_FULL_RETRY_EPOCH="$NEXT_CHANGED_RETRY_EPOCH"
-        echo "[WARN] Changed-files scan paused because a scan path is unavailable. Retrying in ${PATH_UNAVAILABLE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
+          echo "[WARN] On-demand changed scan paused because a scan path is unavailable. Keeping the manual request and retrying in ${PATH_UNAVAILABLE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        else
+          echo "[WARN] Changed-files scan paused because a scan path is unavailable. Retrying in ${PATH_UNAVAILABLE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        fi
       else
         NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
-        echo "[WARN] Changed-files scan file-list build failed. Keeping previous changed-scan checkpoint and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
+          echo "[WARN] On-demand changed scan file-list build failed. Keeping the manual request and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        else
+          echo "[WARN] Changed-files scan file-list build failed. Keeping previous changed-scan checkpoint and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        fi
       fi
     fi
   fi
@@ -822,7 +1084,17 @@ while true; do
   LAST_CHANGED_EPOCH=$(cat "$LAST_CHANGED" 2>/dev/null || echo 0)
   LAST_FULL_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
   FORCE=0
+  MANUAL_CHANGED_REQUEST=0
   [ -f "$FORCE_FULL_FLAG" ] && FORCE=1
+  if load_manual_changed_request; then
+    MANUAL_CHANGED_REQUEST=1
+  else
+    RC=$?
+    if [ "$RC" -eq 2 ] && [ -f "$MANUAL_CHANGED_REQUEST_FILE" ]; then
+      echo "[WARN] [MANUAL] Ignoring invalid on-demand changed scan request and deleting ${MANUAL_CHANGED_REQUEST_FILE}." | tee -a "$SCANLOG"
+      rm -f -- "$MANUAL_CHANGED_REQUEST_FILE"
+    fi
+  fi
   evaluate_changed_trigger
   evaluate_full_trigger
   NEXT_WAKE_EPOCH="$CHANGED_NEXT_WAKE_EPOCH"

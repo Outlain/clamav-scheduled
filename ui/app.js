@@ -1,6 +1,7 @@
 const state = {
   bootstrap: null,
   pollTimer: null,
+  currentStatus: null,
 };
 
 const dayOptions = [
@@ -53,7 +54,7 @@ function formatPhase(phase) {
   const labels = {
     unconfigured: "Waiting For Setup",
     config_error: "Configuration Error",
-    starting: "Starting Scheduler",
+    starting: "Starting Scanner",
     idle: "Idle",
     scanning: "Scanning",
     cycle_complete: "Cycle Complete",
@@ -182,13 +183,26 @@ function closeSettings() {
   $("settings-drawer").classList.add("hidden");
 }
 
+function openManualScanDrawer() {
+  $("manual-scan-drawer").classList.remove("hidden");
+}
+
+function closeManualScanDrawer() {
+  $("manual-scan-drawer").classList.add("hidden");
+}
+
+function updateManualModeVisibility() {
+  const selected = document.querySelector('input[name="manual_mode"]:checked')?.value || "since_last";
+  setVisible("manual-lookback-wrap", selected === "relative");
+}
+
 function applyPhaseVisuals(status) {
   const phase = status.phase || "unknown";
   const dot = $("phase-dot");
   dot.className = "status-dot";
   dot.classList.add(`phase-${phase}`);
   setText("phase-label", formatPhase(phase));
-  setText("scheduler-meta", status.scheduler_running ? `Scheduler: running (PID ${status.scheduler_pid})` : "Scheduler: stopped");
+  setText("scheduler-meta", status.scheduler_running ? `Scanner: running (PID ${status.scheduler_pid})` : "Scanner: stopped");
   setText("next-wake-meta", status.next_wake ? `Next wake: ${status.next_wake}` : "Next wake: pending");
   setText("flag-meta", `Force flag: ${status.effective_force_full_flag}`);
 }
@@ -324,6 +338,7 @@ function renderLogs(logs) {
 
 function updateStatusView(payload) {
   const status = payload.status || payload;
+  state.currentStatus = status;
   applyPhaseVisuals(status);
   updateCurrentScan(status.current_scan);
   updateRuntimePanel(status);
@@ -356,7 +371,7 @@ async function handleConfigSubmit(event) {
       method: "PUT",
       body: JSON.stringify(payload),
     });
-    statusLine.textContent = "Configuration saved. Scheduler restarted with UI-managed settings.";
+    statusLine.textContent = "Configuration saved. Scanner restarted with UI-managed settings.";
     updateStatusView({
       status: response.status,
       history: response.status.history,
@@ -380,10 +395,60 @@ async function handleForceFull() {
 
 async function handleRestart() {
   try {
-    await apiFetch("/api/actions/restart", { method: "POST", body: "{}" });
+    if (state.currentStatus?.current_scan) {
+      const confirmed = window.confirm(
+        "This restarts only the scanner process inside the container, not the whole container. The current scan will stop and be retried later because scan checkpoints are only advanced after successful completion. Continue?",
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    await apiFetch("/api/actions/restart-scanner", { method: "POST", body: "{}" });
     await refreshStatus();
   } catch (error) {
     setText("last-event-value", error.message);
+  }
+}
+
+function collectManualScanPayload() {
+  const form = $("manual-scan-form");
+  const mode = document.querySelector('input[name="manual_mode"]:checked')?.value || "since_last";
+  const payload = {
+    mode,
+    target_paths: splitMultiline(form.manual_target_paths.value),
+  };
+
+  if (mode === "relative") {
+    const value = Number(form.manual_lookback_value.value);
+    const unit = form.manual_lookback_unit.value;
+    const multipliers = {
+      minutes: 60,
+      hours: 3600,
+      days: 86400,
+    };
+    payload.lookback_seconds = value * (multipliers[unit] || 60);
+  }
+
+  return payload;
+}
+
+async function handleManualScanSubmit(event) {
+  event.preventDefault();
+  const statusLine = $("manual-form-status");
+  statusLine.textContent = "Queueing changed scan...";
+
+  try {
+    const payload = collectManualScanPayload();
+    await apiFetch("/api/actions/manual-changed", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    statusLine.textContent = "Changed scan queued. It will run after any current scan finishes.";
+    closeManualScanDrawer();
+    await refreshStatus();
+  } catch (error) {
+    statusLine.textContent = error.message;
   }
 }
 
@@ -399,10 +464,16 @@ async function bootstrap() {
 
 function bindEvents() {
   $("config-form").addEventListener("submit", handleConfigSubmit);
+  $("manual-scan-form").addEventListener("submit", handleManualScanSubmit);
   $("force-full-button").addEventListener("click", handleForceFull);
+  $("manual-changed-button").addEventListener("click", openManualScanDrawer);
   $("restart-button").addEventListener("click", handleRestart);
   $("toggle-settings-button").addEventListener("click", openSettings);
   $("close-settings-button").addEventListener("click", closeSettings);
+  $("close-manual-scan-button").addEventListener("click", closeManualScanDrawer);
+  document.querySelectorAll('input[name="manual_mode"]').forEach((input) => {
+    input.addEventListener("change", updateManualModeVisibility);
+  });
 }
 
 async function start() {
@@ -413,6 +484,8 @@ async function start() {
     setText("last-event-value", error.message);
     openSettings();
   }
+
+  updateManualModeVisibility();
 
   state.pollTimer = window.setInterval(refreshStatus, 5000);
 }

@@ -401,12 +401,41 @@ def recent_tail_lines(path: Path, max_lines: int = 200) -> list[str]:
     return joined.splitlines()[-max_lines:]
 
 
+def path_within_scan_root(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + os.sep)
+
+
+def read_epoch_file(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        return int(path.read_text(encoding="utf-8").strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
+def validate_manual_request_paths(config: dict[str, Any], raw_paths: Any) -> list[str]:
+    paths = normalize_path_list(raw_paths, "target_paths", required=False)
+    if not paths:
+        return []
+
+    scan_roots = config["scan_paths"]
+    for path in paths:
+        if not any(path_within_scan_root(path, root) for root in scan_roots):
+            raise ValueError(f"Target path is outside configured scan roots: {path}")
+        if not os.path.exists(path):
+            raise ValueError(f"Target path does not exist inside the container: {path}")
+
+    return paths
+
+
 class SchedulerManager:
     def __init__(self, config_dir: Path, state_dir: Path) -> None:
         self.config_dir = config_dir
         self.state_dir = state_dir
         self.config_path = config_dir / "ui-config.json"
         self.history_path = config_dir / "ui-history.json"
+        self.manual_changed_request_path = state_dir / "manual_changed_scan_request.env"
         self.static_dir = Path("/usr/local/share/clamav-ui")
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -491,11 +520,48 @@ class SchedulerManager:
             flag_path.touch()
             self._last_event = f"Force-full flag created at {force_full_flag}."
 
-    def restart_scheduler(self) -> dict[str, Any]:
+    def restart_scanner(self) -> dict[str, Any]:
         with self._lock:
             if self._config is None or self._config_error:
                 raise ValueError("UI mode is not configured yet.")
             self._restart_scheduler_locked()
+            return self._status_payload_locked()
+
+    def queue_manual_changed_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._config is None or self._config_error:
+                raise ValueError("UI mode is not configured yet.")
+
+            mode = normalize_optional_string(payload.get("mode")).lower() or "since_last"
+            if mode not in {"since_last", "relative"}:
+                raise ValueError("mode must be 'since_last' or 'relative'.")
+
+            target_paths = validate_manual_request_paths(self._config, payload.get("target_paths"))
+
+            lookback_seconds = 0
+            if mode == "since_last":
+                reference_epoch = read_epoch_file(self.state_dir / "last_changed_scan_epoch")
+            else:
+                lookback_seconds = normalize_int(payload.get("lookback_seconds"), "lookback_seconds", minimum=1)
+                reference_epoch = max(0, int(time.time()) - lookback_seconds)
+
+            request_lines = [
+                f"REQUEST_MODE={mode}",
+                f"REQUEST_REFERENCE_EPOCH={reference_epoch}",
+                f"REQUEST_LOOKBACK_SECONDS={lookback_seconds}",
+                f"REQUEST_PATHS={':'.join(target_paths)}",
+                f"REQUEST_CREATED_AT={int(time.time())}",
+            ]
+            self.manual_changed_request_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.manual_changed_request_path.with_suffix(".tmp")
+            temp_path.write_text("\n".join(request_lines) + "\n", encoding="utf-8")
+            os.replace(temp_path, self.manual_changed_request_path)
+
+            target_label = ":".join(target_paths) if target_paths else "all configured scan paths"
+            if mode == "since_last":
+                self._last_event = f"Queued on-demand changed scan since the last successful checkpoint over {target_label}."
+            else:
+                self._last_event = f"Queued on-demand changed scan for the last {lookback_seconds} seconds over {target_label}."
             return self._status_payload_locked()
 
     def _load_config_from_disk(self) -> None:
@@ -544,12 +610,38 @@ class SchedulerManager:
             "current_scan": deepcopy(self._current_scan),
             "last_summary": deepcopy(self._last_summary),
             "scanlog": self._config["scanlog"] if self._config else DEFAULT_CONFIG["scanlog"],
+            "pending_manual_changed_request": self._read_manual_request_locked(),
         }
         if self._config is not None:
             payload["effective_force_full_flag"] = serialize_config_for_scheduler(self._config)["FORCE_FULL_FLAG"]
         else:
             payload["effective_force_full_flag"] = f"{DEFAULT_CONFIG['scan_paths'][0]}/.clamav_force_full_scan.flag"
         return payload
+
+    def _read_manual_request_locked(self) -> dict[str, Any] | None:
+        if not self.manual_changed_request_path.exists():
+            return None
+
+        request: dict[str, str] = {}
+        try:
+            for raw_line in self.manual_changed_request_path.read_text(encoding="utf-8").splitlines():
+                if "=" not in raw_line:
+                    continue
+                key, value = raw_line.split("=", 1)
+                request[key] = value
+        except OSError:
+            return None
+
+        paths_value = request.get("REQUEST_PATHS", "")
+        target_paths = [part for part in paths_value.split(":") if part]
+
+        return {
+            "mode": request.get("REQUEST_MODE", ""),
+            "reference_epoch": int(request.get("REQUEST_REFERENCE_EPOCH", "0") or "0"),
+            "lookback_seconds": int(request.get("REQUEST_LOOKBACK_SECONDS", "0") or "0"),
+            "target_paths": target_paths,
+            "created_at": int(request.get("REQUEST_CREATED_AT", "0") or "0"),
+        }
 
     def _start_scheduler_locked(self) -> None:
         if self._config is None:
@@ -565,7 +657,7 @@ class SchedulerManager:
         )
         self._process_exit_code = None
         self._phase = "starting"
-        self._last_event = "Scheduler process started from UI mode."
+        self._last_event = "Scanner process started from UI mode."
 
     def _stop_scheduler_locked(self) -> None:
         if self._process is None:
@@ -584,7 +676,7 @@ class SchedulerManager:
         self._process_exit_code = self._process.returncode
         self._process = None
         self._phase = "stopped"
-        self._last_event = "Scheduler process stopped."
+        self._last_event = "Scanner process stopped."
 
     def _restart_scheduler_locked(self) -> None:
         self._stop_scheduler_locked()
@@ -627,9 +719,9 @@ class SchedulerManager:
         self._process = None
         self._phase = "stopped"
         if return_code == 0:
-            self._last_event = "Scheduler process exited cleanly."
+            self._last_event = "Scanner process exited cleanly."
         else:
-            self._last_warning = f"Scheduler exited with code {return_code}."
+            self._last_warning = f"Scanner exited with code {return_code}."
             self._last_event = self._last_warning
 
     def _poll_logs_locked(self) -> None:
@@ -830,7 +922,7 @@ class SchedulerManager:
             self._last_event = line
             return
 
-        if line.startswith("[FORCE]") or line.startswith("[CHANGED]") or line.startswith("[ERROR]"):
+        if line.startswith("[FORCE]") or line.startswith("[MANUAL]") or line.startswith("[CHANGED]") or line.startswith("[ERROR]"):
             self._last_event = line
 
 
@@ -924,9 +1016,19 @@ class UIRequestHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, {"ok": True, "status": MANAGER.get_status()})
             return
 
-        if parsed.path == "/api/actions/restart":
+        if parsed.path == "/api/actions/manual-changed":
             try:
-                status = MANAGER.restart_scheduler()
+                payload = self._read_json_body()
+                status = MANAGER.queue_manual_changed_scan(payload)
+            except ValueError as exc:
+                json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            json_response(self, HTTPStatus.OK, {"ok": True, "status": status})
+            return
+
+        if parsed.path == "/api/actions/restart-scanner":
+            try:
+                status = MANAGER.restart_scanner()
             except ValueError as exc:
                 json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return

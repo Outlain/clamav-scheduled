@@ -468,7 +468,8 @@ body {
 }
 
 .config-form input,
-.config-form textarea {
+.config-form textarea,
+.config-form select {
   width: 100%;
   border: 1px solid rgba(72, 48, 29, 0.14);
   border-radius: 14px;
@@ -512,6 +513,30 @@ body {
 .form-status {
   margin: 0;
   color: var(--muted);
+}
+
+.manual-mode-group {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.radio-card {
+  display: flex;
+  gap: 0.7rem;
+  align-items: flex-start;
+  padding: 0.95rem 1rem;
+  border-radius: 16px;
+  border: 1px solid rgba(72, 48, 29, 0.12);
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.radio-card input {
+  width: auto;
+  margin-top: 0.15rem;
+}
+
+.manual-drawer {
+  max-width: 620px;
 }
 
 .hidden {

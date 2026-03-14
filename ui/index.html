@@ -20,7 +20,8 @@
         </div>
         <div class="hero-actions">
           <button id="force-full-button" class="action-button accent">Force Full Scan</button>
-          <button id="restart-button" class="action-button ghost">Restart Scheduler</button>
+          <button id="manual-changed-button" class="action-button ghost">Run Changed Scan</button>
+          <button id="restart-button" class="action-button ghost">Restart Scanner</button>
           <button id="toggle-settings-button" class="action-button soft">Settings</button>
         </div>
       </header>
@@ -303,6 +304,63 @@
           <div class="form-actions">
             <p id="form-status" class="form-status">UI mode ignores scheduler env vars and uses this saved configuration.</p>
             <button type="submit" class="action-button accent">Save Configuration</button>
+          </div>
+        </form>
+      </aside>
+
+      <aside id="manual-scan-drawer" class="settings-drawer hidden manual-drawer">
+        <div class="settings-header">
+          <div>
+            <p class="panel-kicker">On-Demand Scan</p>
+            <h2>Run Changed-File Scan</h2>
+          </div>
+          <button id="close-manual-scan-button" class="action-button ghost">Close</button>
+        </div>
+
+        <form id="manual-scan-form" class="config-form">
+          <section class="form-section">
+            <h3>Scope</h3>
+            <p class="section-copy">
+              This runs an extra changed-files scan on demand. It does not advance the normal scheduled scan checkpoints.
+            </p>
+            <div class="manual-mode-group">
+              <label class="radio-card">
+                <input type="radio" name="manual_mode" value="since_last" checked>
+                <span>Since Last Successful Scheduled Checkpoint</span>
+              </label>
+              <label class="radio-card">
+                <input type="radio" name="manual_mode" value="relative">
+                <span>Files Changed Within A Recent Time Window</span>
+              </label>
+            </div>
+            <div id="manual-lookback-wrap" class="field-grid hidden">
+              <label>
+                <span>Lookback Amount</span>
+                <input name="manual_lookback_value" type="number" min="1" value="30">
+              </label>
+              <label>
+                <span>Lookback Unit</span>
+                <select name="manual_lookback_unit">
+                  <option value="minutes">Minutes</option>
+                  <option value="hours">Hours</option>
+                  <option value="days">Days</option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <h3>Optional Target Paths</h3>
+            <label>
+              <span>Only Scan These Files Or Directories</span>
+              <textarea name="manual_target_paths" rows="5" placeholder="/downloads/projects&#10;/downloads/incoming/file.zip"></textarea>
+              <small>Leave blank to scan all configured scan paths. One absolute in-container path per line.</small>
+            </label>
+          </section>
+
+          <div class="form-actions">
+            <p id="manual-form-status" class="form-status">Queued requests wait for the current scan to finish if the scanner is already busy.</p>
+            <button type="submit" class="action-button accent">Queue Changed Scan</button>
           </div>
         </form>
       </aside>
