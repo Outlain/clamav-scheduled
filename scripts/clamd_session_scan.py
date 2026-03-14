@@ -19,6 +19,16 @@ from pathlib import Path
 SESSION_PREFIX_RE = re.compile(r"^\d+:\s+")
 
 
+def is_missing_path_error(detail: str, path: str) -> bool:
+    normalized_detail = detail.lower()
+
+    if "no such file or directory" not in normalized_detail and "can't open file or directory" not in normalized_detail:
+        return False
+
+    parent_dir = os.path.dirname(path) or "."
+    return not os.path.exists(path) and os.path.isdir(parent_dir)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Persistent clamd session scanner")
     parser.add_argument("--socket", required=True, dest="socket_path")
@@ -119,6 +129,7 @@ class Metrics:
         self.processed_files = 0
         self.processed_bytes = 0
         self.infected_files = 0
+        self.vanished_files = 0
         self.error_files = 0
         self.quarantine_failures = 0
         self.slowest_files: list[tuple[int, str, str, int]] = []
@@ -134,6 +145,9 @@ class Metrics:
             if status == "INFECTED":
                 self.infected_files += 1
                 self.root_stats[entry.root]["infected"] += 1
+            elif status == "VANISHED":
+                self.vanished_files += 1
+                self.root_stats[entry.root]["vanished"] += 1
             elif status == "ERROR":
                 self.error_files += 1
                 self.root_stats[entry.root]["errors"] += 1
@@ -155,6 +169,7 @@ class Metrics:
                 "processed_files": self.processed_files,
                 "processed_bytes": self.processed_bytes,
                 "infected_files": self.infected_files,
+                "vanished_files": self.vanished_files,
                 "error_files": self.error_files,
                 "quarantine_failures": self.quarantine_failures,
             }
@@ -214,12 +229,14 @@ class SessionScanner:
         if ": " not in decoded:
             raise RuntimeError(f"Unexpected clamd reply: {decoded}")
 
-        scanned_path, detail = decoded.rsplit(": ", 1)
+        scanned_path, detail = decoded.split(": ", 1)
         if detail == "OK":
             return "CLEAN", scanned_path
         if detail.endswith("FOUND"):
             return "INFECTED", scanned_path
         if detail.endswith("ERROR"):
+            if is_missing_path_error(detail, scanned_path):
+                return "VANISHED", scanned_path
             return "ERROR", scanned_path
         raise RuntimeError(f"Unexpected clamd reply detail: {decoded}")
 
@@ -320,6 +337,8 @@ def worker_loop(
                         quarantine_failed = True
                         status = "ERROR"
                         logger.log(f"[ERROR] [{label}] Failed to quarantine infected file {entry.path}: {exc}")
+                elif status == "VANISHED":
+                    logger.log(f"[{label}] File vanished before scan completed: {entry.path}")
             except Exception as exc:
                 logger.log(f"[ERROR] [{label}] Scan failed for {entry.path}: {exc}")
                 status = "ERROR"
@@ -332,12 +351,18 @@ def worker_loop(
             if should_log:
                 snapshot = metrics.snapshot()
                 elapsed_ms = max(1, (time.monotonic_ns() - start_ns) // 1_000_000)
-                clean_files = max(0, snapshot["processed_files"] - snapshot["infected_files"] - snapshot["error_files"])
+                clean_files = max(
+                    0,
+                    snapshot["processed_files"]
+                    - snapshot["infected_files"]
+                    - snapshot["vanished_files"]
+                    - snapshot["error_files"],
+                )
                 logger.log(
                     f"[{label}] Progress: {processed_files * 100 // metrics.total_files}% "
                     f"({processed_files}/{metrics.total_files}) "
                     f"bytes={format_bytes(snapshot['processed_bytes'])}/{format_bytes(metrics.total_bytes)} "
-                    f"clean={clean_files} infected={snapshot['infected_files']} errors={snapshot['error_files']} "
+                    f"clean={clean_files} infected={snapshot['infected_files']} vanished={snapshot['vanished_files']} errors={snapshot['error_files']} "
                     f"elapsed={format_duration_ms(elapsed_ms)} "
                     f"throughput={format_files_per_second(processed_files, elapsed_ms)} "
                     f"data_rate={format_bytes_per_second(snapshot['processed_bytes'], elapsed_ms)}"
@@ -357,6 +382,7 @@ def build_entries(list_file: str, roots: list[str]) -> tuple[list[FileEntry], di
             "processed_files": 0,
             "processed_bytes": 0,
             "infected": 0,
+            "vanished": 0,
             "errors": 0,
         }
         for root in roots
@@ -420,11 +446,11 @@ def main() -> int:
             thread.join()
 
         elapsed_ms = max(1, (time.monotonic_ns() - start_ns) // 1_000_000)
-        clean_files = max(0, metrics.processed_files - metrics.infected_files - metrics.error_files)
+        clean_files = max(0, metrics.processed_files - metrics.infected_files - metrics.vanished_files - metrics.error_files)
 
         logger.log(
             f"[{args.label}] Summary: scheduled_files={metrics.total_files} indexed_files={metrics.total_files} "
-            f"processed_files={metrics.processed_files} clean={clean_files} infected={metrics.infected_files} "
+            f"processed_files={metrics.processed_files} clean={clean_files} infected={metrics.infected_files} vanished={metrics.vanished_files} "
             f"errors={metrics.error_files} quarantine_failures={metrics.quarantine_failures} "
             f"bytes={format_bytes(metrics.total_bytes)} "
             f"elapsed={format_duration_ms(elapsed_ms)} "
@@ -439,7 +465,7 @@ def main() -> int:
             logger.log(
                 f"[{args.label}] Root summary {root}: files={stats['files']} processed_files={stats['processed_files']} "
                 f"bytes={format_bytes(stats['bytes'])} processed_bytes={format_bytes(stats['processed_bytes'])} "
-                f"infected={stats['infected']} errors={stats['errors']}"
+                f"infected={stats['infected']} vanished={stats['vanished']} errors={stats['errors']}"
             )
 
         for duration_ms, status, path, size_bytes in metrics.slowest_files:

@@ -15,6 +15,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Dynamic chunk sizing for clearer progress logging
 - Separate full-scan and changed-scan concurrency controls
 - Richer scan metrics including bytes, infected/error counts, per-root summaries, and slowest files
+- Treats files that vanish after list-building as non-fatal and reports them separately
 - Pauses and retries if any configured scan root becomes unavailable
 - Persistent state and ClamAV definitions via bind mounts
 
@@ -67,6 +68,8 @@ If a scheduled scan fails, the scheduler retries after `SCAN_FAILURE_RETRY_INTER
 A successful full scan also refreshes the changed-files checkpoint, so the scanner does not immediately rerun a redundant changed-files scan in the same cycle.
 
 Changed-file scans treat either a newer content-modified time or a newer metadata-change time as "changed," which helps catch files copied in with preserved old modification times.
+
+If a file disappears after it was added to the scan list but before `clamd` can scan it, the run records that file as `vanished` instead of failing the entire scan. Real scan errors still fail the run and keep the previous checkpoints in place.
 
 Deprecated environment variables such as `DOWNLOADS_DIR`, `PARALLEL_JOBS`, `CHUNK_SIZE`, `SCAN_INTERVAL`, `CHANGED_SCAN_INTERVAL`, and `FULL_SCAN_INTERVAL` are no longer accepted.
 
