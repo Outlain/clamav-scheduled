@@ -81,5 +81,37 @@ class SessionScannerTests(unittest.TestCase):
         self.assertEqual(scanned_path, "/downloads/subdir/missing.txt")
 
 
+class MetricsTests(unittest.TestCase):
+    def test_progress_snapshot_tracks_window_deltas_between_logs(self):
+        root_stats = {
+            "/downloads": {
+                "files": 2,
+                "bytes": 300,
+                "processed_files": 0,
+                "processed_bytes": 0,
+                "infected": 0,
+                "vanished": 0,
+                "errors": 0,
+            }
+        }
+        metrics = clamd_session_scan.Metrics(total_files=2, total_bytes=300, root_stats=root_stats, progress_interval=1)
+
+        first_entry = clamd_session_scan.FileEntry(path="/downloads/a.txt", size_bytes=100, root="/downloads")
+        second_entry = clamd_session_scan.FileEntry(path="/downloads/b.txt", size_bytes=200, root="/downloads")
+
+        metrics.record(first_entry, "CLEAN", 10, False)
+        first_snapshot = metrics.progress_snapshot(1000)
+
+        metrics.record(second_entry, "CLEAN", 10, False)
+        second_snapshot = metrics.progress_snapshot(3000)
+
+        self.assertEqual(first_snapshot["window_files"], 1)
+        self.assertEqual(first_snapshot["window_bytes"], 100)
+        self.assertEqual(first_snapshot["window_elapsed_ms"], 1000)
+        self.assertEqual(second_snapshot["window_files"], 1)
+        self.assertEqual(second_snapshot["window_bytes"], 200)
+        self.assertEqual(second_snapshot["window_elapsed_ms"], 2000)
+
+
 if __name__ == "__main__":
     unittest.main()

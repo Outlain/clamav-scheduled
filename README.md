@@ -15,6 +15,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Dynamic chunk sizing for clearer progress logging
 - Separate full-scan and changed-scan concurrency controls
 - Richer scan metrics including bytes, infected/error counts, per-root summaries, and slowest files
+- Live progress logs show both running-average and since-last-update throughput/data rates
 - Treats files that vanish after list-building as non-fatal and reports them separately
 - Pauses and retries if any configured scan root becomes unavailable
 - Persistent state and ClamAV definitions via bind mounts

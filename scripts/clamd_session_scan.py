@@ -133,6 +133,9 @@ class Metrics:
         self.error_files = 0
         self.quarantine_failures = 0
         self.slowest_files: list[tuple[int, str, str, int]] = []
+        self.last_log_processed_files = 0
+        self.last_log_processed_bytes = 0
+        self.last_log_elapsed_ms = 0
         self._lock = threading.Lock()
 
     def record(self, entry: FileEntry, status: str, duration_ms: int, quarantine_failed: bool) -> tuple[int, bool]:
@@ -173,6 +176,29 @@ class Metrics:
                 "error_files": self.error_files,
                 "quarantine_failures": self.quarantine_failures,
             }
+
+    def progress_snapshot(self, elapsed_ms: int) -> dict[str, int]:
+        with self._lock:
+            window_elapsed_ms = elapsed_ms - self.last_log_elapsed_ms
+            if window_elapsed_ms < 1:
+                window_elapsed_ms = 1
+
+            snapshot = {
+                "processed_files": self.processed_files,
+                "processed_bytes": self.processed_bytes,
+                "infected_files": self.infected_files,
+                "vanished_files": self.vanished_files,
+                "error_files": self.error_files,
+                "quarantine_failures": self.quarantine_failures,
+                "window_files": self.processed_files - self.last_log_processed_files,
+                "window_bytes": self.processed_bytes - self.last_log_processed_bytes,
+                "window_elapsed_ms": window_elapsed_ms,
+            }
+
+            self.last_log_processed_files = self.processed_files
+            self.last_log_processed_bytes = self.processed_bytes
+            self.last_log_elapsed_ms = elapsed_ms
+            return snapshot
 
 
 class SessionScanner:
@@ -349,8 +375,8 @@ def worker_loop(
             processed_files, should_log = metrics.record(entry, status, duration_ms, quarantine_failed)
 
             if should_log:
-                snapshot = metrics.snapshot()
                 elapsed_ms = max(1, (time.monotonic_ns() - start_ns) // 1_000_000)
+                snapshot = metrics.progress_snapshot(elapsed_ms)
                 clean_files = max(
                     0,
                     snapshot["processed_files"]
@@ -364,8 +390,10 @@ def worker_loop(
                     f"bytes={format_bytes(snapshot['processed_bytes'])}/{format_bytes(metrics.total_bytes)} "
                     f"clean={clean_files} infected={snapshot['infected_files']} vanished={snapshot['vanished_files']} errors={snapshot['error_files']} "
                     f"elapsed={format_duration_ms(elapsed_ms)} "
-                    f"throughput={format_files_per_second(processed_files, elapsed_ms)} "
-                    f"data_rate={format_bytes_per_second(snapshot['processed_bytes'], elapsed_ms)}"
+                    f"avg_throughput={format_files_per_second(processed_files, elapsed_ms)} "
+                    f"window_throughput={format_files_per_second(snapshot['window_files'], snapshot['window_elapsed_ms'])} "
+                    f"avg_data_rate={format_bytes_per_second(snapshot['processed_bytes'], elapsed_ms)} "
+                    f"window_data_rate={format_bytes_per_second(snapshot['window_bytes'], snapshot['window_elapsed_ms'])}"
                 )
 
             work_queue.task_done()
@@ -454,8 +482,8 @@ def main() -> int:
             f"errors={metrics.error_files} quarantine_failures={metrics.quarantine_failures} "
             f"bytes={format_bytes(metrics.total_bytes)} "
             f"elapsed={format_duration_ms(elapsed_ms)} "
-            f"throughput={format_files_per_second(metrics.processed_files, elapsed_ms)} "
-            f"data_rate={format_bytes_per_second(metrics.processed_bytes, elapsed_ms)}"
+            f"avg_throughput={format_files_per_second(metrics.processed_files, elapsed_ms)} "
+            f"avg_data_rate={format_bytes_per_second(metrics.processed_bytes, elapsed_ms)}"
         )
 
         for root in roots:
