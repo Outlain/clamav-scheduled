@@ -5,6 +5,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 ## Features
 
 - Runs `clamd` inside the container
+- Uses a persistent socket-based scan client instead of spawning one `clamdscan` process per file
 - Time-based full-scan schedule using `FULL_SCAN_DAYS` and `FULL_SCAN_TIMES`
 - Time-based changed-files schedule using `CHANGED_SCAN_DAYS` and `CHANGED_SCAN_TIMES`
 - Incremental changed-files scans between full scans
@@ -13,6 +14,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Force full scan via a flag file
 - Dynamic chunk sizing for clearer progress logging
 - Separate full-scan and changed-scan concurrency controls
+- Richer scan metrics including bytes, infected/error counts, per-root summaries, and slowest files
 - Pauses and retries if any configured scan root becomes unavailable
 - Persistent state and ClamAV definitions via bind mounts
 
@@ -26,12 +28,12 @@ This container is designed for trusted local/server use. Review paths, permissio
 - `MAXTHREADS` - clamd thread count
 - `SCAN_PATHS` - colon-separated scan roots inside the container; defaults to `/downloads` and every listed path must be mounted and healthy before a scan runs
 - `EXCLUDE_PATHS` - optional colon-separated in-container file or directory paths to skip during both full and changed scans
-- `FULL_SCAN_PARALLEL_JOBS` - parallel `clamdscan` processes for full scans
-- `CHANGED_SCAN_PARALLEL_JOBS` - parallel `clamdscan` processes for changed-file scans
-- `FULL_PROGRESS_STEPS` - target number of progress updates used to derive full-scan chunk sizes
-- `CHANGED_PROGRESS_STEPS` - target number of progress updates used to derive changed-scan chunk sizes
-- `FULL_CHUNK_SIZE` - optional fixed full-scan chunk size override; `0` keeps dynamic chunk sizing
-- `CHANGED_CHUNK_SIZE` - optional fixed changed-scan chunk size override; `0` keeps dynamic chunk sizing
+- `FULL_SCAN_PARALLEL_JOBS` - parallel persistent scan workers for full scans
+- `CHANGED_SCAN_PARALLEL_JOBS` - parallel persistent scan workers for changed-file scans
+- `FULL_PROGRESS_STEPS` - target number of progress updates used to derive the full-scan progress interval
+- `CHANGED_PROGRESS_STEPS` - target number of progress updates used to derive the changed-scan progress interval
+- `FULL_CHUNK_SIZE` - optional fixed full-scan progress interval override; `0` keeps dynamic sizing
+- `CHANGED_CHUNK_SIZE` - optional fixed changed-scan progress interval override; `0` keeps dynamic sizing
 - `FULL_SCAN_DAYS` - comma-separated days for scheduled full scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`; defaults to `sun`
 - `FULL_SCAN_TIMES` - required comma-separated `HH:MM` times for scheduled full scans in the container timezone
 - `CHANGED_SCAN_DAYS` - comma-separated days for scheduled changed-file scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`; defaults to `*`
@@ -60,6 +62,10 @@ Examples:
 Schedules are evaluated in the container timezone from `TZ`.
 
 If a scheduled scan fails, the scheduler retries after `SCAN_FAILURE_RETRY_INTERVAL` until the scan succeeds or a newer scheduled slot becomes due.
+
+A successful full scan also refreshes the changed-files checkpoint, so the scanner does not immediately rerun a redundant changed-files scan in the same cycle.
+
+Changed-file scans treat either a newer content-modified time or a newer metadata-change time as "changed," which helps catch files copied in with preserved old modification times.
 
 Deprecated environment variables such as `DOWNLOADS_DIR`, `PARALLEL_JOBS`, `CHUNK_SIZE`, `SCAN_INTERVAL`, `CHANGED_SCAN_INTERVAL`, and `FULL_SCAN_INTERVAL` are no longer accepted.
 

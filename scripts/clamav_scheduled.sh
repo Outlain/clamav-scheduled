@@ -329,30 +329,6 @@ LAST_FULL="$STATE_DIR/last_full_scan_epoch"
 NEXT_CHANGED_RETRY_EPOCH=0
 NEXT_FULL_RETRY_EPOCH=0
 
-run_clamdscan_chunk() {
-  CHUNK_FILE="$1"
-  CHUNK_PARALLEL_JOBS="$2"
-
-  xargs -d '\n' -a "$CHUNK_FILE" -r -n 1 -P "$CHUNK_PARALLEL_JOBS" \
-    sh -c '
-      QUARANTINE_DIR="$1"
-      SCANLOG="$2"
-      FILE_TO_SCAN="$3"
-
-      if clamdscan --fdpass -i --move="$QUARANTINE_DIR" --no-summary -- "$FILE_TO_SCAN" >> "$SCANLOG" 2>&1; then
-        exit 0
-      fi
-
-      RC=$?
-      if [ "$RC" -eq 1 ]; then
-        exit 0
-      fi
-
-      printf "[ERROR] clamdscan failed for %s (exit=%s)\n" "$FILE_TO_SCAN" "$RC" >> "$SCANLOG"
-      exit 1
-    ' sh "$QUARANTINE_DIR" "$SCANLOG"
-}
-
 min_int() {
   A="$1"
   B="$2"
@@ -593,13 +569,16 @@ append_scan_path_list() {
   LIST_FILE="$3"
   REFERENCE_EPOCH="$4"
   RAW_LIST_FILE="$TMP_DIR/${LABEL}_raw_list.txt"
+  REFERENCE_FILE="$TMP_DIR/${LABEL}_reference.timestamp"
 
   : > "$RAW_LIST_FILE"
 
   if [ "$LABEL" = "CHANGED" ]; then
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" -newermt "@${REFERENCE_EPOCH}" > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+    touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
       append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
       rm -f "$RAW_LIST_FILE"
+      rm -f "$REFERENCE_FILE"
       return 0
     fi
   else
@@ -612,6 +591,7 @@ append_scan_path_list() {
 
   RC=$?
   rm -f "$RAW_LIST_FILE"
+  rm -f "$REFERENCE_FILE"
   if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
     echo "[WARN] [$LABEL] Timed out while enumerating files under $SCAN_PATH. The mount may be unavailable." | tee -a "$SCANLOG"
     return 2
@@ -672,42 +652,24 @@ run_scan_list() {
   EFFECTIVE_PARALLEL_JOBS=$(min_int "$TOTAL" "$CONFIGURED_PARALLEL_JOBS")
   EFFECTIVE_CHUNK_SIZE=$(get_chunk_size "$TOTAL" "$REQUESTED_CHUNK_SIZE" "$PROGRESS_STEPS" "$EFFECTIVE_PARALLEL_JOBS")
 
-  echo "[$LABEL] Scanning ${TOTAL} files with parallel_jobs=${EFFECTIVE_PARALLEL_JOBS} chunk_size=${EFFECTIVE_CHUNK_SIZE} progress_steps=${PROGRESS_STEPS}" | tee -a "$SCANLOG"
+  echo "[$LABEL] Scanning ${TOTAL} files with persistent_session_workers=${EFFECTIVE_PARALLEL_JOBS} progress_interval=${EFFECTIVE_CHUNK_SIZE}" | tee -a "$SCANLOG"
 
-  CHUNKDIR="$TMP_DIR/${LABEL}_chunks"
-  rm -rf "$CHUNKDIR"
-  mkdir -p "$CHUNKDIR"
-
-  split -l "$EFFECTIVE_CHUNK_SIZE" "$LIST_FILE" "$CHUNKDIR/chunk_"
-
-  DONE=0
-  START=$(date +%s)
-
-  for CHUNK in "$CHUNKDIR"/chunk_*; do
-    [ -f "$CHUNK" ] || continue
-    C=$(wc -l < "$CHUNK" | tr -d ' ')
-
-    if ! run_clamdscan_chunk "$CHUNK" "$EFFECTIVE_PARALLEL_JOBS"; then
-      echo "[ERROR] clamdscan failed during ${LABEL} scan. Not counting this chunk." | tee -a "$SCANLOG"
-      return 1
-    fi
-
-    DONE=$((DONE + C))
-    NOW2=$(date +%s)
-    ELAPSED=$((NOW2 - START))
-    [ "$ELAPSED" -lt 1 ] && ELAPSED=1
-    RATE=$((DONE / ELAPSED))
-    PCT=$((DONE * 100 / TOTAL))
-
-    echo "[$LABEL] Progress: ${PCT}% (${DONE}/${TOTAL}) ~${RATE} files/s" | tee -a "$SCANLOG"
-  done
-
-  if [ "$DONE" -eq "$TOTAL" ]; then
+  RESULTS_FILE="$TMP_DIR/${LABEL}_results.tsv"
+  if python3 /usr/local/bin/clamd_session_scan.py \
+    --socket /tmp/clamd.sock \
+    --list-file "$LIST_FILE" \
+    --results-file "$RESULTS_FILE" \
+    --quarantine-dir "$QUARANTINE_DIR" \
+    --workers "$EFFECTIVE_PARALLEL_JOBS" \
+    --progress-interval "$EFFECTIVE_CHUNK_SIZE" \
+    --label "$LABEL" \
+    --scanlog "$SCANLOG" \
+    --scan-paths "$SCAN_PATHS"; then
     echo "[$LABEL] Completed successfully." | tee -a "$SCANLOG"
     return 0
   fi
 
-  echo "[WARN] ${LABEL} scan incomplete (${DONE}/${TOTAL})." | tee -a "$SCANLOG"
+  echo "[WARN] ${LABEL} scan incomplete (${TOTAL} scheduled files)." | tee -a "$SCANLOG"
   return 1
 }
 
@@ -753,12 +715,24 @@ while true; do
     echo "=== FULL SCAN starting ===" | tee -a "$SCANLOG"
 
     FULL_LIST="$TMP_DIR/full_list.txt"
+    FULL_SCAN_CUTOFF=$(date +%s)
 
     if build_scan_list "FULL" "$FULL_LIST" 0; then
       if run_scan_list "$FULL_LIST" "FULL" "$FULL_SCAN_PARALLEL_JOBS" "$FULL_CHUNK_SIZE" "$FULL_PROGRESS_STEPS"; then
         date +%s > "$LAST_FULL" || true
+        if [ "$FULL_SCAN_CUTOFF" -gt "$LAST_CHANGED_EPOCH" ]; then
+          echo "$FULL_SCAN_CUTOFF" > "$LAST_CHANGED" || true
+          LAST_CHANGED_EPOCH="$FULL_SCAN_CUTOFF"
+          echo "[CHANGED] Updated changed-file checkpoint to successful full-scan cutoff $(date -d "@$FULL_SCAN_CUTOFF")." | tee -a "$SCANLOG"
+        fi
+        NEXT_CHANGED_RETRY_EPOCH=0
         NEXT_FULL_RETRY_EPOCH=0
         echo "=== FULL SCAN finished ===" | tee -a "$SCANLOG"
+
+        if [ "$CHANGED_DUE" -eq 1 ]; then
+          CHANGED_DUE=0
+          echo "[CHANGED] Skipping changed-files scan because the successful full scan already covered files through $(date -d "@$FULL_SCAN_CUTOFF")." | tee -a "$SCANLOG"
+        fi
 
         if [ "$FORCE" -eq 1 ] && [ -f "$FORCE_FULL_FLAG" ]; then
           rm -f -- "$FORCE_FULL_FLAG"
