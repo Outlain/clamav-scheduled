@@ -117,6 +117,7 @@ class Metrics:
         self.root_stats = root_stats
         self.progress_interval = max(1, progress_interval)
         self.processed_files = 0
+        self.processed_bytes = 0
         self.infected_files = 0
         self.error_files = 0
         self.quarantine_failures = 0
@@ -126,6 +127,9 @@ class Metrics:
     def record(self, entry: FileEntry, status: str, duration_ms: int, quarantine_failed: bool) -> tuple[int, bool]:
         with self._lock:
             self.processed_files += 1
+            self.processed_bytes += entry.size_bytes
+            self.root_stats[entry.root]["processed_files"] += 1
+            self.root_stats[entry.root]["processed_bytes"] += entry.size_bytes
 
             if status == "INFECTED":
                 self.infected_files += 1
@@ -144,6 +148,16 @@ class Metrics:
 
             should_log = self.processed_files % self.progress_interval == 0 or self.processed_files == self.total_files
             return self.processed_files, should_log
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "processed_files": self.processed_files,
+                "processed_bytes": self.processed_bytes,
+                "infected_files": self.infected_files,
+                "error_files": self.error_files,
+                "quarantine_failures": self.quarantine_failures,
+            }
 
 
 class SessionScanner:
@@ -316,10 +330,17 @@ def worker_loop(
             processed_files, should_log = metrics.record(entry, status, duration_ms, quarantine_failed)
 
             if should_log:
+                snapshot = metrics.snapshot()
                 elapsed_ms = max(1, (time.monotonic_ns() - start_ns) // 1_000_000)
+                clean_files = max(0, snapshot["processed_files"] - snapshot["infected_files"] - snapshot["error_files"])
                 logger.log(
                     f"[{label}] Progress: {processed_files * 100 // metrics.total_files}% "
-                    f"({processed_files}/{metrics.total_files}) ~{format_files_per_second(processed_files, elapsed_ms)}"
+                    f"({processed_files}/{metrics.total_files}) "
+                    f"bytes={format_bytes(snapshot['processed_bytes'])}/{format_bytes(metrics.total_bytes)} "
+                    f"clean={clean_files} infected={snapshot['infected_files']} errors={snapshot['error_files']} "
+                    f"elapsed={format_duration_ms(elapsed_ms)} "
+                    f"throughput={format_files_per_second(processed_files, elapsed_ms)} "
+                    f"data_rate={format_bytes_per_second(snapshot['processed_bytes'], elapsed_ms)}"
                 )
 
             work_queue.task_done()
@@ -329,7 +350,17 @@ def worker_loop(
 
 def build_entries(list_file: str, roots: list[str]) -> tuple[list[FileEntry], dict[str, dict[str, int]], int]:
     entries: list[FileEntry] = []
-    root_stats = {root: {"files": 0, "bytes": 0, "infected": 0, "errors": 0} for root in roots}
+    root_stats = {
+        root: {
+            "files": 0,
+            "bytes": 0,
+            "processed_files": 0,
+            "processed_bytes": 0,
+            "infected": 0,
+            "errors": 0,
+        }
+        for root in roots
+    }
     total_bytes = 0
 
     with open(list_file, "r", encoding="utf-8", errors="surrogateescape") as handle:
@@ -367,11 +398,6 @@ def main() -> int:
             logger.log(f"[{args.label}] No files found to scan.")
             return 0
 
-        logger.log(
-            f"[{args.label}] Scanning {total_files} files with persistent_session_workers={args.workers} "
-            f"progress_interval={args.progress_interval}"
-        )
-
         work_queue: "queue.Queue[FileEntry]" = queue.Queue()
         for entry in entries:
             work_queue.put(entry)
@@ -399,10 +425,11 @@ def main() -> int:
         logger.log(
             f"[{args.label}] Summary: scheduled_files={metrics.total_files} indexed_files={metrics.total_files} "
             f"processed_files={metrics.processed_files} clean={clean_files} infected={metrics.infected_files} "
-            f"errors={metrics.error_files} bytes={format_bytes(metrics.total_bytes)} "
+            f"errors={metrics.error_files} quarantine_failures={metrics.quarantine_failures} "
+            f"bytes={format_bytes(metrics.total_bytes)} "
             f"elapsed={format_duration_ms(elapsed_ms)} "
             f"throughput={format_files_per_second(metrics.processed_files, elapsed_ms)} "
-            f"data_rate={format_bytes_per_second(metrics.total_bytes, elapsed_ms)}"
+            f"data_rate={format_bytes_per_second(metrics.processed_bytes, elapsed_ms)}"
         )
 
         for root in roots:
@@ -410,8 +437,9 @@ def main() -> int:
             if stats["files"] <= 0:
                 continue
             logger.log(
-                f"[{args.label}] Root summary {root}: files={stats['files']} "
-                f"bytes={format_bytes(stats['bytes'])} infected={stats['infected']} errors={stats['errors']}"
+                f"[{args.label}] Root summary {root}: files={stats['files']} processed_files={stats['processed_files']} "
+                f"bytes={format_bytes(stats['bytes'])} processed_bytes={format_bytes(stats['processed_bytes'])} "
+                f"infected={stats['infected']} errors={stats['errors']}"
             )
 
         for duration_ms, status, path, size_bytes in metrics.slowest_files:

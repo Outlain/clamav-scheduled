@@ -342,7 +342,7 @@ min_int() {
   fi
 }
 
-get_chunk_size() {
+get_progress_interval() {
   TOTAL="$1"
   REQUESTED_CHUNK_SIZE="$2"
   PROGRESS_STEPS="$3"
@@ -665,9 +665,18 @@ run_scan_list() {
   fi
 
   EFFECTIVE_PARALLEL_JOBS=$(min_int "$TOTAL" "$CONFIGURED_PARALLEL_JOBS")
-  EFFECTIVE_CHUNK_SIZE=$(get_chunk_size "$TOTAL" "$REQUESTED_CHUNK_SIZE" "$PROGRESS_STEPS" "$EFFECTIVE_PARALLEL_JOBS")
+  EFFECTIVE_PROGRESS_INTERVAL=$(get_progress_interval "$TOTAL" "$REQUESTED_CHUNK_SIZE" "$PROGRESS_STEPS" "$EFFECTIVE_PARALLEL_JOBS")
 
-  echo "[$LABEL] Scanning ${TOTAL} files with persistent_session_workers=${EFFECTIVE_PARALLEL_JOBS} progress_interval=${EFFECTIVE_CHUNK_SIZE}" | tee -a "$SCANLOG"
+  if [ "$REQUESTED_CHUNK_SIZE" -gt 0 ]; then
+    PROGRESS_INTERVAL_MODE="fixed"
+    PROGRESS_INTERVAL_DETAIL="configured_interval=${REQUESTED_CHUNK_SIZE}"
+  else
+    PROGRESS_INTERVAL_MODE="auto"
+    PROGRESS_INTERVAL_DETAIL="derived_interval=ceil(${TOTAL}/${PROGRESS_STEPS}) capped_by_worker_floor=${EFFECTIVE_PARALLEL_JOBS}"
+  fi
+
+  echo "[$LABEL] Scanning ${TOTAL} files with persistent_session_workers=${EFFECTIVE_PARALLEL_JOBS}" | tee -a "$SCANLOG"
+  echo "[$LABEL] Progress logging uses file-count checkpoints, not scan chunks: mode=${PROGRESS_INTERVAL_MODE} progress_interval=${EFFECTIVE_PROGRESS_INTERVAL} ${PROGRESS_INTERVAL_DETAIL}" | tee -a "$SCANLOG"
 
   RESULTS_FILE="$TMP_DIR/${LABEL}_results.tsv"
   if python3 /usr/local/bin/clamd_session_scan.py \
@@ -676,7 +685,7 @@ run_scan_list() {
     --results-file "$RESULTS_FILE" \
     --quarantine-dir "$QUARANTINE_DIR" \
     --workers "$EFFECTIVE_PARALLEL_JOBS" \
-    --progress-interval "$EFFECTIVE_CHUNK_SIZE" \
+    --progress-interval "$EFFECTIVE_PROGRESS_INTERVAL" \
     --label "$LABEL" \
     --scanlog "$SCANLOG" \
     --scan-paths "$SCAN_PATHS"; then
