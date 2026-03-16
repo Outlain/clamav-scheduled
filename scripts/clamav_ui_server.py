@@ -379,6 +379,44 @@ def format_scan_label(label: str) -> str:
     return "Full Scan" if label == "FULL" else "Changed-Files Scan"
 
 
+def history_entry_identity(entry: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        entry.get("label"),
+        entry.get("cycle_started_at"),
+        entry.get("scheduled_files"),
+        entry.get("indexed_files"),
+        entry.get("processed_files"),
+        entry.get("clean"),
+        entry.get("infected"),
+        entry.get("vanished"),
+        entry.get("errors"),
+        entry.get("quarantine_failures"),
+        entry.get("bytes"),
+        entry.get("elapsed"),
+    )
+
+
+def dedupe_history_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    by_identity: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+    for entry in entries:
+        identity = history_entry_identity(entry)
+        existing = by_identity.get(identity)
+        if existing is None:
+            cloned = deepcopy(entry)
+            deduped.append(cloned)
+            by_identity[identity] = cloned
+            continue
+
+        existing_roots = existing.setdefault("roots", [])
+        for root_entry in entry.get("roots", []):
+            if root_entry not in existing_roots:
+                existing_roots.append(deepcopy(root_entry))
+
+    return deduped
+
+
 def recent_tail_lines(path: Path, max_lines: int = 200) -> list[str]:
     if not path.exists():
         return []
@@ -457,7 +495,8 @@ class SchedulerManager:
         self._process_exit_code: int | None = None
         self._config_error = ""
         self._config: dict[str, Any] | None = None
-        self._history: list[dict[str, Any]] = read_json(self.history_path, default=[]) or []
+        raw_history = read_json(self.history_path, default=[]) or []
+        self._history: list[dict[str, Any]] = dedupe_history_entries(raw_history)
         self._recent_logs: deque[str] = deque(maxlen=250)
         self._phase = "unconfigured"
         self._next_wake = ""
@@ -473,6 +512,8 @@ class SchedulerManager:
 
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        if self._history != raw_history:
+            write_json_atomic(self.history_path, self._history)
 
         self._load_config_from_disk()
         self._replay_existing_log()
@@ -851,14 +892,19 @@ class SchedulerManager:
         except OSError:
             return
 
-    def _append_history_locked(self, entry: dict[str, Any]) -> None:
-        if self._history and self._history[-1] == entry:
-            return
+    def _append_history_locked(self, entry: dict[str, Any]) -> dict[str, Any]:
+        identity = history_entry_identity(entry)
+        for existing in self._history:
+            if history_entry_identity(existing) == identity:
+                self._last_summary = existing
+                return existing
+
         self._history.append(entry)
         if len(self._history) > 100:
             self._history = self._history[-100:]
         write_json_atomic(self.history_path, self._history)
         self._last_summary = entry
+        return entry
 
     def _handle_log_line(self, raw_line: str, replay: bool = False) -> None:
         line = sanitize_line(raw_line)
@@ -995,6 +1041,9 @@ class SchedulerManager:
 
         summary_match = SUMMARY_RE.match(line)
         if summary_match:
+            if replay:
+                self._last_event = line
+                return
             label = summary_match.group("label")
             entry = {
                 "label": label,
@@ -1022,22 +1071,25 @@ class SchedulerManager:
             return
 
         root_match = ROOT_SUMMARY_RE.match(line)
-        if root_match and self._history:
-            latest = self._history[-1]
+        if root_match:
+            if replay or self._last_summary is None:
+                return
+            latest = self._last_summary
             if latest.get("label") == root_match.group("label"):
-                latest.setdefault("roots", []).append(
-                    {
-                        "root": root_match.group("root"),
-                        "files": int(root_match.group("files")),
-                        "processed_files": int(root_match.group("processed_files")),
-                        "bytes": root_match.group("bytes"),
-                        "processed_bytes": root_match.group("processed_bytes"),
-                        "infected": int(root_match.group("infected")),
-                        "vanished": int(root_match.group("vanished")),
-                        "errors": int(root_match.group("errors")),
-                    }
-                )
-                write_json_atomic(self.history_path, self._history)
+                root_entry = {
+                    "root": root_match.group("root"),
+                    "files": int(root_match.group("files")),
+                    "processed_files": int(root_match.group("processed_files")),
+                    "bytes": root_match.group("bytes"),
+                    "processed_bytes": root_match.group("processed_bytes"),
+                    "infected": int(root_match.group("infected")),
+                    "vanished": int(root_match.group("vanished")),
+                    "errors": int(root_match.group("errors")),
+                }
+                roots = latest.setdefault("roots", [])
+                if root_entry not in roots:
+                    roots.append(root_entry)
+                    write_json_atomic(self.history_path, self._history)
             return
 
         if line.startswith("=== Scan cycle finished ==="):

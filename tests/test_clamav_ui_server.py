@@ -77,6 +77,92 @@ class UIConfigValidationTests(unittest.TestCase):
 
 
 class UISchedulerManagerTests(unittest.TestCase):
+    def test_manager_dedupes_existing_history_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            duplicate_entry = {
+                "label": "FULL",
+                "display_label": "Full Scan",
+                "cycle_started_at": "Sun Mar 15 08:30:00 UTC 2026",
+                "scheduled_files": 100,
+                "indexed_files": 100,
+                "processed_files": 100,
+                "clean": 100,
+                "infected": 0,
+                "vanished": 0,
+                "errors": 0,
+                "quarantine_failures": 0,
+                "bytes": "3.0 GiB",
+                "elapsed": "1m",
+                "avg_throughput": "10 files/s",
+                "avg_data_rate": "100 MiB/s",
+                "roots": [{"root": "/downloads", "files": 100, "processed_files": 100, "bytes": "3.0 GiB", "processed_bytes": "3.0 GiB", "infected": 0, "vanished": 0, "errors": 0}],
+            }
+            clamav_ui_server.write_json_atomic(config_dir / "ui-history.json", [duplicate_entry, duplicate_entry])
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            try:
+                history = clamav_ui_server.read_json(config_dir / "ui-history.json", default=[])
+            finally:
+                manager.shutdown()
+
+            self.assertEqual(len(history), 1)
+
+    def test_log_replay_does_not_duplicate_history_summaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            scanlog = temp_path / "clamav.log"
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            existing_entry = {
+                "label": "FULL",
+                "display_label": "Full Scan",
+                "cycle_started_at": "Sun Mar 15 08:30:00 UTC 2026",
+                "scheduled_files": 100,
+                "indexed_files": 100,
+                "processed_files": 100,
+                "clean": 100,
+                "infected": 0,
+                "vanished": 0,
+                "errors": 0,
+                "quarantine_failures": 0,
+                "bytes": "3.0 GiB",
+                "elapsed": "1m",
+                "avg_throughput": "10 files/s",
+                "avg_data_rate": "100 MiB/s",
+                "roots": [],
+            }
+            clamav_ui_server.write_json_atomic(config_dir / "ui-history.json", [existing_entry])
+            scanlog.write_text(
+                "\n".join(
+                    [
+                        "=== Sun Mar 15 08:30:00 UTC 2026 Scan cycle starting (full_due=1 changed_due=0) ===",
+                        "[FULL] Summary: scheduled_files=100 indexed_files=100 processed_files=100 clean=100 infected=0 vanished=0 errors=0 quarantine_failures=0 bytes=3.0 GiB elapsed=1m avg_throughput=10 files/s avg_data_rate=100 MiB/s",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            manager._log_path = scanlog
+
+            try:
+                manager._replay_existing_log()
+            finally:
+                manager.shutdown()
+
+            history = clamav_ui_server.read_json(config_dir / "ui-history.json", default=[])
+            self.assertEqual(len(history), 1)
+
     def test_no_scans_line_clears_stale_current_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
