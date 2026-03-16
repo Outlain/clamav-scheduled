@@ -193,6 +193,55 @@ class UISchedulerManagerTests(unittest.TestCase):
 
             self.assertEqual(len(history), 2)
 
+    def test_manager_keeps_nearby_identical_history_entries_when_both_have_traces(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            base_entry = {
+                "label": "FULL",
+                "display_label": "Full Scan",
+                "scheduled_files": 42922,
+                "indexed_files": 42922,
+                "processed_files": 42922,
+                "clean": 42922,
+                "infected": 0,
+                "vanished": 0,
+                "errors": 0,
+                "quarantine_failures": 0,
+                "bytes": "5.47 TiB",
+                "elapsed": "23h 46m 2s",
+                "avg_throughput": "0.50 files/s",
+                "avg_data_rate": "66.90 MiB/s",
+                "progress_trace": [
+                    {
+                        "percent": 50,
+                        "processed_files": 21461,
+                        "total_files": 42922,
+                        "elapsed_seconds": 100.0,
+                        "avg_throughput_files_per_sec": 1.0,
+                        "window_throughput_files_per_sec": 1.1,
+                        "avg_data_rate_mib_per_sec": 50.0,
+                        "window_data_rate_mib_per_sec": 52.0,
+                    }
+                ],
+                "roots": [],
+            }
+            entry_a = {**base_entry, "cycle_started_at": "Mon Mar 16 01:03:08 UTC 2026"}
+            entry_b = {**base_entry, "cycle_started_at": "Mon Mar 16 01:27:20 UTC 2026"}
+            clamav_ui_server.write_json_atomic(config_dir / "ui-history.json", [entry_a, entry_b])
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            try:
+                history = clamav_ui_server.read_json(config_dir / "ui-history.json", default=[])
+            finally:
+                manager.shutdown()
+
+            self.assertEqual(len(history), 2)
+
     def test_manager_dedupes_existing_history_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -449,6 +498,49 @@ class UISchedulerManagerTests(unittest.TestCase):
                 manager.shutdown()
 
             self.assertEqual(status["pending_manual_changed_request"]["reference_epoch"], 12345)
+
+    def test_progress_trace_is_saved_with_completed_scan_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+
+            try:
+                manager._handle_log_line(
+                    "=== Mon Mar 16 01:03:08 UTC 2026 Scan cycle starting (full_due=1 changed_due=0) ==="
+                )
+                manager._handle_log_line("=== FULL SCAN starting ===")
+                manager._handle_log_line("[FULL] Scanning 100 files with persistent_session_workers=8")
+                manager._handle_log_line(
+                    "[FULL] Progress: 25% (25/100) bytes=1.0 GiB/4.0 GiB clean=25 infected=0 vanished=0 errors=0 "
+                    "elapsed=30s avg_throughput=0.83 files/s window_throughput=0.83 files/s "
+                    "avg_data_rate=34.13 MiB/s window_data_rate=34.13 MiB/s"
+                )
+                manager._handle_log_line(
+                    "[FULL] Progress: 50% (50/100) bytes=2.5 GiB/4.0 GiB clean=50 infected=0 vanished=0 errors=0 "
+                    "elapsed=1m 10s avg_throughput=0.71 files/s window_throughput=0.56 files/s "
+                    "avg_data_rate=36.57 MiB/s window_data_rate=39.90 MiB/s"
+                )
+                manager._handle_log_line(
+                    "[FULL] Summary: scheduled_files=100 indexed_files=100 processed_files=100 clean=100 infected=0 "
+                    "vanished=0 errors=0 quarantine_failures=0 bytes=4.0 GiB elapsed=2m 0s "
+                    "avg_throughput=0.83 files/s avg_data_rate=34.13 MiB/s"
+                )
+            finally:
+                manager.shutdown()
+
+            history = clamav_ui_server.read_json(config_dir / "ui-history.json", default=[])
+            self.assertEqual(len(history), 1)
+            trace = history[0]["progress_trace"]
+            self.assertEqual(len(trace), 2)
+            self.assertEqual(trace[0]["percent"], 25)
+            self.assertAlmostEqual(trace[1]["elapsed_seconds"], 70.0)
+            self.assertAlmostEqual(trace[1]["window_throughput_files_per_sec"], 0.56)
+            self.assertAlmostEqual(trace[1]["window_data_rate_mib_per_sec"], 39.90)
 
 
 if __name__ == "__main__":

@@ -139,10 +139,13 @@
           <div class="panel-header">
             <div>
               <p class="panel-kicker">Recent Scans</p>
-              <h2>History</h2>
+              <h2>Performance History</h2>
             </div>
           </div>
-          <canvas id="history-chart" width="640" height="220"></canvas>
+          <p class="section-copy trace-copy">
+            Recent scan traces show checkpoint-to-checkpoint speed, so slowdowns are easier to spot than with a simple completion bar.
+          </p>
+          <div id="history-traces" class="history-traces"></div>
           <div id="history-empty" class="empty-state">Recent summaries will appear here after completed scans.</div>
           <div id="history-list" class="history-list"></div>
         </article>

@@ -347,20 +347,142 @@ body {
 .definition-grid dd {
   margin: 0;
   line-height: 1.4;
-}
-
-.chart-panel canvas {
-  width: 100%;
-  height: auto;
-  display: block;
-  border-radius: 18px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0.16));
-  border: 1px solid rgba(72, 48, 29, 0.08);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .empty-state {
   margin-top: 0.9rem;
   color: var(--muted);
+}
+
+.trace-copy {
+  margin-top: -0.35rem;
+}
+
+.history-traces {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 0.9rem;
+}
+
+.trace-empty {
+  padding: 1rem 1.1rem;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.38);
+  border: 1px dashed rgba(72, 48, 29, 0.16);
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.trace-card {
+  padding: 1rem;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.46);
+  border: 1px solid rgba(72, 48, 29, 0.08);
+}
+
+.trace-card-head,
+.trace-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.9rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.trace-overline {
+  margin: 0 0 0.25rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.trace-card h3 {
+  margin: 0;
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.trace-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.42rem 0.75rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.trace-badge-full {
+  background: rgba(15, 118, 110, 0.12);
+  color: #0f766e;
+}
+
+.trace-badge-changed {
+  background: rgba(180, 83, 9, 0.12);
+  color: #b45309;
+}
+
+.trace-chart-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.8rem;
+  margin-top: 0.9rem;
+}
+
+.trace-metric-card {
+  padding: 0.85rem;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.45);
+  border: 1px solid rgba(72, 48, 29, 0.08);
+}
+
+.trace-metric-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.trace-metric-label {
+  display: block;
+  color: var(--muted);
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.trace-metric-head strong {
+  display: block;
+  margin-top: 0.22rem;
+  font-size: 1rem;
+}
+
+.trace-metric-meta,
+.trace-footer {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.trace-svg {
+  width: 100%;
+  height: 120px;
+  display: block;
+}
+
+.trace-grid-line {
+  stroke: rgba(72, 48, 29, 0.12);
+  stroke-width: 1;
+}
+
+.trace-footer {
+  margin-top: 0.85rem;
+  line-height: 1.5;
 }
 
 .history-list {
@@ -388,6 +510,13 @@ body {
   margin-top: 0.5rem;
   color: var(--muted);
   font-size: 0.92rem;
+}
+
+.status-meta span,
+.history-head span,
+.history-meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .log-output {

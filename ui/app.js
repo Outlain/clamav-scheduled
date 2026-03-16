@@ -42,6 +42,15 @@ function setVisible(id, visible) {
   $(id).classList.toggle("hidden", !visible);
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function joinLines(values) {
   return (values || []).join("\n");
 }
@@ -266,79 +275,211 @@ function updateRuntimePanel(status) {
   setText("scanlog-value", status.scanlog || "n/a");
 }
 
+function formatRateNumber(value) {
+  if (!Number.isFinite(value)) {
+    return "n/a";
+  }
+  if (value >= 100) {
+    return value.toFixed(0);
+  }
+  if (value >= 10) {
+    return value.toFixed(1);
+  }
+  if (value >= 1) {
+    return value.toFixed(2);
+  }
+  if (value === 0) {
+    return "0";
+  }
+  return value.toFixed(3);
+}
+
+function formatFilesRateValue(value) {
+  return Number.isFinite(value) ? `${formatRateNumber(value)} files/s` : "n/a";
+}
+
+function formatDataRateValue(mibPerSecond) {
+  if (!Number.isFinite(mibPerSecond)) {
+    return "n/a";
+  }
+
+  const units = [
+    { label: "TiB/s", factor: 1024 * 1024 },
+    { label: "GiB/s", factor: 1024 },
+    { label: "MiB/s", factor: 1 },
+    { label: "KiB/s", factor: 1 / 1024 },
+    { label: "B/s", factor: 1 / (1024 * 1024) },
+  ];
+
+  for (const unit of units) {
+    if (mibPerSecond >= unit.factor || unit.label === "B/s") {
+      return `${formatRateNumber(mibPerSecond / unit.factor)} ${unit.label}`;
+    }
+  }
+
+  return "n/a";
+}
+
+function buildTraceSamples(trace, valueKey) {
+  return (trace || [])
+    .map((point, index) => {
+      const rawValue = Number(point?.[valueKey]);
+      const elapsedSeconds = Number(point?.elapsed_seconds);
+      return {
+        elapsedSeconds: Number.isFinite(elapsedSeconds) ? elapsedSeconds : index,
+        value: Number.isFinite(rawValue) ? rawValue : null,
+      };
+    })
+    .filter((point) => point.value !== null);
+}
+
+function buildTraceSvg(samples, color) {
+  const width = 320;
+  const height = 112;
+  const paddingX = 10;
+  const paddingY = 12;
+  const plotWidth = width - paddingX * 2;
+  const plotHeight = height - paddingY * 2;
+
+  if (!samples.length) {
+    return `
+      <svg viewBox="0 0 ${width} ${height}" class="trace-svg" aria-hidden="true">
+        <rect x="${paddingX}" y="${paddingY}" width="${plotWidth}" height="${plotHeight}" rx="12" fill="rgba(44, 32, 22, 0.04)"></rect>
+      </svg>
+    `;
+  }
+
+  const maxElapsed = Math.max(samples[samples.length - 1].elapsedSeconds, 1);
+  const maxValue = Math.max(...samples.map((point) => point.value), 1);
+  const midY = paddingY + plotHeight / 2;
+  const bottomY = paddingY + plotHeight;
+
+  const points = samples.map((point, index) => {
+    const x = paddingX + (index === 0 ? 0 : (point.elapsedSeconds / maxElapsed) * plotWidth);
+    const y = paddingY + (1 - point.value / maxValue) * plotHeight;
+    return { x, y };
+  });
+
+  const linePath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ");
+  const areaPath = `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${bottomY.toFixed(2)} L ${points[0].x.toFixed(2)} ${bottomY.toFixed(2)} Z`;
+  const endPoint = points[points.length - 1];
+
+  return `
+    <svg viewBox="0 0 ${width} ${height}" class="trace-svg" aria-hidden="true">
+      <rect x="${paddingX}" y="${paddingY}" width="${plotWidth}" height="${plotHeight}" rx="12" fill="rgba(44, 32, 22, 0.04)"></rect>
+      <line x1="${paddingX}" y1="${paddingY}" x2="${width - paddingX}" y2="${paddingY}" class="trace-grid-line"></line>
+      <line x1="${paddingX}" y1="${midY}" x2="${width - paddingX}" y2="${midY}" class="trace-grid-line"></line>
+      <line x1="${paddingX}" y1="${bottomY}" x2="${width - paddingX}" y2="${bottomY}" class="trace-grid-line"></line>
+      <path d="${areaPath}" fill="${color}" fill-opacity="0.12"></path>
+      <path d="${linePath}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+      <circle cx="${endPoint.x.toFixed(2)}" cy="${endPoint.y.toFixed(2)}" r="4.5" fill="${color}"></circle>
+    </svg>
+  `;
+}
+
+function renderHistoryTraces(history) {
+  const container = $("history-traces");
+  container.innerHTML = "";
+
+  const entries = (history || [])
+    .filter((entry) => Array.isArray(entry.progress_trace) && entry.progress_trace.length > 1)
+    .slice(-3)
+    .reverse();
+
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "trace-empty";
+    empty.textContent = "Detailed speed traces will appear here after recent scans complete with progress checkpoints.";
+    container.appendChild(empty);
+    return;
+  }
+
+  entries.forEach((entry) => {
+    const throughputSamples = buildTraceSamples(entry.progress_trace, "window_throughput_files_per_sec");
+    const dataRateSamples = buildTraceSamples(entry.progress_trace, "window_data_rate_mib_per_sec");
+    const latestThroughput = throughputSamples.length ? throughputSamples[throughputSamples.length - 1].value : NaN;
+    const peakThroughput = throughputSamples.length ? Math.max(...throughputSamples.map((point) => point.value)) : NaN;
+    const latestDataRate = dataRateSamples.length ? dataRateSamples[dataRateSamples.length - 1].value : NaN;
+    const peakDataRate = dataRateSamples.length ? Math.max(...dataRateSamples.map((point) => point.value)) : NaN;
+
+    const card = document.createElement("article");
+    card.className = "trace-card";
+    card.innerHTML = `
+      <div class="trace-card-head">
+        <div>
+          <p class="trace-overline">${escapeHtml(entry.display_label || "Recent Scan")}</p>
+          <h3>${escapeHtml(entry.cycle_started_at || "Recently completed")}</h3>
+        </div>
+        <div class="trace-badge trace-badge-${escapeHtml((entry.label || "CHANGED").toLowerCase())}">
+          ${escapeHtml(entry.label || "SCAN")}
+        </div>
+      </div>
+      <div class="trace-chart-grid">
+        <section class="trace-metric-card">
+          <div class="trace-metric-head">
+            <div>
+              <span class="trace-metric-label">Window Throughput</span>
+              <strong>${escapeHtml(formatFilesRateValue(latestThroughput))}</strong>
+            </div>
+            <span class="trace-metric-meta">Peak ${escapeHtml(formatFilesRateValue(peakThroughput))}</span>
+          </div>
+          ${buildTraceSvg(throughputSamples, "#0f766e")}
+        </section>
+        <section class="trace-metric-card">
+          <div class="trace-metric-head">
+            <div>
+              <span class="trace-metric-label">Window Data Rate</span>
+              <strong>${escapeHtml(formatDataRateValue(latestDataRate))}</strong>
+            </div>
+            <span class="trace-metric-meta">Peak ${escapeHtml(formatDataRateValue(peakDataRate))}</span>
+          </div>
+          ${buildTraceSvg(dataRateSamples, "#b45309")}
+        </section>
+      </div>
+      <div class="trace-footer">
+        <span>${escapeHtml(`${entry.progress_trace.length} checkpoints across ${entry.elapsed || "the scan"}`)}</span>
+        <span>${escapeHtml(`Final averages: ${entry.avg_throughput || "n/a"} and ${entry.avg_data_rate || "n/a"}`)}</span>
+      </div>
+    `;
+    container.appendChild(card);
+  });
+}
+
 function renderHistory(history) {
   const list = $("history-list");
   list.innerHTML = "";
 
   if (!history || history.length === 0) {
     setVisible("history-empty", true);
-    renderHistoryChart([]);
+    renderHistoryTraces([]);
     return;
   }
 
   setVisible("history-empty", false);
+  renderHistoryTraces(history);
+
   history.slice(-8).reverse().forEach((entry) => {
     const card = document.createElement("article");
     card.className = "history-item";
     card.innerHTML = `
       <div class="history-head">
-        <strong>${entry.display_label}</strong>
-        <span>${entry.cycle_started_at || "recently"}</span>
+        <strong>${escapeHtml(entry.display_label)}</strong>
+        <span>${escapeHtml(entry.cycle_started_at || "recently")}</span>
       </div>
       <div class="history-meta">
-        <span>Processed ${entry.processed_files} / ${entry.scheduled_files} files</span>
-        <span>Elapsed ${entry.elapsed}</span>
-        <span>Avg ${entry.avg_throughput}</span>
-        <span>Data ${entry.avg_data_rate}</span>
+        <span>${escapeHtml(`Processed ${entry.processed_files} / ${entry.scheduled_files} files`)}</span>
+        <span>${escapeHtml(`Elapsed ${entry.elapsed}`)}</span>
+        <span>${escapeHtml(`Avg ${entry.avg_throughput}`)}</span>
+        <span>${escapeHtml(`Data ${entry.avg_data_rate}`)}</span>
       </div>
       <div class="history-meta">
-        <span>Clean ${entry.clean}</span>
-        <span>Infected ${entry.infected}</span>
-        <span>Vanished ${entry.vanished}</span>
-        <span>Errors ${entry.errors}</span>
+        <span>${escapeHtml(`Clean ${entry.clean}`)}</span>
+        <span>${escapeHtml(`Infected ${entry.infected}`)}</span>
+        <span>${escapeHtml(`Vanished ${entry.vanished}`)}</span>
+        <span>${escapeHtml(`Errors ${entry.errors}`)}</span>
       </div>
     `;
     list.appendChild(card);
-  });
-
-  renderHistoryChart(history.slice(-12));
-}
-
-function renderHistoryChart(history) {
-  const canvas = $("history-chart");
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  if (!history || history.length === 0) {
-    return;
-  }
-
-  const width = canvas.width;
-  const height = canvas.height;
-  const padding = 26;
-  const barGap = 18;
-  const chartWidth = width - padding * 2;
-  const chartHeight = height - padding * 2;
-  const maxProcessed = Math.max(...history.map((entry) => entry.processed_files || 0), 1);
-  const barWidth = Math.max(18, (chartWidth - barGap * (history.length - 1)) / history.length);
-
-  ctx.fillStyle = "rgba(44, 32, 22, 0.08)";
-  ctx.fillRect(padding, padding, chartWidth, chartHeight);
-
-  history.forEach((entry, index) => {
-    const x = padding + index * (barWidth + barGap);
-    const heightScale = (entry.processed_files || 0) / maxProcessed;
-    const barHeight = Math.max(8, chartHeight * heightScale);
-    const y = padding + chartHeight - barHeight;
-    const gradient = ctx.createLinearGradient(0, y, 0, y + barHeight);
-    gradient.addColorStop(0, "#0f766e");
-    gradient.addColorStop(1, "#b45309");
-    ctx.fillStyle = gradient;
-    ctx.fillRect(x, y, barWidth, barHeight);
-
-    ctx.fillStyle = "#2c2016";
-    ctx.font = "12px 'Trebuchet MS', sans-serif";
-    ctx.fillText(entry.label === "FULL" ? "F" : "C", x + barWidth / 2 - 4, height - 8);
   });
 }
 

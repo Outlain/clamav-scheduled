@@ -95,6 +95,9 @@ ROOT_SUMMARY_RE = re.compile(
 )
 CYCLE_START_RE = re.compile(r"^=== (?P<stamp>.+?) Scan cycle starting")
 NO_SCANS_RE = re.compile(r"^=== (?P<stamp>.+?) No scans due\. Next wake at (?P<next_wake>.+?) ===$")
+FILES_PER_SECOND_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)\s+files/s$")
+DATA_RATE_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)\s+(?P<unit>B|KiB|MiB|GiB|TiB)/s$")
+ELAPSED_PART_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>h|m|s)")
 
 
 BOOTSTRAP_ENV_KEYS = {
@@ -380,6 +383,86 @@ def format_scan_label(label: str) -> str:
 
 
 HISTORY_DEDUPE_WINDOW_SECONDS = 7200
+MIB_PER_UNIT = {
+    "B": 1.0 / (1024.0 * 1024.0),
+    "KiB": 1.0 / 1024.0,
+    "MiB": 1.0,
+    "GiB": 1024.0,
+    "TiB": 1024.0 * 1024.0,
+}
+
+
+def parse_files_per_second(value: Any) -> float | None:
+    if not isinstance(value, str):
+        return None
+    match = FILES_PER_SECOND_RE.match(value.strip())
+    if not match:
+        return None
+    return float(match.group("value"))
+
+
+def parse_data_rate_to_mib_per_second(value: Any) -> float | None:
+    if not isinstance(value, str):
+        return None
+    match = DATA_RATE_RE.match(value.strip())
+    if not match:
+        return None
+    return float(match.group("value")) * MIB_PER_UNIT[match.group("unit")]
+
+
+def parse_elapsed_seconds(value: Any) -> float | None:
+    if not isinstance(value, str):
+        return None
+    matches = list(ELAPSED_PART_RE.finditer(value.strip()))
+    if not matches:
+        return None
+
+    total_seconds = 0.0
+    for match in matches:
+        amount = float(match.group("value"))
+        unit = match.group("unit")
+        if unit == "h":
+            total_seconds += amount * 3600.0
+        elif unit == "m":
+            total_seconds += amount * 60.0
+        else:
+            total_seconds += amount
+    return total_seconds
+
+
+def history_entry_has_trace(entry: dict[str, Any]) -> bool:
+    trace = entry.get("progress_trace")
+    return isinstance(trace, list) and bool(trace)
+
+
+def merge_history_entry(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+    existing["cycle_started_at"] = choose_preferred_cycle_started_at(
+        existing.get("cycle_started_at"),
+        incoming.get("cycle_started_at"),
+    )
+
+    existing_roots = existing.setdefault("roots", [])
+    for root_entry in incoming.get("roots", []):
+        if root_entry not in existing_roots:
+            existing_roots.append(deepcopy(root_entry))
+
+    existing_trace = existing.get("progress_trace") or []
+    incoming_trace = incoming.get("progress_trace") or []
+    if len(incoming_trace) > len(existing_trace):
+        existing["progress_trace"] = deepcopy(incoming_trace)
+
+
+def build_progress_trace_point(progress_match: re.Match[str]) -> dict[str, Any]:
+    return {
+        "percent": int(progress_match.group("percent")),
+        "processed_files": int(progress_match.group("processed")),
+        "total_files": int(progress_match.group("total")),
+        "elapsed_seconds": parse_elapsed_seconds(progress_match.group("elapsed")),
+        "avg_throughput_files_per_sec": parse_files_per_second(progress_match.group("avg_throughput")),
+        "window_throughput_files_per_sec": parse_files_per_second(progress_match.group("window_throughput")),
+        "avg_data_rate_mib_per_sec": parse_data_rate_to_mib_per_second(progress_match.group("avg_data_rate")),
+        "window_data_rate_mib_per_sec": parse_data_rate_to_mib_per_second(progress_match.group("window_data_rate")),
+    }
 
 
 def history_summary_identity(entry: dict[str, Any]) -> tuple[Any, ...]:
@@ -395,6 +478,8 @@ def history_summary_identity(entry: dict[str, Any]) -> tuple[Any, ...]:
         entry.get("quarantine_failures"),
         entry.get("bytes"),
         entry.get("elapsed"),
+        entry.get("avg_throughput"),
+        entry.get("avg_data_rate"),
     )
 
 
@@ -437,6 +522,9 @@ def history_entries_match(existing: dict[str, Any], incoming: dict[str, Any]) ->
     if history_summary_identity(existing) != history_summary_identity(incoming):
         return False
 
+    if history_entry_has_trace(existing) and history_entry_has_trace(incoming):
+        return existing.get("cycle_started_at") == incoming.get("cycle_started_at")
+
     existing_dt = parse_history_timestamp(existing.get("cycle_started_at"))
     incoming_dt = parse_history_timestamp(incoming.get("cycle_started_at"))
     if existing_dt and incoming_dt:
@@ -461,14 +549,7 @@ def dedupe_history_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]
             if not history_entries_match(existing, cloned):
                 continue
 
-            existing["cycle_started_at"] = choose_preferred_cycle_started_at(
-                existing.get("cycle_started_at"),
-                cloned.get("cycle_started_at"),
-            )
-            existing_roots = existing.setdefault("roots", [])
-            for root_entry in cloned.get("roots", []):
-                if root_entry not in existing_roots:
-                    existing_roots.append(deepcopy(root_entry))
+            merge_history_entry(existing, cloned)
             matched = True
             break
 
@@ -564,6 +645,7 @@ class SchedulerManager:
         self._last_event = "Waiting for UI configuration."
         self._last_warning = ""
         self._current_scan: dict[str, Any] | None = None
+        self._current_scan_trace: list[dict[str, Any]] = []
         self._last_summary: dict[str, Any] | None = self._history[-1] if self._history else None
         self._current_cycle_started_at = ""
         self._last_scan_kind = ""
@@ -840,6 +922,7 @@ class SchedulerManager:
             self._process_exit_code = self._process.returncode
             self._process = None
             self._current_scan = None
+            self._current_scan_trace = []
             return
 
         had_active_scan = self._current_scan is not None
@@ -852,6 +935,7 @@ class SchedulerManager:
         self._process_exit_code = self._process.returncode
         self._process = None
         self._current_scan = None
+        self._current_scan_trace = []
         self._phase = "stopped"
         if had_active_scan:
             self._last_warning = (
@@ -875,6 +959,7 @@ class SchedulerManager:
     def _reset_runtime_state_from_replay_locked(self) -> None:
         self._next_wake = ""
         self._current_scan = None
+        self._current_scan_trace = []
         self._current_cycle_started_at = ""
         self._last_scan_kind = ""
         self._last_event = "Waiting for scanner activity."
@@ -917,6 +1002,7 @@ class SchedulerManager:
         self._process_exit_code = return_code
         self._process = None
         self._current_scan = None
+        self._current_scan_trace = []
         self._phase = "stopped"
         if return_code == 0:
             if had_active_scan:
@@ -956,10 +1042,7 @@ class SchedulerManager:
     def _append_history_locked(self, entry: dict[str, Any]) -> dict[str, Any]:
         for existing in self._history:
             if history_entries_match_live(existing, entry):
-                existing["cycle_started_at"] = choose_preferred_cycle_started_at(
-                    existing.get("cycle_started_at"),
-                    entry.get("cycle_started_at"),
-                )
+                merge_history_entry(existing, entry)
                 self._last_summary = existing
                 write_json_atomic(self.history_path, self._history)
                 return existing
@@ -990,6 +1073,7 @@ class SchedulerManager:
             self._next_wake = no_scans_match.group("next_wake")
             self._last_event = f"No scans due. Next wake at {self._next_wake}."
             self._current_scan = None
+            self._current_scan_trace = []
             self._last_scan_kind = ""
             return
 
@@ -1000,10 +1084,12 @@ class SchedulerManager:
                 return
             self._phase = "scanning"
             self._last_scan_kind = "FULL"
+            self._current_scan_trace = []
             self._current_scan = {
                 "label": "FULL",
                 "display_label": format_scan_label("FULL"),
                 "started_at": self._current_cycle_started_at or utc_now_iso(),
+                "progress_trace": [],
             }
             self._last_event = "Full scan started."
             return
@@ -1015,10 +1101,12 @@ class SchedulerManager:
                 return
             self._phase = "scanning"
             self._last_scan_kind = "CHANGED"
+            self._current_scan_trace = []
             self._current_scan = {
                 "label": "CHANGED",
                 "display_label": format_scan_label("CHANGED"),
                 "started_at": self._current_cycle_started_at or utc_now_iso(),
+                "progress_trace": [],
             }
             self._last_event = "Changed-files scan started."
             return
@@ -1026,6 +1114,7 @@ class SchedulerManager:
         if line.startswith("=== Scan cycle paused due to unavailable scan path ==="):
             self._phase = "paused"
             self._current_scan = None
+            self._current_scan_trace = []
             self._last_warning = line
             self._last_event = line
             return
@@ -1033,6 +1122,7 @@ class SchedulerManager:
         if line.startswith("[LOCKED]"):
             self._phase = "waiting_lock"
             self._current_scan = None
+            self._current_scan_trace = []
             self._last_event = line
             return
 
@@ -1048,10 +1138,12 @@ class SchedulerManager:
                 return
             label = scan_start_match.group("label")
             if self._current_scan is None or self._current_scan.get("label") != label:
+                self._current_scan_trace = []
                 self._current_scan = {
                     "label": label,
                     "display_label": format_scan_label(label),
                     "started_at": self._current_cycle_started_at or utc_now_iso(),
+                    "progress_trace": [],
                 }
             self._current_scan["total_files"] = int(scan_start_match.group("total"))
             self._current_scan["workers"] = int(scan_start_match.group("workers"))
@@ -1076,12 +1168,15 @@ class SchedulerManager:
                 return
             label = progress_match.group("label")
             if self._current_scan is None or self._current_scan.get("label") != label:
+                self._current_scan_trace = []
                 self._current_scan = {
                     "label": label,
                     "display_label": format_scan_label(label),
                     "started_at": self._current_cycle_started_at or utc_now_iso(),
+                    "progress_trace": [],
                 }
             self._phase = "scanning"
+            self._current_scan_trace.append(build_progress_trace_point(progress_match))
             self._current_scan.update(
                 {
                     "percent": int(progress_match.group("percent")),
@@ -1098,6 +1193,7 @@ class SchedulerManager:
                     "window_throughput": progress_match.group("window_throughput"),
                     "avg_data_rate": progress_match.group("avg_data_rate"),
                     "window_data_rate": progress_match.group("window_data_rate"),
+                    "progress_trace": deepcopy(self._current_scan_trace[-120:]),
                     "updated_at": utc_now_iso(),
                 }
             )
@@ -1126,12 +1222,14 @@ class SchedulerManager:
                 "elapsed": summary_match.group("elapsed"),
                 "avg_throughput": summary_match.group("avg_throughput"),
                 "avg_data_rate": summary_match.group("avg_data_rate"),
+                "progress_trace": deepcopy(self._current_scan_trace),
                 "roots": [],
             }
             self._append_history_locked(entry)
             self._phase = "cycle_complete"
             self._last_event = line
             self._current_scan = None
+            self._current_scan_trace = []
             self._last_scan_kind = label
             return
 
@@ -1161,6 +1259,7 @@ class SchedulerManager:
             if self._process is not None and self._process.poll() is None:
                 self._phase = "idle"
             self._current_scan = None
+            self._current_scan_trace = []
             self._last_event = line
             return
 
