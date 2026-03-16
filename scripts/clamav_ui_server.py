@@ -445,6 +445,13 @@ def history_entries_match(existing: dict[str, Any], incoming: dict[str, Any]) ->
     return existing.get("cycle_started_at") == incoming.get("cycle_started_at")
 
 
+def history_entries_match_live(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    return (
+        history_summary_identity(existing) == history_summary_identity(incoming)
+        and existing.get("cycle_started_at") == incoming.get("cycle_started_at")
+    )
+
+
 def dedupe_history_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: list[dict[str, Any]] = []
     for entry in entries:
@@ -948,7 +955,7 @@ class SchedulerManager:
 
     def _append_history_locked(self, entry: dict[str, Any]) -> dict[str, Any]:
         for existing in self._history:
-            if history_entries_match(existing, entry):
+            if history_entries_match_live(existing, entry):
                 existing["cycle_started_at"] = choose_preferred_cycle_started_at(
                     existing.get("cycle_started_at"),
                     entry.get("cycle_started_at"),

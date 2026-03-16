@@ -77,6 +77,46 @@ class UIConfigValidationTests(unittest.TestCase):
 
 
 class UISchedulerManagerTests(unittest.TestCase):
+    def test_live_history_append_keeps_nearby_identical_scans_with_different_timestamps(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            first_entry = {
+                "label": "FULL",
+                "display_label": "Full Scan",
+                "cycle_started_at": "Mon Mar 16 01:03:08 UTC 2026",
+                "scheduled_files": 42922,
+                "indexed_files": 42922,
+                "processed_files": 42922,
+                "clean": 42922,
+                "infected": 0,
+                "vanished": 0,
+                "errors": 0,
+                "quarantine_failures": 0,
+                "bytes": "5.47 TiB",
+                "elapsed": "23h 46m 2s",
+                "avg_throughput": "0.50 files/s",
+                "avg_data_rate": "66.90 MiB/s",
+                "roots": [],
+            }
+            second_entry = {
+                **first_entry,
+                "cycle_started_at": "Mon Mar 16 01:27:20 UTC 2026",
+            }
+
+            try:
+                manager._append_history_locked(first_entry)
+                manager._append_history_locked(second_entry)
+            finally:
+                manager.shutdown()
+
+            self.assertEqual(len(manager._history), 2)
+
     def test_manager_dedupes_nearby_history_entries_with_different_timestamps(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
