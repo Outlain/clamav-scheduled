@@ -77,6 +77,64 @@ class UIConfigValidationTests(unittest.TestCase):
 
 
 class UISchedulerManagerTests(unittest.TestCase):
+    def test_no_scans_line_clears_stale_current_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            manager._current_scan = {
+                "label": "FULL",
+                "display_label": "Full Scan",
+                "percent": 31,
+            }
+
+            try:
+                manager._handle_log_line(
+                    "=== Mon Mar 16 12:00:00 UTC 2026 No scans due. Next wake at Mon Mar 16 13:00:00 UTC 2026 ==="
+                )
+            finally:
+                manager.shutdown()
+
+            self.assertEqual(manager._phase, "idle")
+            self.assertEqual(manager._next_wake, "Mon Mar 16 13:00:00 UTC 2026")
+            self.assertIsNone(manager._current_scan)
+
+    def test_log_replay_does_not_restore_historical_in_progress_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            scanlog = temp_path / "clamav.log"
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+            scanlog.write_text(
+                "\n".join(
+                    [
+                        "=== FULL SCAN starting ===",
+                        "[FULL] Scanning 100 files with persistent_session_workers=8",
+                        "[FULL] Progress: 31% (31/100) bytes=1.0 GiB/3.0 GiB clean=31 infected=0 vanished=0 errors=0 elapsed=1m avg_throughput=10 files/s window_throughput=9 files/s avg_data_rate=100 MiB/s window_data_rate=95 MiB/s",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            manager._log_path = scanlog
+            manager._phase = "starting"
+
+            try:
+                manager._replay_existing_log()
+            finally:
+                manager.shutdown()
+
+            self.assertIsNone(manager._current_scan)
+            self.assertNotEqual(manager._phase, "scanning")
+
     def test_queue_manual_full_scan_writes_request_file_with_ignore_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

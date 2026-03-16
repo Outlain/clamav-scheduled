@@ -661,6 +661,8 @@ class SchedulerManager:
         elif not scheduler_running and phase not in {"unconfigured", "config_error"}:
             phase = "stopped"
 
+        current_scan = deepcopy(self._current_scan) if scheduler_running and phase == "scanning" else None
+
         payload = {
             "mode": "ui",
             "configured": self._config is not None and not self._config_error,
@@ -672,7 +674,7 @@ class SchedulerManager:
             "next_wake": self._next_wake,
             "last_event": self._last_event,
             "last_warning": self._last_warning,
-            "current_scan": deepcopy(self._current_scan),
+            "current_scan": current_scan,
             "last_summary": deepcopy(self._last_summary),
             "scanlog": self._config["scanlog"] if self._config else DEFAULT_CONFIG["scanlog"],
             "pending_manual_full_request": self._read_manual_request_locked(self.manual_full_request_path),
@@ -735,8 +737,10 @@ class SchedulerManager:
         if self._process.poll() is not None:
             self._process_exit_code = self._process.returncode
             self._process = None
+            self._current_scan = None
             return
 
+        had_active_scan = self._current_scan is not None
         self._process.terminate()
         try:
             self._process.wait(timeout=10)
@@ -745,8 +749,15 @@ class SchedulerManager:
             self._process.wait(timeout=5)
         self._process_exit_code = self._process.returncode
         self._process = None
+        self._current_scan = None
         self._phase = "stopped"
-        self._last_event = "Scanner process stopped."
+        if had_active_scan:
+            self._last_warning = (
+                "Scanner process stopped while a scan was in progress. The interrupted scan will be retried later because checkpoints were not advanced."
+            )
+            self._last_event = self._last_warning
+        else:
+            self._last_event = "Scanner process stopped."
 
     def _restart_scheduler_locked(self) -> None:
         self._stop_scheduler_locked()
@@ -759,12 +770,27 @@ class SchedulerManager:
         if replay:
             self._replay_existing_log()
 
+    def _reset_runtime_state_from_replay_locked(self) -> None:
+        self._next_wake = ""
+        self._current_scan = None
+        self._current_cycle_started_at = ""
+        self._last_scan_kind = ""
+        self._last_event = "Waiting for scanner activity."
+        self._last_warning = ""
+
     def _replay_existing_log(self) -> None:
         if self._log_path is None or not self._log_path.exists():
             return
         self._recent_logs.clear()
+        self._reset_runtime_state_from_replay_locked()
         for line in recent_tail_lines(self._log_path, max_lines=200):
             self._handle_log_line(line, replay=True)
+
+        if self._current_scan is not None:
+            self._current_scan = None
+            if self._phase in {"scanning", "waiting_lock", "starting", "cycle_complete"}:
+                self._phase = "idle" if self._next_wake else "stopped"
+
         try:
             stat_result = self._log_path.stat()
         except OSError:
@@ -785,11 +811,19 @@ class SchedulerManager:
         return_code = self._process.poll()
         if return_code is None:
             return
+        had_active_scan = self._current_scan is not None
         self._process_exit_code = return_code
         self._process = None
+        self._current_scan = None
         self._phase = "stopped"
         if return_code == 0:
-            self._last_event = "Scanner process exited cleanly."
+            if had_active_scan:
+                self._last_warning = (
+                    "Scanner process exited while a scan was in progress. The interrupted scan will be retried later because checkpoints were not advanced."
+                )
+                self._last_event = self._last_warning
+            else:
+                self._last_event = "Scanner process exited cleanly."
         else:
             self._last_warning = f"Scanner exited with code {return_code}."
             self._last_event = self._last_warning
@@ -844,11 +878,15 @@ class SchedulerManager:
             self._phase = "idle"
             self._next_wake = no_scans_match.group("next_wake")
             self._last_event = f"No scans due. Next wake at {self._next_wake}."
-            if self._current_scan is None:
-                self._last_scan_kind = ""
+            self._current_scan = None
+            self._last_scan_kind = ""
             return
 
         if line.startswith("=== FULL SCAN starting ==="):
+            if replay:
+                self._last_scan_kind = "FULL"
+                self._last_event = "Historical full scan start detected in log replay."
+                return
             self._phase = "scanning"
             self._last_scan_kind = "FULL"
             self._current_scan = {
@@ -860,6 +898,10 @@ class SchedulerManager:
             return
 
         if line.startswith("=== CHANGED-FILES scan starting ==="):
+            if replay:
+                self._last_scan_kind = "CHANGED"
+                self._last_event = "Historical changed-files scan start detected in log replay."
+                return
             self._phase = "scanning"
             self._last_scan_kind = "CHANGED"
             self._current_scan = {
@@ -872,12 +914,14 @@ class SchedulerManager:
 
         if line.startswith("=== Scan cycle paused due to unavailable scan path ==="):
             self._phase = "paused"
+            self._current_scan = None
             self._last_warning = line
             self._last_event = line
             return
 
         if line.startswith("[LOCKED]"):
             self._phase = "waiting_lock"
+            self._current_scan = None
             self._last_event = line
             return
 
@@ -887,6 +931,10 @@ class SchedulerManager:
 
         scan_start_match = SCAN_START_RE.match(line)
         if scan_start_match:
+            if replay:
+                self._last_scan_kind = scan_start_match.group("label")
+                self._last_event = line
+                return
             label = scan_start_match.group("label")
             if self._current_scan is None or self._current_scan.get("label") != label:
                 self._current_scan = {
@@ -901,6 +949,8 @@ class SchedulerManager:
 
         progress_config_match = PROGRESS_CONFIG_RE.match(line)
         if progress_config_match:
+            if replay:
+                return
             if self._current_scan is not None:
                 self._current_scan["progress_mode"] = progress_config_match.group("mode")
                 self._current_scan["progress_interval"] = int(progress_config_match.group("interval"))
@@ -909,6 +959,10 @@ class SchedulerManager:
 
         progress_match = PROGRESS_RE.match(line)
         if progress_match:
+            if replay:
+                self._last_scan_kind = progress_match.group("label")
+                self._last_event = line
+                return
             label = progress_match.group("label")
             if self._current_scan is None or self._current_scan.get("label") != label:
                 self._current_scan = {
@@ -989,6 +1043,7 @@ class SchedulerManager:
         if line.startswith("=== Scan cycle finished ==="):
             if self._process is not None and self._process.poll() is None:
                 self._phase = "idle"
+            self._current_scan = None
             self._last_event = line
             return
 
