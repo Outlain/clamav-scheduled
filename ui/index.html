@@ -15,11 +15,11 @@
           <p class="eyebrow">ClamAV Scheduled</p>
           <h1>Scanner Control Room</h1>
           <p class="hero-copy">
-            Configure schedules, inspect scan health, and force a full scan without editing environment variables.
+            Configure schedules, inspect scan health, and launch scoped full or changed scans without editing environment variables.
           </p>
         </div>
         <div class="hero-actions">
-          <button id="force-full-button" class="action-button accent">Force Full Scan</button>
+          <button id="manual-full-button" class="action-button accent">Run Full Scan</button>
           <button id="manual-changed-button" class="action-button ghost">Run Changed Scan</button>
           <button id="restart-button" class="action-button ghost">Restart Scanner</button>
           <button id="toggle-settings-button" class="action-button soft">Settings</button>
@@ -308,6 +308,48 @@
         </form>
       </aside>
 
+      <aside id="manual-full-drawer" class="settings-drawer hidden manual-drawer">
+        <div class="settings-header">
+          <div>
+            <p class="panel-kicker">On-Demand Scan</p>
+            <h2>Run Full Scan</h2>
+          </div>
+          <button id="close-manual-full-button" class="action-button ghost">Close</button>
+        </div>
+
+        <form id="manual-full-form" class="config-form">
+          <section class="form-section">
+            <h3>Scope</h3>
+            <p class="section-copy">
+              This queues an extra full scan from the UI. Leave target paths blank to scan every configured scan path. The separate Force Full Trigger File is still available for simple NAS-side file triggering.
+            </p>
+          </section>
+
+          <section class="form-section">
+            <h3>Optional Target Paths</h3>
+            <label>
+              <span>Only Scan These Files Or Directories</span>
+              <textarea name="manual_full_target_paths" rows="5" placeholder="/downloads/projects&#10;/downloads/incoming/file.zip"></textarea>
+              <small>Leave blank to scan all configured scan paths. One absolute in-container path per line.</small>
+            </label>
+          </section>
+
+          <section class="form-section">
+            <h3>Optional Ignore Paths</h3>
+            <label>
+              <span>Skip These Files Or Directories For This Full Scan</span>
+              <textarea name="manual_full_ignore_paths" rows="5" placeholder="/downloads/projects/cache&#10;/downloads/private"></textarea>
+              <small>Optional extra ignore list for this one on-demand full scan. Global excluded paths still apply.</small>
+            </label>
+          </section>
+
+          <div class="form-actions">
+            <p id="manual-full-form-status" class="form-status">Queued requests wait for the current scan to finish if the scanner is already busy.</p>
+            <button type="submit" class="action-button accent">Queue Full Scan</button>
+          </div>
+        </form>
+      </aside>
+
       <aside id="manual-scan-drawer" class="settings-drawer hidden manual-drawer">
         <div class="settings-header">
           <div>
@@ -355,6 +397,15 @@
               <span>Only Scan These Files Or Directories</span>
               <textarea name="manual_target_paths" rows="5" placeholder="/downloads/projects&#10;/downloads/incoming/file.zip"></textarea>
               <small>Leave blank to scan all configured scan paths. One absolute in-container path per line.</small>
+            </label>
+          </section>
+
+          <section class="form-section">
+            <h3>Optional Ignore Paths</h3>
+            <label>
+              <span>Skip These Files Or Directories For This Changed Scan</span>
+              <textarea name="manual_ignore_paths" rows="5" placeholder="/downloads/projects/cache&#10;/downloads/private"></textarea>
+              <small>Optional extra ignore list for this one on-demand changed scan. Global excluded paths still apply.</small>
             </label>
           </section>
 

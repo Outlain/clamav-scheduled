@@ -328,6 +328,7 @@ fi
 
 LAST_CHANGED="$STATE_DIR/last_changed_scan_epoch"
 LAST_FULL="$STATE_DIR/last_full_scan_epoch"
+MANUAL_FULL_REQUEST_FILE="$STATE_DIR/manual_full_scan_request.env"
 MANUAL_CHANGED_REQUEST_FILE="$STATE_DIR/manual_changed_scan_request.env"
 NEXT_CHANGED_RETRY_EPOCH=0
 NEXT_FULL_RETRY_EPOCH=0
@@ -418,11 +419,44 @@ get_scan_root_for_path() {
   printf '%s\n' "$MATCHED_ROOT"
 }
 
+load_manual_full_request() {
+  MANUAL_FULL_REQUEST_TARGET_PATHS=""
+  MANUAL_FULL_REQUEST_IGNORE_PATHS=""
+  MANUAL_FULL_REQUEST_CREATED_AT=""
+
+  [ -f "$MANUAL_FULL_REQUEST_FILE" ] || return 1
+
+  while IFS='=' read -r KEY VALUE || [ -n "$KEY" ]; do
+    case "$KEY" in
+      REQUEST_TARGET_PATHS)
+        MANUAL_FULL_REQUEST_TARGET_PATHS="$VALUE"
+        ;;
+      REQUEST_PATHS)
+        [ -n "$MANUAL_FULL_REQUEST_TARGET_PATHS" ] || MANUAL_FULL_REQUEST_TARGET_PATHS="$VALUE"
+        ;;
+      REQUEST_IGNORE_PATHS)
+        MANUAL_FULL_REQUEST_IGNORE_PATHS="$VALUE"
+        ;;
+      REQUEST_CREATED_AT)
+        MANUAL_FULL_REQUEST_CREATED_AT="$VALUE"
+        ;;
+    esac
+  done < "$MANUAL_FULL_REQUEST_FILE"
+
+  validate_optional_path_list_config "MANUAL_FULL_REQUEST_TARGET_PATHS" "$MANUAL_FULL_REQUEST_TARGET_PATHS"
+  validate_optional_path_list_config "MANUAL_FULL_REQUEST_IGNORE_PATHS" "$MANUAL_FULL_REQUEST_IGNORE_PATHS"
+  MANUAL_FULL_REQUEST_TARGET_PATHS=$(normalize_absolute_path_list "MANUAL_FULL_REQUEST_TARGET_PATHS" "$MANUAL_FULL_REQUEST_TARGET_PATHS")
+  MANUAL_FULL_REQUEST_IGNORE_PATHS=$(normalize_absolute_path_list "MANUAL_FULL_REQUEST_IGNORE_PATHS" "$MANUAL_FULL_REQUEST_IGNORE_PATHS")
+
+  return 0
+}
+
 load_manual_changed_request() {
   MANUAL_CHANGED_REQUEST_MODE=""
   MANUAL_CHANGED_REFERENCE_EPOCH=""
   MANUAL_CHANGED_LOOKBACK_SECONDS=0
-  MANUAL_CHANGED_REQUEST_PATHS=""
+  MANUAL_CHANGED_REQUEST_TARGET_PATHS=""
+  MANUAL_CHANGED_REQUEST_IGNORE_PATHS=""
   MANUAL_CHANGED_REQUEST_CREATED_AT=""
 
   [ -f "$MANUAL_CHANGED_REQUEST_FILE" ] || return 1
@@ -438,8 +472,14 @@ load_manual_changed_request() {
       REQUEST_LOOKBACK_SECONDS)
         MANUAL_CHANGED_LOOKBACK_SECONDS="$VALUE"
         ;;
+      REQUEST_TARGET_PATHS)
+        MANUAL_CHANGED_REQUEST_TARGET_PATHS="$VALUE"
+        ;;
       REQUEST_PATHS)
-        MANUAL_CHANGED_REQUEST_PATHS="$VALUE"
+        [ -n "$MANUAL_CHANGED_REQUEST_TARGET_PATHS" ] || MANUAL_CHANGED_REQUEST_TARGET_PATHS="$VALUE"
+        ;;
+      REQUEST_IGNORE_PATHS)
+        MANUAL_CHANGED_REQUEST_IGNORE_PATHS="$VALUE"
         ;;
       REQUEST_CREATED_AT)
         MANUAL_CHANGED_REQUEST_CREATED_AT="$VALUE"
@@ -458,10 +498,19 @@ load_manual_changed_request() {
   validate_nonnegative_numeric_string "$MANUAL_CHANGED_REFERENCE_EPOCH" || return 2
   validate_nonnegative_numeric_string "$MANUAL_CHANGED_LOOKBACK_SECONDS" || return 2
 
-  validate_optional_path_list_config "MANUAL_CHANGED_REQUEST_PATHS" "$MANUAL_CHANGED_REQUEST_PATHS"
-  MANUAL_CHANGED_REQUEST_PATHS=$(normalize_absolute_path_list "MANUAL_CHANGED_REQUEST_PATHS" "$MANUAL_CHANGED_REQUEST_PATHS")
+  validate_optional_path_list_config "MANUAL_CHANGED_REQUEST_TARGET_PATHS" "$MANUAL_CHANGED_REQUEST_TARGET_PATHS"
+  validate_optional_path_list_config "MANUAL_CHANGED_REQUEST_IGNORE_PATHS" "$MANUAL_CHANGED_REQUEST_IGNORE_PATHS"
+  MANUAL_CHANGED_REQUEST_TARGET_PATHS=$(normalize_absolute_path_list "MANUAL_CHANGED_REQUEST_TARGET_PATHS" "$MANUAL_CHANGED_REQUEST_TARGET_PATHS")
+  MANUAL_CHANGED_REQUEST_IGNORE_PATHS=$(normalize_absolute_path_list "MANUAL_CHANGED_REQUEST_IGNORE_PATHS" "$MANUAL_CHANGED_REQUEST_IGNORE_PATHS")
 
   return 0
+}
+
+manual_full_request_should_wake() {
+  CURRENT_EPOCH="$1"
+
+  [ -f "$MANUAL_FULL_REQUEST_FILE" ] || return 1
+  [ "$NEXT_FULL_RETRY_EPOCH" -le "$CURRENT_EPOCH" ]
 }
 
 manual_changed_request_should_wake() {
@@ -596,6 +645,18 @@ evaluate_changed_trigger() {
 
 evaluate_full_trigger() {
   FULL_DUE=0
+  FULL_MANUAL_REQUEST=0
+
+  if [ "$MANUAL_FULL_REQUEST" -eq 1 ]; then
+    if [ "$NEXT_FULL_RETRY_EPOCH" -gt "$NOW" ]; then
+      FULL_NEXT_WAKE_EPOCH="$NEXT_FULL_RETRY_EPOCH"
+    else
+      FULL_DUE=1
+      FULL_MANUAL_REQUEST=1
+      FULL_NEXT_WAKE_EPOCH="$NOW"
+    fi
+    return 0
+  fi
 
   if [ "$FORCE" -eq 1 ]; then
     if [ "$NEXT_FULL_RETRY_EPOCH" -gt "$NOW" ]; then
@@ -629,6 +690,11 @@ sleep_until_epoch() {
   echo "Sleeping ${SLEEP_SECONDS}s..." | tee -a "$SCANLOG"
 
   while [ "$CURRENT_EPOCH" -lt "$TARGET_EPOCH" ]; do
+    if manual_full_request_should_wake "$CURRENT_EPOCH"; then
+      echo "[MANUAL] On-demand full scan request detected during sleep; waking early." | tee -a "$SCANLOG"
+      return 0
+    fi
+
     if force_full_should_wake "$CURRENT_EPOCH"; then
       echo "[FORCE] Force-full flag detected during sleep; waking early." | tee -a "$SCANLOG"
       return 0
@@ -681,19 +747,21 @@ check_scan_path_health() {
   return 1
 }
 
-path_is_excluded() {
+path_matches_path_list() {
   FILE_PATH="$1"
+  PATH_LIST="$2"
+
+  [ -n "$PATH_LIST" ] || return 1
+
   OLD_IFS="$IFS"
 
-  [ -n "$EXCLUDE_PATHS" ] || return 1
-
   IFS=':'
-  set -- $EXCLUDE_PATHS
+  set -- $PATH_LIST
   IFS="$OLD_IFS"
 
-  for EXCLUDED_PATH do
+  for LIST_PATH do
     case "$FILE_PATH" in
-      "$EXCLUDED_PATH"|"$EXCLUDED_PATH"/*)
+      "$LIST_PATH"|"$LIST_PATH"/*)
         return 0
         ;;
     esac
@@ -702,12 +770,17 @@ path_is_excluded() {
   return 1
 }
 
+path_is_excluded() {
+  path_matches_path_list "$1" "$EXCLUDE_PATHS"
+}
+
 append_filtered_scan_list() {
   RAW_LIST_FILE="$1"
   LIST_FILE="$2"
+  EXTRA_IGNORE_PATHS="$3"
 
   while IFS= read -r FILE_PATH || [ -n "$FILE_PATH" ]; do
-    if path_is_excluded "$FILE_PATH"; then
+    if path_is_excluded "$FILE_PATH" || path_matches_path_list "$FILE_PATH" "$EXTRA_IGNORE_PATHS"; then
       continue
     fi
 
@@ -720,6 +793,7 @@ append_scan_path_list() {
   SCAN_PATH="$2"
   LIST_FILE="$3"
   REFERENCE_EPOCH="$4"
+  EXTRA_IGNORE_PATHS="$5"
   RAW_LIST_FILE="$TMP_DIR/${LABEL}_raw_list.txt"
   REFERENCE_FILE="$TMP_DIR/${LABEL}_reference.timestamp"
 
@@ -728,14 +802,14 @@ append_scan_path_list() {
   if [ "$LABEL" = "CHANGED" ]; then
     touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"
     if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
+      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"
       rm -f "$RAW_LIST_FILE"
       rm -f "$REFERENCE_FILE"
       return 0
     fi
   else
     if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
+      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"
       rm -f "$RAW_LIST_FILE"
       return 0
     fi
@@ -757,6 +831,7 @@ build_scan_list() {
   LABEL="$1"
   LIST_FILE="$2"
   REFERENCE_EPOCH="$3"
+  EXTRA_IGNORE_PATHS="${4:-}"
   PATH_COUNT=0
   OLD_IFS="$IFS"
 
@@ -775,7 +850,7 @@ build_scan_list() {
       return 2
     fi
 
-    if append_scan_path_list "$LABEL" "$SCAN_PATH" "$LIST_FILE" "$REFERENCE_EPOCH"; then
+    if append_scan_path_list "$LABEL" "$SCAN_PATH" "$LIST_FILE" "$REFERENCE_EPOCH" "$EXTRA_IGNORE_PATHS"; then
       :
     else
       RC=$?
@@ -792,6 +867,7 @@ append_target_scan_path_list() {
   TARGET_PATH="$2"
   LIST_FILE="$3"
   REFERENCE_EPOCH="$4"
+  EXTRA_IGNORE_PATHS="$5"
   TARGET_TOKEN=$(printf '%s' "$TARGET_PATH" | tr '/:' '__')
   RAW_LIST_FILE="$TMP_DIR/${LABEL}_${TARGET_TOKEN}_raw_list.txt"
   REFERENCE_FILE="$TMP_DIR/${LABEL}_${TARGET_TOKEN}_reference.timestamp"
@@ -806,13 +882,13 @@ append_target_scan_path_list() {
   if [ "$LABEL" = "CHANGED" ]; then
     touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"
     if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f -not -path "$QUARANTINE_DIR/*" \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
+      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"
       rm -f "$RAW_LIST_FILE" "$REFERENCE_FILE"
       return 0
     fi
   else
     if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f -not -path "$QUARANTINE_DIR/*" > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE"
+      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"
       rm -f "$RAW_LIST_FILE"
       return 0
     fi
@@ -834,6 +910,7 @@ build_targeted_scan_list() {
   LIST_FILE="$2"
   REFERENCE_EPOCH="$3"
   TARGET_PATHS="$4"
+  EXTRA_IGNORE_PATHS="${5:-}"
   TARGET_COUNT=0
   OLD_IFS="$IFS"
 
@@ -858,7 +935,7 @@ build_targeted_scan_list() {
       return 2
     fi
 
-    if append_target_scan_path_list "$LABEL" "$TARGET_PATH" "$LIST_FILE" "$REFERENCE_EPOCH"; then
+    if append_target_scan_path_list "$LABEL" "$TARGET_PATH" "$LIST_FILE" "$REFERENCE_EPOCH" "$EXTRA_IGNORE_PATHS"; then
       TARGET_COUNT=$((TARGET_COUNT + 1))
     else
       RC=$?
@@ -934,17 +1011,35 @@ while true; do
   LAST_FULL_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
 
   FORCE=0
+  MANUAL_FULL_REQUEST=0
   MANUAL_CHANGED_REQUEST=0
   if [ -f "$FORCE_FULL_FLAG" ]; then
     FORCE=1
     echo "[FORCE] Full scan requested (flag detected): $FORCE_FULL_FLAG" | tee -a "$SCANLOG"
   fi
 
+  if load_manual_full_request; then
+    MANUAL_FULL_REQUEST=1
+    TARGET_DESC="$MANUAL_FULL_REQUEST_TARGET_PATHS"
+    IGNORE_DESC="$MANUAL_FULL_REQUEST_IGNORE_PATHS"
+    [ -n "$TARGET_DESC" ] || TARGET_DESC="$SCAN_PATHS"
+    [ -n "$IGNORE_DESC" ] || IGNORE_DESC="<none>"
+    echo "[MANUAL] On-demand full scan requested (target_paths=${TARGET_DESC} ignore_paths=${IGNORE_DESC})" | tee -a "$SCANLOG"
+  else
+    RC=$?
+    if [ "$RC" -eq 2 ] && [ -f "$MANUAL_FULL_REQUEST_FILE" ]; then
+      echo "[WARN] [MANUAL] Ignoring invalid on-demand full scan request and deleting ${MANUAL_FULL_REQUEST_FILE}." | tee -a "$SCANLOG"
+      rm -f -- "$MANUAL_FULL_REQUEST_FILE"
+    fi
+  fi
+
   if load_manual_changed_request; then
     MANUAL_CHANGED_REQUEST=1
-    TARGET_DESC="$MANUAL_CHANGED_REQUEST_PATHS"
+    TARGET_DESC="$MANUAL_CHANGED_REQUEST_TARGET_PATHS"
+    IGNORE_DESC="$MANUAL_CHANGED_REQUEST_IGNORE_PATHS"
     [ -n "$TARGET_DESC" ] || TARGET_DESC="$SCAN_PATHS"
-    echo "[MANUAL] On-demand changed scan requested (mode=${MANUAL_CHANGED_REQUEST_MODE} reference_epoch=${MANUAL_CHANGED_REFERENCE_EPOCH} lookback_seconds=${MANUAL_CHANGED_LOOKBACK_SECONDS} target_paths=${TARGET_DESC})" | tee -a "$SCANLOG"
+    [ -n "$IGNORE_DESC" ] || IGNORE_DESC="<none>"
+    echo "[MANUAL] On-demand changed scan requested (mode=${MANUAL_CHANGED_REQUEST_MODE} reference_epoch=${MANUAL_CHANGED_REFERENCE_EPOCH} lookback_seconds=${MANUAL_CHANGED_LOOKBACK_SECONDS} target_paths=${TARGET_DESC} ignore_paths=${IGNORE_DESC})" | tee -a "$SCANLOG"
   else
     RC=$?
     if [ "$RC" -eq 2 ] && [ -f "$MANUAL_CHANGED_REQUEST_FILE" ]; then
@@ -974,43 +1069,96 @@ while true; do
 
     FULL_LIST="$TMP_DIR/full_list.txt"
     FULL_SCAN_CUTOFF=$(date +%s)
+    FULL_TARGET_PATHS="$SCAN_PATHS"
+    FULL_IGNORE_PATHS=""
+    FULL_ADVANCES_CHECKPOINTS=1
+    FULL_BUILD_MODE="scan_paths"
 
-    if build_scan_list "FULL" "$FULL_LIST" 0; then
+    if [ "$FULL_MANUAL_REQUEST" -eq 1 ]; then
+      [ -n "$MANUAL_FULL_REQUEST_TARGET_PATHS" ] && FULL_TARGET_PATHS="$MANUAL_FULL_REQUEST_TARGET_PATHS"
+      FULL_IGNORE_PATHS="$MANUAL_FULL_REQUEST_IGNORE_PATHS"
+      if [ -n "$MANUAL_FULL_REQUEST_TARGET_PATHS" ]; then
+        FULL_BUILD_MODE="target_paths"
+      fi
+      if [ -n "$MANUAL_FULL_REQUEST_TARGET_PATHS" ] || [ -n "$MANUAL_FULL_REQUEST_IGNORE_PATHS" ]; then
+        FULL_ADVANCES_CHECKPOINTS=0
+      fi
+      IGNORE_DESC="$FULL_IGNORE_PATHS"
+      [ -n "$IGNORE_DESC" ] || IGNORE_DESC="<none>"
+      echo "[MANUAL] Starting on-demand full scan over target paths ${FULL_TARGET_PATHS} with ignore paths ${IGNORE_DESC}." | tee -a "$SCANLOG"
+    fi
+
+    if [ "$FULL_BUILD_MODE" = "target_paths" ]; then
+      FULL_BUILD_OK=0
+      if build_targeted_scan_list "FULL" "$FULL_LIST" 0 "$FULL_TARGET_PATHS" "$FULL_IGNORE_PATHS"; then
+        FULL_BUILD_OK=1
+      else
+        RC=$?
+      fi
+    else
+      FULL_BUILD_OK=0
+      if build_scan_list "FULL" "$FULL_LIST" 0 "$FULL_IGNORE_PATHS"; then
+        FULL_BUILD_OK=1
+      else
+        RC=$?
+      fi
+    fi
+
+    if [ "$FULL_BUILD_OK" -eq 1 ]; then
       if run_scan_list "$FULL_LIST" "FULL" "$FULL_SCAN_PARALLEL_JOBS" "$FULL_CHUNK_SIZE" "$FULL_PROGRESS_STEPS"; then
-        date +%s > "$LAST_FULL" || true
-        if [ "$FULL_SCAN_CUTOFF" -gt "$LAST_CHANGED_EPOCH" ]; then
-          echo "$FULL_SCAN_CUTOFF" > "$LAST_CHANGED" || true
-          LAST_CHANGED_EPOCH="$FULL_SCAN_CUTOFF"
-          echo "[CHANGED] Updated changed-file checkpoint to successful full-scan cutoff $(date -d "@$FULL_SCAN_CUTOFF")." | tee -a "$SCANLOG"
+        if [ "$FULL_ADVANCES_CHECKPOINTS" -eq 1 ]; then
+          date +%s > "$LAST_FULL" || true
+          if [ "$FULL_SCAN_CUTOFF" -gt "$LAST_CHANGED_EPOCH" ]; then
+            echo "$FULL_SCAN_CUTOFF" > "$LAST_CHANGED" || true
+            LAST_CHANGED_EPOCH="$FULL_SCAN_CUTOFF"
+            echo "[CHANGED] Updated changed-file checkpoint to successful full-scan cutoff $(date -d "@$FULL_SCAN_CUTOFF")." | tee -a "$SCANLOG"
+          fi
+          NEXT_CHANGED_RETRY_EPOCH=0
+        else
+          echo "[FULL] Scoped on-demand full scan completed; scheduled full and changed checkpoints were left unchanged." | tee -a "$SCANLOG"
         fi
-        NEXT_CHANGED_RETRY_EPOCH=0
         NEXT_FULL_RETRY_EPOCH=0
         echo "=== FULL SCAN finished ===" | tee -a "$SCANLOG"
 
-        if [ "$CHANGED_DUE" -eq 1 ] && [ "$CHANGED_MANUAL_REQUEST" -eq 0 ]; then
+        if [ "$FULL_ADVANCES_CHECKPOINTS" -eq 1 ] && [ "$CHANGED_DUE" -eq 1 ] && [ "$CHANGED_MANUAL_REQUEST" -eq 0 ]; then
           CHANGED_DUE=0
           echo "[CHANGED] Skipping changed-files scan because the successful full scan already covered files through $(date -d "@$FULL_SCAN_CUTOFF")." | tee -a "$SCANLOG"
         fi
 
-        if [ "$FORCE" -eq 1 ] && [ -f "$FORCE_FULL_FLAG" ]; then
+        if [ "$FULL_MANUAL_REQUEST" -eq 1 ] && [ -f "$MANUAL_FULL_REQUEST_FILE" ]; then
+          rm -f -- "$MANUAL_FULL_REQUEST_FILE"
+          echo "[MANUAL] On-demand full scan finished successfully; request consumed." | tee -a "$SCANLOG"
+        fi
+
+        if [ "$FORCE" -eq 1 ] && [ -f "$FORCE_FULL_FLAG" ] && [ "$FULL_ADVANCES_CHECKPOINTS" -eq 1 ]; then
           rm -f -- "$FORCE_FULL_FLAG"
           echo "[FORCE] Flag consumed (deleted): $FORCE_FULL_FLAG" | tee -a "$SCANLOG"
         fi
       else
         NEXT_FULL_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
-        echo "[WARN] Full scan did not complete. Retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        if [ "$FULL_MANUAL_REQUEST" -eq 1 ]; then
+          echo "[WARN] On-demand full scan did not complete. Keeping the manual request and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        else
+          echo "[WARN] Full scan did not complete. Retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        fi
       fi
     else
-      RC=$?
-
       if [ "$RC" -eq 2 ]; then
         CYCLE_ABORT=1
         NEXT_FULL_RETRY_EPOCH=$(( $(date +%s) + PATH_UNAVAILABLE_RETRY_INTERVAL ))
         NEXT_CHANGED_RETRY_EPOCH="$NEXT_FULL_RETRY_EPOCH"
-        echo "[WARN] Full scan paused because a scan path is unavailable. Retrying in ${PATH_UNAVAILABLE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        if [ "$FULL_MANUAL_REQUEST" -eq 1 ]; then
+          echo "[WARN] On-demand full scan paused because a scan path is unavailable. Keeping the manual request and retrying in ${PATH_UNAVAILABLE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        else
+          echo "[WARN] Full scan paused because a scan path is unavailable. Retrying in ${PATH_UNAVAILABLE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        fi
       else
         NEXT_FULL_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
-        echo "[WARN] Full scan file-list build failed. Retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        if [ "$FULL_MANUAL_REQUEST" -eq 1 ]; then
+          echo "[WARN] On-demand full scan file-list build failed. Keeping the manual request and retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        else
+          echo "[WARN] Full scan file-list build failed. Retrying after ${SCAN_FAILURE_RETRY_INTERVAL}s." | tee -a "$SCANLOG"
+        fi
       fi
     fi
   fi
@@ -1021,17 +1169,38 @@ while true; do
     CHANGED_SCAN_CUTOFF=$(date +%s)
     CHANGED_REFERENCE_EPOCH="$LAST_CHANGED_EPOCH"
     CHANGED_TARGET_PATHS="$SCAN_PATHS"
+    CHANGED_IGNORE_PATHS=""
+    CHANGED_BUILD_MODE="scan_paths"
 
     if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
       CHANGED_REFERENCE_EPOCH="$MANUAL_CHANGED_REFERENCE_EPOCH"
-      [ -n "$MANUAL_CHANGED_REQUEST_PATHS" ] && CHANGED_TARGET_PATHS="$MANUAL_CHANGED_REQUEST_PATHS"
-      echo "[MANUAL] Starting on-demand changed scan from reference epoch ${CHANGED_REFERENCE_EPOCH} over target paths ${CHANGED_TARGET_PATHS}." | tee -a "$SCANLOG"
-      BUILD_FN="build_targeted_scan_list"
-    else
-      BUILD_FN="build_scan_list"
+      [ -n "$MANUAL_CHANGED_REQUEST_TARGET_PATHS" ] && CHANGED_TARGET_PATHS="$MANUAL_CHANGED_REQUEST_TARGET_PATHS"
+      CHANGED_IGNORE_PATHS="$MANUAL_CHANGED_REQUEST_IGNORE_PATHS"
+      if [ -n "$MANUAL_CHANGED_REQUEST_TARGET_PATHS" ]; then
+        CHANGED_BUILD_MODE="target_paths"
+      fi
+      IGNORE_DESC="$CHANGED_IGNORE_PATHS"
+      [ -n "$IGNORE_DESC" ] || IGNORE_DESC="<none>"
+      echo "[MANUAL] Starting on-demand changed scan from reference epoch ${CHANGED_REFERENCE_EPOCH} over target paths ${CHANGED_TARGET_PATHS} with ignore paths ${IGNORE_DESC}." | tee -a "$SCANLOG"
     fi
 
-    if $BUILD_FN "CHANGED" "$CHANGED_LIST" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_TARGET_PATHS"; then
+    if [ "$CHANGED_BUILD_MODE" = "target_paths" ]; then
+      CHANGED_BUILD_OK=0
+      if build_targeted_scan_list "CHANGED" "$CHANGED_LIST" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_TARGET_PATHS" "$CHANGED_IGNORE_PATHS"; then
+        CHANGED_BUILD_OK=1
+      else
+        RC=$?
+      fi
+    else
+      CHANGED_BUILD_OK=0
+      if build_scan_list "CHANGED" "$CHANGED_LIST" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_IGNORE_PATHS"; then
+        CHANGED_BUILD_OK=1
+      else
+        RC=$?
+      fi
+    fi
+
+    if [ "$CHANGED_BUILD_OK" -eq 1 ]; then
       if run_scan_list "$CHANGED_LIST" "CHANGED" "$CHANGED_SCAN_PARALLEL_JOBS" "$CHANGED_CHUNK_SIZE" "$CHANGED_PROGRESS_STEPS"; then
         NEXT_CHANGED_RETRY_EPOCH=0
         if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
@@ -1049,8 +1218,6 @@ while true; do
         fi
       fi
     else
-      RC=$?
-
       if [ "$RC" -eq 2 ]; then
         CYCLE_ABORT=1
         NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + PATH_UNAVAILABLE_RETRY_INTERVAL ))
@@ -1084,8 +1251,18 @@ while true; do
   LAST_CHANGED_EPOCH=$(cat "$LAST_CHANGED" 2>/dev/null || echo 0)
   LAST_FULL_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
   FORCE=0
+  MANUAL_FULL_REQUEST=0
   MANUAL_CHANGED_REQUEST=0
   [ -f "$FORCE_FULL_FLAG" ] && FORCE=1
+  if load_manual_full_request; then
+    MANUAL_FULL_REQUEST=1
+  else
+    RC=$?
+    if [ "$RC" -eq 2 ] && [ -f "$MANUAL_FULL_REQUEST_FILE" ]; then
+      echo "[WARN] [MANUAL] Ignoring invalid on-demand full scan request and deleting ${MANUAL_FULL_REQUEST_FILE}." | tee -a "$SCANLOG"
+      rm -f -- "$MANUAL_FULL_REQUEST_FILE"
+    fi
+  fi
   if load_manual_changed_request; then
     MANUAL_CHANGED_REQUEST=1
   else

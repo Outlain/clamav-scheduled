@@ -91,9 +91,10 @@ The UI currently includes:
 - running-average and since-last-update throughput/data rates
 - recent scan history
 - recent log tail
-- force-full-scan action
+- on-demand full scans from the UI, with optional target paths and optional one-off ignore paths
+- the separate exact `FORCE_FULL_FLAG` file path for simple NAS-side full-scan triggering
 - on-demand changed-file scans using either "since last successful checkpoint" or a custom recent lookback window
-- optional path-scoped on-demand changed scans for specific files or directories
+- optional target paths and optional one-off ignore paths for on-demand changed-file scans
 - restart-scanner action for restarting only the scanner process inside the container
 
 Recommended UI-mode mounts:
@@ -122,6 +123,8 @@ Schedules are evaluated in the container timezone from `TZ`.
 If a scheduled scan fails, the scheduler retries after `SCAN_FAILURE_RETRY_INTERVAL` until the scan succeeds or a newer scheduled slot becomes due.
 
 A successful full scan also refreshes the changed-files checkpoint, so the scanner does not immediately rerun a redundant changed-files scan in the same cycle.
+
+UI-queued full scans only advance the normal scheduled full/changed checkpoints when they cover all configured scan paths with no extra one-off ignore paths. Scoped UI full scans are treated as extra manual scans and leave the regular schedule checkpoints unchanged.
 
 Changed-file scans treat either a newer content-modified time or a newer metadata-change time as "changed," which helps catch files copied in with preserved old modification times.
 

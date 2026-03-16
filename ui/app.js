@@ -183,7 +183,17 @@ function closeSettings() {
   $("settings-drawer").classList.add("hidden");
 }
 
+function openManualFullDrawer() {
+  closeManualScanDrawer();
+  $("manual-full-drawer").classList.remove("hidden");
+}
+
+function closeManualFullDrawer() {
+  $("manual-full-drawer").classList.add("hidden");
+}
+
 function openManualScanDrawer() {
+  closeManualFullDrawer();
   $("manual-scan-drawer").classList.remove("hidden");
 }
 
@@ -384,12 +394,30 @@ async function handleConfigSubmit(event) {
   }
 }
 
-async function handleForceFull() {
+function collectManualFullPayload() {
+  const form = $("manual-full-form");
+  return {
+    target_paths: splitMultiline(form.manual_full_target_paths.value),
+    ignore_paths: splitMultiline(form.manual_full_ignore_paths.value),
+  };
+}
+
+async function handleManualFullSubmit(event) {
+  event.preventDefault();
+  const statusLine = $("manual-full-form-status");
+  statusLine.textContent = "Queueing full scan...";
+
   try {
-    await apiFetch("/api/actions/force-full", { method: "POST", body: "{}" });
+    const payload = collectManualFullPayload();
+    await apiFetch("/api/actions/manual-full", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    statusLine.textContent = "Full scan queued. It will run after any current scan finishes.";
+    closeManualFullDrawer();
     await refreshStatus();
   } catch (error) {
-    setText("last-event-value", error.message);
+    statusLine.textContent = error.message;
   }
 }
 
@@ -417,6 +445,7 @@ function collectManualScanPayload() {
   const payload = {
     mode,
     target_paths: splitMultiline(form.manual_target_paths.value),
+    ignore_paths: splitMultiline(form.manual_ignore_paths.value),
   };
 
   if (mode === "relative") {
@@ -464,12 +493,14 @@ async function bootstrap() {
 
 function bindEvents() {
   $("config-form").addEventListener("submit", handleConfigSubmit);
+  $("manual-full-form").addEventListener("submit", handleManualFullSubmit);
   $("manual-scan-form").addEventListener("submit", handleManualScanSubmit);
-  $("force-full-button").addEventListener("click", handleForceFull);
+  $("manual-full-button").addEventListener("click", openManualFullDrawer);
   $("manual-changed-button").addEventListener("click", openManualScanDrawer);
   $("restart-button").addEventListener("click", handleRestart);
   $("toggle-settings-button").addEventListener("click", openSettings);
   $("close-settings-button").addEventListener("click", closeSettings);
+  $("close-manual-full-button").addEventListener("click", closeManualFullDrawer);
   $("close-manual-scan-button").addEventListener("click", closeManualScanDrawer);
   document.querySelectorAll('input[name="manual_mode"]').forEach((input) => {
     input.addEventListener("change", updateManualModeVisibility);

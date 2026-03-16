@@ -414,17 +414,30 @@ def read_epoch_file(path: Path) -> int:
         return 0
 
 
-def validate_manual_request_paths(config: dict[str, Any], raw_paths: Any) -> list[str]:
-    paths = normalize_path_list(raw_paths, "target_paths", required=False)
+def write_key_value_file(path: Path, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(temp_path, path)
+
+
+def validate_manual_request_paths(
+    config: dict[str, Any],
+    raw_paths: Any,
+    *,
+    field_name: str,
+    require_existing: bool,
+) -> list[str]:
+    paths = normalize_path_list(raw_paths, field_name, required=False)
     if not paths:
         return []
 
     scan_roots = config["scan_paths"]
     for path in paths:
         if not any(path_within_scan_root(path, root) for root in scan_roots):
-            raise ValueError(f"Target path is outside configured scan roots: {path}")
-        if not os.path.exists(path):
-            raise ValueError(f"Target path does not exist inside the container: {path}")
+            raise ValueError(f"{field_name.replace('_', ' ').title()} is outside configured scan roots: {path}")
+        if require_existing and not os.path.exists(path):
+            raise ValueError(f"{field_name.replace('_', ' ').title()} does not exist inside the container: {path}")
 
     return paths
 
@@ -435,6 +448,7 @@ class SchedulerManager:
         self.state_dir = state_dir
         self.config_path = config_dir / "ui-config.json"
         self.history_path = config_dir / "ui-history.json"
+        self.manual_full_request_path = state_dir / "manual_full_scan_request.env"
         self.manual_changed_request_path = state_dir / "manual_changed_scan_request.env"
         self.static_dir = Path("/usr/local/share/clamav-ui")
         self._lock = threading.RLock()
@@ -527,6 +541,41 @@ class SchedulerManager:
             self._restart_scheduler_locked()
             return self._status_payload_locked()
 
+    def queue_manual_full_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._config is None or self._config_error:
+                raise ValueError("UI mode is not configured yet.")
+
+            target_paths = validate_manual_request_paths(
+                self._config,
+                payload.get("target_paths"),
+                field_name="target_paths",
+                require_existing=True,
+            )
+            ignore_paths = validate_manual_request_paths(
+                self._config,
+                payload.get("ignore_paths"),
+                field_name="ignore_paths",
+                require_existing=False,
+            )
+
+            request_lines = [
+                f"REQUEST_TARGET_PATHS={':'.join(target_paths)}",
+                f"REQUEST_IGNORE_PATHS={':'.join(ignore_paths)}",
+                f"REQUEST_CREATED_AT={int(time.time())}",
+            ]
+            write_key_value_file(self.manual_full_request_path, request_lines)
+
+            target_label = ":".join(target_paths) if target_paths else "all configured scan paths"
+            if ignore_paths:
+                ignore_label = ":".join(ignore_paths)
+                self._last_event = (
+                    f"Queued on-demand full scan over {target_label} with extra ignore paths {ignore_label}."
+                )
+            else:
+                self._last_event = f"Queued on-demand full scan over {target_label}."
+            return self._status_payload_locked()
+
     def queue_manual_changed_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             if self._config is None or self._config_error:
@@ -536,7 +585,18 @@ class SchedulerManager:
             if mode not in {"since_last", "relative"}:
                 raise ValueError("mode must be 'since_last' or 'relative'.")
 
-            target_paths = validate_manual_request_paths(self._config, payload.get("target_paths"))
+            target_paths = validate_manual_request_paths(
+                self._config,
+                payload.get("target_paths"),
+                field_name="target_paths",
+                require_existing=True,
+            )
+            ignore_paths = validate_manual_request_paths(
+                self._config,
+                payload.get("ignore_paths"),
+                field_name="ignore_paths",
+                require_existing=False,
+            )
 
             lookback_seconds = 0
             if mode == "since_last":
@@ -549,19 +609,24 @@ class SchedulerManager:
                 f"REQUEST_MODE={mode}",
                 f"REQUEST_REFERENCE_EPOCH={reference_epoch}",
                 f"REQUEST_LOOKBACK_SECONDS={lookback_seconds}",
-                f"REQUEST_PATHS={':'.join(target_paths)}",
+                f"REQUEST_TARGET_PATHS={':'.join(target_paths)}",
+                f"REQUEST_IGNORE_PATHS={':'.join(ignore_paths)}",
                 f"REQUEST_CREATED_AT={int(time.time())}",
             ]
-            self.manual_changed_request_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = self.manual_changed_request_path.with_suffix(".tmp")
-            temp_path.write_text("\n".join(request_lines) + "\n", encoding="utf-8")
-            os.replace(temp_path, self.manual_changed_request_path)
+            write_key_value_file(self.manual_changed_request_path, request_lines)
 
             target_label = ":".join(target_paths) if target_paths else "all configured scan paths"
+            ignore_suffix = ""
+            if ignore_paths:
+                ignore_suffix = f" while ignoring {':'.join(ignore_paths)}"
             if mode == "since_last":
-                self._last_event = f"Queued on-demand changed scan since the last successful checkpoint over {target_label}."
+                self._last_event = (
+                    f"Queued on-demand changed scan since the last successful checkpoint over {target_label}{ignore_suffix}."
+                )
             else:
-                self._last_event = f"Queued on-demand changed scan for the last {lookback_seconds} seconds over {target_label}."
+                self._last_event = (
+                    f"Queued on-demand changed scan for the last {lookback_seconds} seconds over {target_label}{ignore_suffix}."
+                )
             return self._status_payload_locked()
 
     def _load_config_from_disk(self) -> None:
@@ -610,6 +675,7 @@ class SchedulerManager:
             "current_scan": deepcopy(self._current_scan),
             "last_summary": deepcopy(self._last_summary),
             "scanlog": self._config["scanlog"] if self._config else DEFAULT_CONFIG["scanlog"],
+            "pending_manual_full_request": self._read_manual_request_locked(self.manual_full_request_path),
             "pending_manual_changed_request": self._read_manual_request_locked(),
         }
         if self._config is not None:
@@ -618,13 +684,14 @@ class SchedulerManager:
             payload["effective_force_full_flag"] = f"{DEFAULT_CONFIG['scan_paths'][0]}/.clamav_force_full_scan.flag"
         return payload
 
-    def _read_manual_request_locked(self) -> dict[str, Any] | None:
-        if not self.manual_changed_request_path.exists():
+    def _read_manual_request_locked(self, request_path: Path | None = None) -> dict[str, Any] | None:
+        request_path = request_path or self.manual_changed_request_path
+        if not request_path.exists():
             return None
 
         request: dict[str, str] = {}
         try:
-            for raw_line in self.manual_changed_request_path.read_text(encoding="utf-8").splitlines():
+            for raw_line in request_path.read_text(encoding="utf-8").splitlines():
                 if "=" not in raw_line:
                     continue
                 key, value = raw_line.split("=", 1)
@@ -632,14 +699,17 @@ class SchedulerManager:
         except OSError:
             return None
 
-        paths_value = request.get("REQUEST_PATHS", "")
-        target_paths = [part for part in paths_value.split(":") if part]
+        target_paths_value = request.get("REQUEST_TARGET_PATHS", "") or request.get("REQUEST_PATHS", "")
+        target_paths = [part for part in target_paths_value.split(":") if part]
+        ignore_paths_value = request.get("REQUEST_IGNORE_PATHS", "")
+        ignore_paths = [part for part in ignore_paths_value.split(":") if part]
 
         return {
             "mode": request.get("REQUEST_MODE", ""),
             "reference_epoch": int(request.get("REQUEST_REFERENCE_EPOCH", "0") or "0"),
             "lookback_seconds": int(request.get("REQUEST_LOOKBACK_SECONDS", "0") or "0"),
             "target_paths": target_paths,
+            "ignore_paths": ignore_paths,
             "created_at": int(request.get("REQUEST_CREATED_AT", "0") or "0"),
         }
 
@@ -1014,6 +1084,16 @@ class UIRequestHandler(BaseHTTPRequestHandler):
                 json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             json_response(self, HTTPStatus.OK, {"ok": True, "status": MANAGER.get_status()})
+            return
+
+        if parsed.path == "/api/actions/manual-full":
+            try:
+                payload = self._read_json_body()
+                status = MANAGER.queue_manual_full_scan(payload)
+            except ValueError as exc:
+                json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            json_response(self, HTTPStatus.OK, {"ok": True, "status": status})
             return
 
         if parsed.path == "/api/actions/manual-changed":
