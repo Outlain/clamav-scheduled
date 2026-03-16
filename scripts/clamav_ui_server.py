@@ -12,7 +12,7 @@ import threading
 import time
 from collections import deque
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import formatdate
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -379,10 +379,12 @@ def format_scan_label(label: str) -> str:
     return "Full Scan" if label == "FULL" else "Changed-Files Scan"
 
 
-def history_entry_identity(entry: dict[str, Any]) -> tuple[Any, ...]:
+HISTORY_DEDUPE_WINDOW_SECONDS = 7200
+
+
+def history_summary_identity(entry: dict[str, Any]) -> tuple[Any, ...]:
     return (
         entry.get("label"),
-        entry.get("cycle_started_at"),
         entry.get("scheduled_files"),
         entry.get("indexed_files"),
         entry.get("processed_files"),
@@ -396,23 +398,75 @@ def history_entry_identity(entry: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def dedupe_history_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    by_identity: dict[tuple[Any, ...], dict[str, Any]] = {}
+def parse_history_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
 
-    for entry in entries:
-        identity = history_entry_identity(entry)
-        existing = by_identity.get(identity)
-        if existing is None:
-            cloned = deepcopy(entry)
-            deduped.append(cloned)
-            by_identity[identity] = cloned
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    for fmt in ("%a %b %d %H:%M:%S %Z %Y", "%a %b %d %H:%M:%S %Y"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
             continue
 
-        existing_roots = existing.setdefault("roots", [])
-        for root_entry in entry.get("roots", []):
-            if root_entry not in existing_roots:
-                existing_roots.append(deepcopy(root_entry))
+    return None
+
+
+def choose_preferred_cycle_started_at(existing_value: Any, incoming_value: Any) -> Any:
+    existing_dt = parse_history_timestamp(existing_value)
+    incoming_dt = parse_history_timestamp(incoming_value)
+
+    if existing_dt and incoming_dt:
+        return existing_value if existing_dt <= incoming_dt else incoming_value
+    if incoming_dt and not existing_dt:
+        return incoming_value
+    return existing_value or incoming_value
+
+
+def history_entries_match(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    if history_summary_identity(existing) != history_summary_identity(incoming):
+        return False
+
+    existing_dt = parse_history_timestamp(existing.get("cycle_started_at"))
+    incoming_dt = parse_history_timestamp(incoming.get("cycle_started_at"))
+    if existing_dt and incoming_dt:
+        return abs((existing_dt - incoming_dt).total_seconds()) <= HISTORY_DEDUPE_WINDOW_SECONDS
+
+    return existing.get("cycle_started_at") == incoming.get("cycle_started_at")
+
+
+def dedupe_history_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    for entry in entries:
+        cloned = deepcopy(entry)
+        matched = False
+        for existing in deduped:
+            if not history_entries_match(existing, cloned):
+                continue
+
+            existing["cycle_started_at"] = choose_preferred_cycle_started_at(
+                existing.get("cycle_started_at"),
+                cloned.get("cycle_started_at"),
+            )
+            existing_roots = existing.setdefault("roots", [])
+            for root_entry in cloned.get("roots", []):
+                if root_entry not in existing_roots:
+                    existing_roots.append(deepcopy(root_entry))
+            matched = True
+            break
+
+        if not matched:
+            deduped.append(cloned)
 
     return deduped
 
@@ -893,10 +947,14 @@ class SchedulerManager:
             return
 
     def _append_history_locked(self, entry: dict[str, Any]) -> dict[str, Any]:
-        identity = history_entry_identity(entry)
         for existing in self._history:
-            if history_entry_identity(existing) == identity:
+            if history_entries_match(existing, entry):
+                existing["cycle_started_at"] = choose_preferred_cycle_started_at(
+                    existing.get("cycle_started_at"),
+                    entry.get("cycle_started_at"),
+                )
                 self._last_summary = existing
+                write_json_atomic(self.history_path, self._history)
                 return existing
 
         self._history.append(entry)
