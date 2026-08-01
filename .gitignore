@@ -1,7 +1,9 @@
 *.log
+.DS_Store
 .env
 .env.*
 downloads/
+config/
 state/
 defs/
 logs/

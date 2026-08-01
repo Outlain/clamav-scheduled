@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+set -f
+umask 077
 
 # Tunables from environment
 : "${TZ:=UTC}"
@@ -19,7 +21,25 @@ set -eu
 : "${EXCLUDE_PATHS:=}"
 : "${FORCE_FULL_POLL_INTERVAL:=60}"
 : "${STATE_DIR:=/state}"
-: "${TMP_DIR:=/tmp/clamav}"
+: "${RUNTIME_DIR:=/tmp/clamav-runtime}"
+: "${TMP_DIR:=${RUNTIME_DIR}/work}"
+: "${DEFINITIONS_DIR:=/var/lib/clamav}"
+: "${DEFINITIONS_WAIT_TIMEOUT:=300}"
+: "${DEFINITIONS_MAX_AGE_SECONDS:=172800}"
+: "${DEFINITIONS_STALE_ACTION:=warn}"
+: "${CLAMD_MAX_SCAN_SIZE:=512M}"
+: "${CLAMD_MAX_FILE_SIZE:=256M}"
+: "${CLAMD_LOG_MAX_SIZE:=10M}"
+: "${CLAMD_MAX_RECURSION:=32}"
+: "${CLAMD_MAX_FILES:=10000}"
+: "${CLAMD_MAX_SCAN_TIME:=900000}"
+: "${CLAMD_READ_TIMEOUT:=900}"
+: "${CLAMD_COMMAND_READ_TIMEOUT:=30}"
+: "${CLAMD_SELF_CHECK:=300}"
+: "${CLAMD_START_TIMEOUT:=180}"
+: "${MAX_SCHEDULED_FILES:=1000000}"
+: "${SCANLOG_MAX_BYTES:=104857600}"
+: "${SCANLOG_ROTATIONS:=5}"
 : "${PATH_CHECK_TIMEOUT:=10}"
 : "${PATH_ENUMERATION_TIMEOUT:=300}"
 : "${PATH_UNAVAILABLE_RETRY_INTERVAL:=300}"
@@ -32,6 +52,36 @@ reject_deprecated_env() {
 
   if [ -n "$VAR_IS_SET" ]; then
     echo "[ERROR] ${VAR_NAME} is no longer supported. ${MESSAGE}" >&2
+    exit 1
+  fi
+}
+
+reject_control_characters() {
+  NAME="$1"
+  VALUE="$2"
+  CLEAN_VALUE=$(printf '%s' "$VALUE" | LC_ALL=C tr -d '\001-\037\177')
+  if [ "$CLEAN_VALUE" != "$VALUE" ]; then
+    echo "[ERROR] ${NAME} must not contain control characters." >&2
+    exit 1
+  fi
+}
+
+normalize_absolute_path() {
+  NAME="$1"
+  VALUE="$2"
+  reject_control_characters "$NAME" "$VALUE"
+
+  case "$VALUE" in
+    /*)
+      ;;
+    *)
+      echo "[ERROR] ${NAME} must be an absolute path (got: ${VALUE})" >&2
+      exit 1
+      ;;
+  esac
+
+  if ! realpath -m -- "$VALUE" 2>/dev/null; then
+    echo "[ERROR] Unable to canonicalize ${NAME}: ${VALUE}" >&2
     exit 1
   fi
 }
@@ -72,11 +122,17 @@ normalize_absolute_path_list() {
 
   NORMALIZED=""
   OLD_IFS="$IFS"
+  case $- in
+    *f*) RESTORE_PATHNAME_EXPANSION=0 ;;
+    *) set -f; RESTORE_PATHNAME_EXPANSION=1 ;;
+  esac
   IFS=':'
   set -- $VALUE
   IFS="$OLD_IFS"
+  [ "$RESTORE_PATHNAME_EXPANSION" -eq 0 ] || set +f
 
   for PATH_ENTRY do
+    reject_control_characters "$NAME" "$PATH_ENTRY"
     case "$PATH_ENTRY" in
       /*)
         ;;
@@ -86,10 +142,10 @@ normalize_absolute_path_list() {
         ;;
     esac
 
-    NORMALIZED_ENTRY="$PATH_ENTRY"
-    while [ "$NORMALIZED_ENTRY" != "/" ] && [ "${NORMALIZED_ENTRY%/}" != "$NORMALIZED_ENTRY" ]; do
-      NORMALIZED_ENTRY=${NORMALIZED_ENTRY%/}
-    done
+    if ! NORMALIZED_ENTRY=$(realpath -m -- "$PATH_ENTRY" 2>/dev/null); then
+      echo "[ERROR] Unable to canonicalize ${NAME} entry: ${PATH_ENTRY}" >&2
+      exit 1
+    fi
 
     NORMALIZED="${NORMALIZED}${NORMALIZED:+:}${NORMALIZED_ENTRY}"
   done
@@ -195,6 +251,7 @@ reject_deprecated_env "FULL_SCAN_INTERVAL" "Use FULL_SCAN_DAYS and FULL_SCAN_TIM
 
 validate_scan_paths_config "$SCAN_PATHS"
 validate_optional_path_list_config "EXCLUDE_PATHS" "$EXCLUDE_PATHS"
+SCAN_PATHS=$(normalize_absolute_path_list "SCAN_PATHS" "$SCAN_PATHS")
 EXCLUDE_PATHS=$(normalize_absolute_path_list "EXCLUDE_PATHS" "$EXCLUDE_PATHS")
 PRIMARY_SCAN_PATH=$(get_primary_scan_path "$SCAN_PATHS")
 [ -n "$PRIMARY_SCAN_PATH" ] || {
@@ -205,84 +262,265 @@ PRIMARY_SCAN_PATH=$(get_primary_scan_path "$SCAN_PATHS")
 : "${QUARANTINE_DIR:=${PRIMARY_SCAN_PATH}/quarantine}"
 : "${FORCE_FULL_FLAG:=${PRIMARY_SCAN_PATH}/.clamav_force_full_scan.flag}"
 
+reject_control_characters "TZ" "$TZ"
+reject_control_characters "SCAN_PATH_MARKER" "$SCAN_PATH_MARKER"
+case "$SCAN_PATH_MARKER" in
+  ''|.|..|*/*)
+    if [ -n "$SCAN_PATH_MARKER" ]; then
+      echo "[ERROR] SCAN_PATH_MARKER must be one file or directory name, not a path." >&2
+      exit 1
+    fi
+    ;;
+esac
+
+STATE_DIR=$(normalize_absolute_path "STATE_DIR" "$STATE_DIR")
+RUNTIME_DIR=$(normalize_absolute_path "RUNTIME_DIR" "$RUNTIME_DIR")
+TMP_DIR=$(normalize_absolute_path "TMP_DIR" "$TMP_DIR")
+DEFINITIONS_DIR=$(normalize_absolute_path "DEFINITIONS_DIR" "$DEFINITIONS_DIR")
+QUARANTINE_DIR=$(normalize_absolute_path "QUARANTINE_DIR" "$QUARANTINE_DIR")
+FORCE_FULL_FLAG=$(normalize_absolute_path "FORCE_FULL_FLAG" "$FORCE_FULL_FLAG")
+SCANLOG=$(normalize_absolute_path "SCANLOG" "$SCANLOG")
+CLAMD_SOCKET="$RUNTIME_DIR/clamd.sock"
+CLAMD_CONFIG="$RUNTIME_DIR/clamd.conf"
+CLAMD_PID_FILE="$RUNTIME_DIR/clamd.pid"
+CLAMD_LOG_FILE="$RUNTIME_DIR/clamd.log"
+CLAMD_OUTPUT_FILE="$RUNTIME_DIR/clamd.out"
+export CLAMD_SOCKET DEFINITIONS_DIR DEFINITIONS_MAX_AGE_SECONDS DEFINITIONS_WAIT_TIMEOUT DEFINITIONS_STALE_ACTION
+
 CHANGED_SCAN_TIMES=$(normalize_schedule_times "$CHANGED_SCAN_TIMES")
 CHANGED_SCAN_DAYS=$(normalize_schedule_days "$CHANGED_SCAN_DAYS")
 FULL_SCAN_TIMES=$(normalize_schedule_times "$FULL_SCAN_TIMES")
 FULL_SCAN_DAYS=$(normalize_schedule_days "$FULL_SCAN_DAYS")
 
-mkdir -p "$QUARANTINE_DIR" "$STATE_DIR" "$TMP_DIR" /var/log/clamav /var/lib/clamav
-
-echo "=== Starting scheduled ClamAV scanner ===" | tee -a "$SCANLOG"
-echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL FORCE_FULL_POLL_INTERVAL=$FORCE_FULL_POLL_INTERVAL SCAN_PATHS=$SCAN_PATHS EXCLUDE_PATHS=$EXCLUDE_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER" | tee -a "$SCANLOG"
-
-validate_positive_int() {
+validate_bounded_int() {
   NAME="$1"
   VALUE="$2"
+  MINIMUM="$3"
+  MAXIMUM="$4"
 
   case "$VALUE" in
     ''|*[!0-9]*)
-      echo "[ERROR] ${NAME} must be a positive integer (got: ${VALUE})" | tee -a "$SCANLOG"
+      echo "[ERROR] ${NAME} must be an integer between ${MINIMUM} and ${MAXIMUM} (got: ${VALUE})" >&2
       exit 1
       ;;
   esac
 
-  if [ "$VALUE" -le 0 ]; then
-    echo "[ERROR] ${NAME} must be greater than 0 (got: ${VALUE})" | tee -a "$SCANLOG"
+  if [ "${#VALUE}" -gt 9 ] || [ "$VALUE" -lt "$MINIMUM" ] || [ "$VALUE" -gt "$MAXIMUM" ]; then
+    echo "[ERROR] ${NAME} must be between ${MINIMUM} and ${MAXIMUM} (got: ${VALUE})" >&2
     exit 1
   fi
 }
 
-validate_nonnegative_int() {
+normalize_clamd_size() {
   NAME="$1"
   VALUE="$2"
+  NORMALIZED_VALUE=$(printf '%s' "$VALUE" | tr '[:lower:]' '[:upper:]')
 
-  case "$VALUE" in
+  case "$NORMALIZED_VALUE" in
+    *K|*M|*G)
+      NUMBER=${NORMALIZED_VALUE%?}
+      ;;
+    *)
+      NUMBER=$NORMALIZED_VALUE
+      ;;
+  esac
+  case "$NUMBER" in
     ''|*[!0-9]*)
-      echo "[ERROR] ${NAME} must be a non-negative integer (got: ${VALUE})" | tee -a "$SCANLOG"
+      echo "[ERROR] ${NAME} must be a positive byte count with an optional K, M, or G suffix (got: ${VALUE})" >&2
       exit 1
+      ;;
+  esac
+  if [ "${#NUMBER}" -gt 9 ] || [ "$NUMBER" -le 0 ]; then
+    echo "[ERROR] ${NAME} must be a positive bounded size (got: ${VALUE})" >&2
+    exit 1
+  fi
+  printf '%s\n' "$NORMALIZED_VALUE"
+}
+
+clamd_size_bytes() {
+  VALUE="$1"
+  case "$VALUE" in
+    *K)
+      printf '%s\n' "$((${VALUE%?} * 1024))"
+      ;;
+    *M)
+      printf '%s\n' "$((${VALUE%?} * 1024 * 1024))"
+      ;;
+    *G)
+      printf '%s\n' "$((${VALUE%?} * 1024 * 1024 * 1024))"
+      ;;
+    *)
+      printf '%s\n' "$VALUE"
       ;;
   esac
 }
 
-validate_positive_int "MAXTHREADS" "$MAXTHREADS"
-validate_positive_int "FULL_SCAN_PARALLEL_JOBS" "$FULL_SCAN_PARALLEL_JOBS"
-validate_positive_int "CHANGED_SCAN_PARALLEL_JOBS" "$CHANGED_SCAN_PARALLEL_JOBS"
-validate_positive_int "FULL_PROGRESS_STEPS" "$FULL_PROGRESS_STEPS"
-validate_positive_int "CHANGED_PROGRESS_STEPS" "$CHANGED_PROGRESS_STEPS"
-validate_positive_int "SCAN_FAILURE_RETRY_INTERVAL" "$SCAN_FAILURE_RETRY_INTERVAL"
-validate_positive_int "FORCE_FULL_POLL_INTERVAL" "$FORCE_FULL_POLL_INTERVAL"
-validate_positive_int "PATH_CHECK_TIMEOUT" "$PATH_CHECK_TIMEOUT"
-validate_positive_int "PATH_ENUMERATION_TIMEOUT" "$PATH_ENUMERATION_TIMEOUT"
-validate_positive_int "PATH_UNAVAILABLE_RETRY_INTERVAL" "$PATH_UNAVAILABLE_RETRY_INTERVAL"
-validate_nonnegative_int "FULL_CHUNK_SIZE" "$FULL_CHUNK_SIZE"
-validate_nonnegative_int "CHANGED_CHUNK_SIZE" "$CHANGED_CHUNK_SIZE"
+validate_bounded_int "MAXTHREADS" "$MAXTHREADS" 1 64
+validate_bounded_int "FULL_SCAN_PARALLEL_JOBS" "$FULL_SCAN_PARALLEL_JOBS" 1 64
+validate_bounded_int "CHANGED_SCAN_PARALLEL_JOBS" "$CHANGED_SCAN_PARALLEL_JOBS" 1 64
+validate_bounded_int "FULL_PROGRESS_STEPS" "$FULL_PROGRESS_STEPS" 1 10000
+validate_bounded_int "CHANGED_PROGRESS_STEPS" "$CHANGED_PROGRESS_STEPS" 1 10000
+validate_bounded_int "FULL_CHUNK_SIZE" "$FULL_CHUNK_SIZE" 0 1000000
+validate_bounded_int "CHANGED_CHUNK_SIZE" "$CHANGED_CHUNK_SIZE" 0 1000000
+validate_bounded_int "SCAN_FAILURE_RETRY_INTERVAL" "$SCAN_FAILURE_RETRY_INTERVAL" 1 86400
+validate_bounded_int "FORCE_FULL_POLL_INTERVAL" "$FORCE_FULL_POLL_INTERVAL" 1 3600
+validate_bounded_int "PATH_CHECK_TIMEOUT" "$PATH_CHECK_TIMEOUT" 1 300
+validate_bounded_int "PATH_ENUMERATION_TIMEOUT" "$PATH_ENUMERATION_TIMEOUT" 1 86400
+validate_bounded_int "PATH_UNAVAILABLE_RETRY_INTERVAL" "$PATH_UNAVAILABLE_RETRY_INTERVAL" 1 86400
+validate_bounded_int "DEFINITIONS_WAIT_TIMEOUT" "$DEFINITIONS_WAIT_TIMEOUT" 1 3600
+validate_bounded_int "DEFINITIONS_MAX_AGE_SECONDS" "$DEFINITIONS_MAX_AGE_SECONDS" 60 2678400
+validate_bounded_int "CLAMD_MAX_RECURSION" "$CLAMD_MAX_RECURSION" 1 100
+validate_bounded_int "CLAMD_MAX_FILES" "$CLAMD_MAX_FILES" 1 1000000
+validate_bounded_int "CLAMD_MAX_SCAN_TIME" "$CLAMD_MAX_SCAN_TIME" 1000 3600000
+validate_bounded_int "CLAMD_READ_TIMEOUT" "$CLAMD_READ_TIMEOUT" 1 3600
+validate_bounded_int "CLAMD_COMMAND_READ_TIMEOUT" "$CLAMD_COMMAND_READ_TIMEOUT" 1 300
+validate_bounded_int "CLAMD_SELF_CHECK" "$CLAMD_SELF_CHECK" 30 3600
+validate_bounded_int "CLAMD_START_TIMEOUT" "$CLAMD_START_TIMEOUT" 30 900
+validate_bounded_int "MAX_SCHEDULED_FILES" "$MAX_SCHEDULED_FILES" 1 5000000
+validate_bounded_int "SCANLOG_MAX_BYTES" "$SCANLOG_MAX_BYTES" 1048576 1073741824
+validate_bounded_int "SCANLOG_ROTATIONS" "$SCANLOG_ROTATIONS" 1 20
+
+if [ "$FULL_SCAN_PARALLEL_JOBS" -gt "$MAXTHREADS" ] || [ "$CHANGED_SCAN_PARALLEL_JOBS" -gt "$MAXTHREADS" ]; then
+  echo "[ERROR] Scan parallel jobs must not exceed MAXTHREADS=${MAXTHREADS}." >&2
+  exit 1
+fi
+
+: "${CLAMD_MAX_QUEUE:=$((MAXTHREADS * 2))}"
+validate_bounded_int "CLAMD_MAX_QUEUE" "$CLAMD_MAX_QUEUE" "$MAXTHREADS" 128
+CLAMD_MAX_SCAN_SIZE=$(normalize_clamd_size "CLAMD_MAX_SCAN_SIZE" "$CLAMD_MAX_SCAN_SIZE")
+CLAMD_MAX_FILE_SIZE=$(normalize_clamd_size "CLAMD_MAX_FILE_SIZE" "$CLAMD_MAX_FILE_SIZE")
+CLAMD_LOG_MAX_SIZE=$(normalize_clamd_size "CLAMD_LOG_MAX_SIZE" "$CLAMD_LOG_MAX_SIZE")
+CLAMD_MAX_SCAN_SIZE_BYTES=$(clamd_size_bytes "$CLAMD_MAX_SCAN_SIZE")
+CLAMD_MAX_FILE_SIZE_BYTES=$(clamd_size_bytes "$CLAMD_MAX_FILE_SIZE")
+CLAMD_LOG_MAX_SIZE_BYTES=$(clamd_size_bytes "$CLAMD_LOG_MAX_SIZE")
+CLAMD_ABSOLUTE_SIZE_LIMIT=$((16 * 1024 * 1024 * 1024))
+if [ "$CLAMD_MAX_SCAN_SIZE_BYTES" -gt "$CLAMD_ABSOLUTE_SIZE_LIMIT" ] || [ "$CLAMD_MAX_FILE_SIZE_BYTES" -gt "$CLAMD_ABSOLUTE_SIZE_LIMIT" ]; then
+  echo "[ERROR] CLAMD_MAX_SCAN_SIZE and CLAMD_MAX_FILE_SIZE must not exceed 16G." >&2
+  exit 1
+fi
+if [ "$CLAMD_MAX_FILE_SIZE_BYTES" -gt "$CLAMD_MAX_SCAN_SIZE_BYTES" ]; then
+  echo "[ERROR] CLAMD_MAX_FILE_SIZE must not exceed CLAMD_MAX_SCAN_SIZE." >&2
+  exit 1
+fi
+if [ "$CLAMD_LOG_MAX_SIZE_BYTES" -gt 1073741824 ]; then
+  echo "[ERROR] CLAMD_LOG_MAX_SIZE must not exceed 1G." >&2
+  exit 1
+fi
+
+DEFINITIONS_STALE_ACTION=$(printf '%s' "$DEFINITIONS_STALE_ACTION" | tr '[:upper:]' '[:lower:]')
+case "$DEFINITIONS_STALE_ACTION" in
+  warn|fail)
+    ;;
+  *)
+    echo "[ERROR] DEFINITIONS_STALE_ACTION must be 'warn' or 'fail'." >&2
+    exit 1
+    ;;
+esac
 
 if [ -z "$CHANGED_SCAN_TIMES" ]; then
-  echo "[ERROR] CHANGED_SCAN_TIMES must contain one or more HH:MM values." | tee -a "$SCANLOG"
+  echo "[ERROR] CHANGED_SCAN_TIMES must contain one or more HH:MM values." >&2
   exit 1
 fi
 
 if [ -z "$FULL_SCAN_TIMES" ]; then
-  echo "[ERROR] FULL_SCAN_TIMES must contain one or more HH:MM values." | tee -a "$SCANLOG"
+  echo "[ERROR] FULL_SCAN_TIMES must contain one or more HH:MM values." >&2
   exit 1
 fi
 
-cat > /etc/clamav/clamd.conf <<EOF2
-DatabaseDirectory /var/lib/clamav
-LocalSocket /tmp/clamd.sock
-PidFile /tmp/clamd.pid
-LogFile /tmp/clamd.log
+ensure_writable_directory() {
+  DIRECTORY="$1"
+  DESCRIPTION="$2"
+  if [ ! -d "$DIRECTORY" ] || [ ! -r "$DIRECTORY" ] || [ ! -w "$DIRECTORY" ] || [ ! -x "$DIRECTORY" ]; then
+    echo "[ERROR] ${DESCRIPTION} must be a readable, writable, searchable directory: ${DIRECTORY}" >&2
+    exit 1
+  fi
+  if ! PROBE_FILE=$(mktemp "$DIRECTORY/.clamav-write-probe.XXXXXX"); then
+    echo "[ERROR] ${DESCRIPTION} failed an actual create-file permission check: ${DIRECTORY}" >&2
+    exit 1
+  fi
+  if ! rm -f -- "$PROBE_FILE"; then
+    echo "[ERROR] ${DESCRIPTION} failed the delete portion of its permission check: ${DIRECTORY}" >&2
+    exit 1
+  fi
+}
+
+SCANLOG_DIR=$(dirname -- "$SCANLOG")
+for REQUIRED_DIRECTORY in "$QUARANTINE_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$SCANLOG_DIR"; do
+  if ! mkdir -p -- "$REQUIRED_DIRECTORY"; then
+    echo "[ERROR] Could not create required writable directory: ${REQUIRED_DIRECTORY}" >&2
+    exit 1
+  fi
+done
+ensure_writable_directory "$QUARANTINE_DIR" "Quarantine directory"
+ensure_writable_directory "$STATE_DIR" "State directory"
+ensure_writable_directory "$RUNTIME_DIR" "Runtime directory"
+ensure_writable_directory "$TMP_DIR" "Temporary work directory"
+ensure_writable_directory "$SCANLOG_DIR" "Scan-log directory"
+
+OLD_IFS="$IFS"
+IFS=':'
+set -- $SCAN_PATHS
+IFS="$OLD_IFS"
+for SCAN_PATH_PERMISSION_CHECK do
+  ensure_writable_directory "$SCAN_PATH_PERMISSION_CHECK" "Scan root (write access is required for quarantine removal)"
+  case "$SCAN_PATH_PERMISSION_CHECK" in
+    "$QUARANTINE_DIR"|"$QUARANTINE_DIR"/*)
+      echo "[ERROR] QUARANTINE_DIR must not be equal to or contain a scan root (quarantine: ${QUARANTINE_DIR}, root: ${SCAN_PATH_PERMISSION_CHECK})." >&2
+      exit 1
+      ;;
+  esac
+  for INTERNAL_PATH in "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$DEFINITIONS_DIR" "$SCANLOG"; do
+    case "$INTERNAL_PATH" in
+      "$SCAN_PATH_PERMISSION_CHECK"|"$SCAN_PATH_PERMISSION_CHECK"/*)
+        echo "[ERROR] Mutable state, runtime files, definitions, and logs must be outside scan roots (path: ${INTERNAL_PATH}, root: ${SCAN_PATH_PERMISSION_CHECK})." >&2
+        exit 1
+        ;;
+    esac
+  done
+done
+
+if ! : >> "$SCANLOG"; then
+  echo "[ERROR] Scan log is not writable: ${SCANLOG}" >&2
+  exit 1
+fi
+
+echo "=== Starting scheduled ClamAV scanner ===" | tee -a "$SCANLOG"
+echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL FORCE_FULL_POLL_INTERVAL=$FORCE_FULL_POLL_INTERVAL SCAN_PATHS=$SCAN_PATHS EXCLUDE_PATHS=$EXCLUDE_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR DEFINITIONS_DIR=$DEFINITIONS_DIR DEFINITIONS_MAX_AGE_SECONDS=$DEFINITIONS_MAX_AGE_SECONDS PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER" | tee -a "$SCANLOG"
+
+echo "Waiting up to ${DEFINITIONS_WAIT_TIMEOUT}s for external definitions..." | tee -a "$SCANLOG"
+if ! python3 /usr/local/bin/clamav_healthcheck.py --wait; then
+  echo "[ERROR] ClamAV definitions did not pass startup readiness checks." | tee -a "$SCANLOG"
+  exit 1
+fi
+
+cat > "$CLAMD_CONFIG" <<EOF2
+DatabaseDirectory ${DEFINITIONS_DIR}
+LocalSocket ${CLAMD_SOCKET}
+LocalSocketMode 600
+PidFile ${CLAMD_PID_FILE}
+LogFile ${CLAMD_LOG_FILE}
 LogTime yes
+LogFileMaxSize ${CLAMD_LOG_MAX_SIZE}
+LogRotate yes
 Foreground yes
 
 MaxThreads ${MAXTHREADS}
-MaxQueue 200
-ReadTimeout 900
-CommandReadTimeout 900
+MaxQueue ${CLAMD_MAX_QUEUE}
+ReadTimeout ${CLAMD_READ_TIMEOUT}
+CommandReadTimeout ${CLAMD_COMMAND_READ_TIMEOUT}
+SelfCheck ${CLAMD_SELF_CHECK}
+MaxScanTime ${CLAMD_MAX_SCAN_TIME}
+MaxScanSize ${CLAMD_MAX_SCAN_SIZE}
+MaxFileSize ${CLAMD_MAX_FILE_SIZE}
+MaxRecursion ${CLAMD_MAX_RECURSION}
+MaxFiles ${CLAMD_MAX_FILES}
+TemporaryDirectory ${TMP_DIR}
+AlertExceedsMax yes
+ConcurrentDatabaseReload no
 EOF2
 
-echo "Starting clamd with MaxThreads=${MAXTHREADS}..." | tee -a "$SCANLOG"
-clamd -c /etc/clamav/clamd.conf >/tmp/clamd.out 2>&1 &
+echo "Starting clamd with MaxThreads=${MAXTHREADS}, MaxQueue=${CLAMD_MAX_QUEUE}, MaxScanSize=${CLAMD_MAX_SCAN_SIZE}, MaxFileSize=${CLAMD_MAX_FILE_SIZE}, SelfCheck=${CLAMD_SELF_CHECK}s..." | tee -a "$SCANLOG"
+clamd -c "$CLAMD_CONFIG" >"$CLAMD_OUTPUT_FILE" 2>&1 &
 CLAMD_PID=$!
 
 release_lock() {
@@ -291,28 +529,40 @@ release_lock() {
 }
 
 cleanup() {
+  [ "${CLEANUP_DONE:-0}" -eq 0 ] || return 0
+  CLEANUP_DONE=1
   release_lock
   echo "Stopping clamd..." | tee -a "$SCANLOG"
   kill "$CLAMD_PID" 2>/dev/null || true
+  wait "$CLAMD_PID" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+
+handle_termination() {
+  cleanup
+  trap - EXIT
+  exit 0
+}
+
+trap cleanup EXIT
+trap handle_termination INT TERM
 
 i=0
-while [ ! -S /tmp/clamd.sock ] && [ $i -lt 60 ]; do
+while [ ! -S "$CLAMD_SOCKET" ] && [ $i -lt "$CLAMD_START_TIMEOUT" ]; do
   i=$((i+1))
   sleep 1
 done
 
-if [ ! -S /tmp/clamd.sock ]; then
-  echo "[ERROR] clamd socket never appeared. Last /tmp/clamd.out:" | tee -a "$SCANLOG"
-  tail -n 200 /tmp/clamd.out 2>/dev/null | tee -a "$SCANLOG" || true
+if [ ! -S "$CLAMD_SOCKET" ]; then
+  echo "[ERROR] clamd socket never appeared. Last clamd output:" | tee -a "$SCANLOG"
+  tail -n 200 "$CLAMD_OUTPUT_FILE" >&2 2>/dev/null || true
   exit 1
 fi
 
-echo "readytest" > /tmp/clamav_readytest.txt
+READY_TEST_FILE="$TMP_DIR/clamav_readytest.txt"
+echo "readytest" > "$READY_TEST_FILE"
 i=0
-while [ $i -lt 60 ]; do
-  if clamdscan --fdpass --no-summary /tmp/clamav_readytest.txt >/dev/null 2>&1; then
+while [ $i -lt "$CLAMD_START_TIMEOUT" ]; do
+  if clamdscan --config-file="$CLAMD_CONFIG" --fdpass --no-summary "$READY_TEST_FILE" >/dev/null 2>&1; then
     echo "clamd ready." | tee -a "$SCANLOG"
     break
   fi
@@ -320,11 +570,23 @@ while [ $i -lt 60 ]; do
   sleep 1
 done
 
-if [ $i -ge 60 ]; then
-  echo "[ERROR] clamd started but never accepted scans. Last /tmp/clamd.out:" | tee -a "$SCANLOG"
-  tail -n 200 /tmp/clamd.out 2>/dev/null | tee -a "$SCANLOG" || true
+rm -f -- "$READY_TEST_FILE"
+
+if [ $i -ge "$CLAMD_START_TIMEOUT" ]; then
+  echo "[ERROR] clamd started but never accepted descriptor scans. Last clamd output:" | tee -a "$SCANLOG"
+  tail -n 200 "$CLAMD_OUTPUT_FILE" >&2 2>/dev/null || true
   exit 1
 fi
+
+ensure_clamd_alive() {
+  if kill -0 "$CLAMD_PID" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "[ERROR] clamd exited unexpectedly; the scheduler must restart the complete scanner process group." | tee -a "$SCANLOG"
+  tail -n 200 "$CLAMD_OUTPUT_FILE" >&2 2>/dev/null || true
+  return 1
+}
 
 LAST_CHANGED="$STATE_DIR/last_changed_scan_epoch"
 LAST_FULL="$STATE_DIR/last_full_scan_epoch"
@@ -342,23 +604,6 @@ min_int() {
   else
     echo "$B"
   fi
-}
-
-get_progress_interval() {
-  TOTAL="$1"
-  REQUESTED_CHUNK_SIZE="$2"
-  PROGRESS_STEPS="$3"
-  PARALLEL_JOBS="$4"
-
-  if [ "$REQUESTED_CHUNK_SIZE" -gt 0 ]; then
-    echo "$REQUESTED_CHUNK_SIZE"
-    return 0
-  fi
-
-  CHUNK_SIZE_AUTO=$(((TOTAL + PROGRESS_STEPS - 1) / PROGRESS_STEPS))
-  [ "$CHUNK_SIZE_AUTO" -lt 1 ] && CHUNK_SIZE_AUTO=1
-  [ "$CHUNK_SIZE_AUTO" -lt "$PARALLEL_JOBS" ] && CHUNK_SIZE_AUTO="$PARALLEL_JOBS"
-  echo "$CHUNK_SIZE_AUTO"
 }
 
 validate_nonnegative_numeric_string() {
@@ -747,45 +992,12 @@ check_scan_path_health() {
   return 1
 }
 
-path_matches_path_list() {
-  FILE_PATH="$1"
-  PATH_LIST="$2"
-
-  [ -n "$PATH_LIST" ] || return 1
-
-  OLD_IFS="$IFS"
-
-  IFS=':'
-  set -- $PATH_LIST
-  IFS="$OLD_IFS"
-
-  for LIST_PATH do
-    case "$FILE_PATH" in
-      "$LIST_PATH"|"$LIST_PATH"/*)
-        return 0
-        ;;
-    esac
-  done
-
-  return 1
-}
-
-path_is_excluded() {
-  path_matches_path_list "$1" "$EXCLUDE_PATHS"
-}
-
 append_filtered_scan_list() {
   RAW_LIST_FILE="$1"
   LIST_FILE="$2"
   EXTRA_IGNORE_PATHS="$3"
 
-  while IFS= read -r FILE_PATH || [ -n "$FILE_PATH" ]; do
-    if path_is_excluded "$FILE_PATH" || path_matches_path_list "$FILE_PATH" "$EXTRA_IGNORE_PATHS"; then
-      continue
-    fi
-
-    printf '%s\n' "$FILE_PATH" >> "$LIST_FILE"
-  done < "$RAW_LIST_FILE"
+  python3 /usr/local/bin/scan_list_filter.py --input "$RAW_LIST_FILE" --output "$LIST_FILE" --exclude-paths "$EXCLUDE_PATHS" --ignore-paths "$EXTRA_IGNORE_PATHS" --quarantine-path "$QUARANTINE_DIR"
 }
 
 append_scan_path_list() {
@@ -794,22 +1006,28 @@ append_scan_path_list() {
   LIST_FILE="$3"
   REFERENCE_EPOCH="$4"
   EXTRA_IGNORE_PATHS="$5"
-  RAW_LIST_FILE="$TMP_DIR/${LABEL}_raw_list.txt"
+  RAW_LIST_FILE="$TMP_DIR/${LABEL}_raw_list.nul"
   REFERENCE_FILE="$TMP_DIR/${LABEL}_reference.timestamp"
 
   : > "$RAW_LIST_FILE"
 
   if [ "$LABEL" = "CHANGED" ]; then
     touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      if ! append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"; then
+        rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
+        return 1
+      fi
       rm -f "$RAW_LIST_FILE"
       rm -f "$REFERENCE_FILE"
       return 0
     fi
   else
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -not -path "$QUARANTINE_DIR/*" > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      if ! append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"; then
+        rm -f -- "$RAW_LIST_FILE"
+        return 1
+      fi
       rm -f "$RAW_LIST_FILE"
       return 0
     fi
@@ -868,9 +1086,8 @@ append_target_scan_path_list() {
   LIST_FILE="$3"
   REFERENCE_EPOCH="$4"
   EXTRA_IGNORE_PATHS="$5"
-  TARGET_TOKEN=$(printf '%s' "$TARGET_PATH" | tr '/:' '__')
-  RAW_LIST_FILE="$TMP_DIR/${LABEL}_${TARGET_TOKEN}_raw_list.txt"
-  REFERENCE_FILE="$TMP_DIR/${LABEL}_${TARGET_TOKEN}_reference.timestamp"
+  RAW_LIST_FILE="$TMP_DIR/${LABEL}_target_raw_list.nul"
+  REFERENCE_FILE="$TMP_DIR/${LABEL}_target_reference.timestamp"
 
   if [ ! -e "$TARGET_PATH" ]; then
     echo "[WARN] [$LABEL] Requested target no longer exists: $TARGET_PATH" | tee -a "$SCANLOG"
@@ -881,14 +1098,20 @@ append_target_scan_path_list() {
 
   if [ "$LABEL" = "CHANGED" ]; then
     touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f -not -path "$QUARANTINE_DIR/*" \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      if ! append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"; then
+        rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
+        return 1
+      fi
       rm -f "$RAW_LIST_FILE" "$REFERENCE_FILE"
       return 0
     fi
   else
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f -not -path "$QUARANTINE_DIR/*" > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      if ! append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"; then
+        rm -f -- "$RAW_LIST_FILE"
+        return 1
+      fi
       rm -f "$RAW_LIST_FILE"
       return 0
     fi
@@ -954,47 +1177,21 @@ run_scan_list() {
   REQUESTED_CHUNK_SIZE="$4"
   PROGRESS_STEPS="$5"
 
-  TOTAL=$(wc -l < "$LIST_FILE" | tr -d ' ')
-
-  if [ "$TOTAL" -le 0 ]; then
-    echo "[$LABEL] No files found to scan." | tee -a "$SCANLOG"
-    return 0
-  fi
-
-  EFFECTIVE_PARALLEL_JOBS=$(min_int "$TOTAL" "$CONFIGURED_PARALLEL_JOBS")
-  EFFECTIVE_PROGRESS_INTERVAL=$(get_progress_interval "$TOTAL" "$REQUESTED_CHUNK_SIZE" "$PROGRESS_STEPS" "$EFFECTIVE_PARALLEL_JOBS")
-
-  if [ "$REQUESTED_CHUNK_SIZE" -gt 0 ]; then
-    PROGRESS_INTERVAL_MODE="fixed"
-    PROGRESS_INTERVAL_DETAIL="configured_interval=${REQUESTED_CHUNK_SIZE}"
-  else
-    PROGRESS_INTERVAL_MODE="auto"
-    PROGRESS_INTERVAL_DETAIL="derived_interval=ceil(${TOTAL}/${PROGRESS_STEPS}) capped_by_worker_floor=${EFFECTIVE_PARALLEL_JOBS}"
-  fi
-
-  echo "[$LABEL] Scanning ${TOTAL} files with persistent_session_workers=${EFFECTIVE_PARALLEL_JOBS}" | tee -a "$SCANLOG"
-  echo "[$LABEL] Progress logging uses file-count checkpoints, not scan chunks: mode=${PROGRESS_INTERVAL_MODE} progress_interval=${EFFECTIVE_PROGRESS_INTERVAL} ${PROGRESS_INTERVAL_DETAIL}" | tee -a "$SCANLOG"
-
-  RESULTS_FILE="$TMP_DIR/${LABEL}_results.tsv"
-  if python3 /usr/local/bin/clamd_session_scan.py \
-    --socket /tmp/clamd.sock \
-    --list-file "$LIST_FILE" \
-    --results-file "$RESULTS_FILE" \
-    --quarantine-dir "$QUARANTINE_DIR" \
-    --workers "$EFFECTIVE_PARALLEL_JOBS" \
-    --progress-interval "$EFFECTIVE_PROGRESS_INTERVAL" \
-    --label "$LABEL" \
-    --scanlog "$SCANLOG" \
-    --scan-paths "$SCAN_PATHS"; then
+  RESULTS_FILE="$TMP_DIR/${LABEL}_results.jsonl"
+  if python3 /usr/local/bin/clamd_session_scan.py --socket "$CLAMD_SOCKET" --list-file "$LIST_FILE" --results-file "$RESULTS_FILE" --quarantine-dir "$QUARANTINE_DIR" --configured-workers "$CONFIGURED_PARALLEL_JOBS" --requested-progress-interval "$REQUESTED_CHUNK_SIZE" --progress-steps "$PROGRESS_STEPS" --max-files "$MAX_SCHEDULED_FILES" --scanlog-max-bytes "$SCANLOG_MAX_BYTES" --scanlog-rotations "$SCANLOG_ROTATIONS" --label "$LABEL" --scanlog "$SCANLOG" --scan-paths "$SCAN_PATHS"; then
     echo "[$LABEL] Completed successfully." | tee -a "$SCANLOG"
     return 0
   fi
 
-  echo "[WARN] ${LABEL} scan incomplete (${TOTAL} scheduled files)." | tee -a "$SCANLOG"
+  echo "[WARN] ${LABEL} scan incomplete. The structured results file is ${RESULTS_FILE}." | tee -a "$SCANLOG"
   return 1
 }
 
 while true; do
+  if ! ensure_clamd_alive; then
+    exit 1
+  fi
+
   exec 9>"$STATE_DIR/scan.lock"
   if ! flock -n 9; then
     release_lock
@@ -1067,7 +1264,7 @@ while true; do
   if [ "$FULL_DUE" -eq 1 ]; then
     echo "=== FULL SCAN starting ===" | tee -a "$SCANLOG"
 
-    FULL_LIST="$TMP_DIR/full_list.txt"
+    FULL_LIST="$TMP_DIR/full_list.nul"
     FULL_SCAN_CUTOFF=$(date +%s)
     FULL_TARGET_PATHS="$SCAN_PATHS"
     FULL_IGNORE_PATHS=""
@@ -1165,7 +1362,7 @@ while true; do
 
   if [ "$CHANGED_DUE" -eq 1 ] && [ "$CYCLE_ABORT" -eq 0 ]; then
     echo "=== CHANGED-FILES scan starting ===" | tee -a "$SCANLOG"
-    CHANGED_LIST="$TMP_DIR/changed_list.txt"
+    CHANGED_LIST="$TMP_DIR/changed_list.nul"
     CHANGED_SCAN_CUTOFF=$(date +%s)
     CHANGED_REFERENCE_EPOCH="$LAST_CHANGED_EPOCH"
     CHANGED_TARGET_PATHS="$SCAN_PATHS"

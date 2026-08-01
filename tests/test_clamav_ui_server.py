@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import os
 import sys
 import tempfile
 import unittest
@@ -17,35 +19,107 @@ SPEC.loader.exec_module(clamav_ui_server)
 
 class UIConfigValidationTests(unittest.TestCase):
     def test_validate_and_normalize_config_accepts_valid_payload(self):
-        payload = {
-            "tz": "UTC",
-            "scan_paths": ["/downloads", "/archive"],
-            "exclude_paths": ["/downloads/tmp"],
-            "changed_scan_days": [1, 2, 3],
-            "changed_scan_times": ["07:00", "14:00"],
-            "full_scan_days": [7],
-            "full_scan_times": ["03:30"],
-        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloads = Path(temp_dir) / "downloads"
+            archive = Path(temp_dir) / "archive"
+            downloads.mkdir()
+            archive.mkdir()
+            payload = {
+                "tz": "UTC",
+                "scan_paths": [str(downloads), str(archive)],
+                "exclude_paths": [str(downloads / "tmp")],
+                "changed_scan_days": [1, 2, 3],
+                "changed_scan_times": ["07:00", "14:00"],
+                "full_scan_days": [7],
+                "full_scan_times": ["03:30"],
+            }
 
-        with mock.patch.object(clamav_ui_server.os.path, "isdir", return_value=True):
             normalized = clamav_ui_server.validate_and_normalize_config(payload)
 
-        self.assertEqual(normalized["scan_paths"], ["/downloads", "/archive"])
-        self.assertEqual(normalized["changed_scan_times"], ["07:00", "14:00"])
-        self.assertEqual(normalized["full_scan_days"], [7])
+            self.assertEqual(normalized["scan_paths"], [str(downloads.resolve()), str(archive.resolve())])
+            self.assertEqual(normalized["changed_scan_times"], ["07:00", "14:00"])
+            self.assertEqual(normalized["full_scan_days"], [7])
 
     def test_validate_and_normalize_config_rejects_invalid_time(self):
-        payload = {
-            "scan_paths": ["/downloads"],
-            "changed_scan_days": [1],
-            "changed_scan_times": ["99:00"],
-            "full_scan_days": [7],
-            "full_scan_times": ["03:30"],
-        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            payload = {
+                "scan_paths": [temp_dir],
+                "changed_scan_days": [1],
+                "changed_scan_times": ["99:00"],
+                "full_scan_days": [7],
+                "full_scan_times": ["03:30"],
+            }
 
-        with mock.patch.object(clamav_ui_server.os.path, "isdir", return_value=True):
             with self.assertRaisesRegex(ValueError, "Invalid time value"):
                 clamav_ui_server.validate_and_normalize_config(payload)
+
+    def test_validate_and_normalize_config_rejects_excessive_or_mismatched_workers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_payload = {
+                "scan_paths": [temp_dir],
+                "changed_scan_days": [1],
+                "changed_scan_times": ["07:00"],
+                "full_scan_days": [7],
+                "full_scan_times": ["03:30"],
+            }
+            with self.assertRaisesRegex(ValueError, "at most 64"):
+                clamav_ui_server.validate_and_normalize_config({**base_payload, "maxthreads": 65})
+            with self.assertRaisesRegex(ValueError, "must not exceed maxthreads"):
+                clamav_ui_server.validate_and_normalize_config(
+                    {
+                        **base_payload,
+                        "maxthreads": 4,
+                        "full_scan_parallel_jobs": 5,
+                        "changed_scan_parallel_jobs": 4,
+                    }
+                )
+
+    def test_validate_and_normalize_config_rejects_scanlog_inside_scan_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scan_root = Path(temp_dir) / "downloads"
+            scan_root.mkdir()
+            with self.assertRaisesRegex(ValueError, "scanlog must be outside"):
+                clamav_ui_server.validate_and_normalize_config(
+                    {
+                        "scan_paths": [str(scan_root)],
+                        "scanlog": str(scan_root / "scanner.log"),
+                    }
+                )
+
+    def test_validate_and_normalize_config_rejects_quarantine_parent_of_scan_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            quarantine = Path(temp_dir) / "quarantine"
+            scan_root = quarantine / "downloads"
+            scan_root.mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, "must not contain a scan root"):
+                clamav_ui_server.validate_and_normalize_config(
+                    {
+                        "scan_paths": [str(scan_root)],
+                        "quarantine_dir": str(quarantine),
+                    }
+                )
+
+    def test_runtime_permission_probe_creates_required_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "downloads"
+            scan_root.mkdir()
+            config = clamav_ui_server.validate_and_normalize_config(
+                {
+                    "scan_paths": [str(scan_root)],
+                    "quarantine_dir": str(scan_root / "quarantine"),
+                    "scanlog": str(base / "logs" / "scanner.log"),
+                }
+            )
+
+            clamav_ui_server.validate_runtime_permissions(
+                config,
+                base / "config",
+                base / "state",
+            )
+
+            self.assertTrue((scan_root / "quarantine").is_dir())
+            self.assertTrue((base / "logs" / "scanner.log").is_file())
 
     def test_serialize_config_for_scheduler_derives_force_flag(self):
         config = dict(clamav_ui_server.DEFAULT_CONFIG)
@@ -64,13 +138,18 @@ class UIConfigValidationTests(unittest.TestCase):
         self.assertEqual(serialized["FORCE_FULL_FLAG"], "/downloads/.clamav_force_full_scan.flag")
 
     def test_validate_manual_request_paths_rejects_paths_outside_scan_roots(self):
-        config = {"scan_paths": ["/downloads"]}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            downloads = base / "downloads"
+            archive = base / "archive"
+            downloads.mkdir()
+            archive.mkdir()
+            config = {"scan_paths": [str(downloads)]}
 
-        with mock.patch.object(clamav_ui_server.os.path, "exists", return_value=True):
             with self.assertRaisesRegex(ValueError, "outside configured scan roots"):
                 clamav_ui_server.validate_manual_request_paths(
                     config,
-                    ["/archive"],
+                    [str(archive)],
                     field_name="target_paths",
                     require_existing=True,
                 )
@@ -104,10 +183,7 @@ class UISchedulerManagerTests(unittest.TestCase):
                 "avg_data_rate": "66.90 MiB/s",
                 "roots": [],
             }
-            second_entry = {
-                **first_entry,
-                "cycle_started_at": "Mon Mar 16 01:27:20 UTC 2026",
-            }
+            second_entry = {**first_entry, "cycle_started_at": "Mon Mar 16 01:27:20 UTC 2026"}
 
             try:
                 manager._append_history_locked(first_entry)
@@ -266,7 +342,18 @@ class UISchedulerManagerTests(unittest.TestCase):
                 "elapsed": "1m",
                 "avg_throughput": "10 files/s",
                 "avg_data_rate": "100 MiB/s",
-                "roots": [{"root": "/downloads", "files": 100, "processed_files": 100, "bytes": "3.0 GiB", "processed_bytes": "3.0 GiB", "infected": 0, "vanished": 0, "errors": 0}],
+                "roots": [
+                    {
+                        "root": "/downloads",
+                        "files": 100,
+                        "processed_files": 100,
+                        "bytes": "3.0 GiB",
+                        "processed_bytes": "3.0 GiB",
+                        "infected": 0,
+                        "vanished": 0,
+                        "errors": 0,
+                    }
+                ],
             }
             clamav_ui_server.write_json_atomic(config_dir / "ui-history.json", [duplicate_entry, duplicate_entry])
 
@@ -353,6 +440,24 @@ class UISchedulerManagerTests(unittest.TestCase):
             self.assertEqual(manager._phase, "idle")
             self.assertEqual(manager._next_wake, "Mon Mar 16 13:00:00 UTC 2026")
             self.assertIsNone(manager._current_scan)
+
+    def test_clamd_ready_line_marks_scheduler_idle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            manager._phase = "starting"
+            try:
+                manager._handle_log_line("clamd ready.")
+            finally:
+                manager.shutdown()
+
+            self.assertEqual(manager._phase, "idle")
+            self.assertEqual(manager._last_event, "clamd ready.")
 
     def test_log_replay_does_not_restore_historical_in_progress_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -541,6 +646,173 @@ class UISchedulerManagerTests(unittest.TestCase):
             self.assertAlmostEqual(trace[1]["elapsed_seconds"], 70.0)
             self.assertAlmostEqual(trace[1]["window_throughput_files_per_sec"], 0.56)
             self.assertAlmostEqual(trace[1]["window_data_rate_mib_per_sec"], 39.90)
+
+    def test_scheduler_starts_in_a_new_process_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            manager = clamav_ui_server.SchedulerManager(
+                config_dir=temp_path / "config",
+                state_dir=temp_path / "state",
+            )
+            manager._stop_event.set()
+            manager._monitor_thread.join(timeout=2)
+            manager._config = {
+                **clamav_ui_server.DEFAULT_CONFIG,
+                "scan_paths": [temp_dir],
+                "scanlog": str(temp_path / "scan.log"),
+            }
+            fake_process = mock.Mock()
+            fake_process.poll.return_value = None
+
+            with mock.patch.object(clamav_ui_server.subprocess, "Popen", return_value=fake_process) as popen:
+                manager._start_scheduler_locked(reset_backoff=True)
+
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            manager._process = None
+
+    def test_scheduler_stop_signals_the_complete_process_group(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            manager = clamav_ui_server.SchedulerManager(
+                config_dir=temp_path / "config",
+                state_dir=temp_path / "state",
+            )
+            manager._stop_event.set()
+            manager._monitor_thread.join(timeout=2)
+            fake_process = mock.Mock()
+            fake_process.pid = 4321
+            fake_process.poll.return_value = None
+            fake_process.wait.return_value = 0
+            fake_process.returncode = -15
+            manager._process = fake_process
+
+            with mock.patch.object(clamav_ui_server.os, "killpg") as killpg:
+                manager._stop_scheduler_locked()
+
+            killpg.assert_called_once_with(4321, clamav_ui_server.signal.SIGTERM)
+            self.assertIsNone(manager._process)
+
+    def test_unexpected_scheduler_exit_gets_exponential_restart_delay(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            manager = clamav_ui_server.SchedulerManager(
+                config_dir=temp_path / "config",
+                state_dir=temp_path / "state",
+            )
+            manager._stop_event.set()
+            manager._monitor_thread.join(timeout=2)
+            manager._config = {**clamav_ui_server.DEFAULT_CONFIG, "scan_paths": [temp_dir]}
+            fake_process = mock.Mock()
+            fake_process.poll.return_value = 7
+            manager._process = fake_process
+            manager._process_started_monotonic = 99.0
+
+            with mock.patch.object(clamav_ui_server.time, "monotonic", return_value=100.0):
+                manager._poll_process_locked()
+
+            self.assertEqual(manager._phase, "restart_wait")
+            self.assertEqual(manager._next_restart_monotonic, 102.0)
+            self.assertIn("Restarting in 2 seconds", manager._last_event)
+
+
+class PathValidationTests(unittest.TestCase):
+    def test_path_line_protocol_rejects_control_characters_and_colons(self):
+        for value in (
+            "/downloads/good\nREQUEST_MODE=relative",
+            "/downloads/trailing-newline\n",
+            "/downloads/colon:name",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    clamav_ui_server.normalize_path_entry(value, "target_paths")
+
+    def test_list_entries_must_be_strings(self):
+        with self.assertRaises(ValueError):
+            clamav_ui_server.normalize_path_list(["/downloads", 7], "scan_paths", required=True)
+
+    def test_symlink_escape_is_outside_canonical_scan_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scan_root = base / "downloads"
+            outside = base / "outside"
+            scan_root.mkdir()
+            outside.mkdir()
+            escaped_file = outside / "escaped.txt"
+            escaped_file.write_text("data", encoding="utf-8")
+            (scan_root / "escape").symlink_to(outside, target_is_directory=True)
+            config = {"scan_paths": [str(scan_root.resolve())]}
+
+            with self.assertRaises(ValueError):
+                clamav_ui_server.validate_manual_request_paths(
+                    config,
+                    [str(scan_root / "escape" / "escaped.txt")],
+                    field_name="target_paths",
+                    require_existing=True,
+                )
+
+    def test_canonical_in_root_target_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scan_root = Path(temp_dir) / "downloads"
+            target = scan_root / "nested" / "target.txt"
+            target.parent.mkdir(parents=True)
+            target.write_text("data", encoding="utf-8")
+            config = {"scan_paths": [str(scan_root.resolve())]}
+
+            paths = clamav_ui_server.validate_manual_request_paths(
+                config,
+                [str(scan_root / "nested" / ".." / "nested" / "target.txt")],
+                field_name="target_paths",
+                require_existing=True,
+            )
+
+            self.assertEqual(paths, [str(target.resolve())])
+
+
+class PersistenceTests(unittest.TestCase):
+    def test_atomic_writer_replaces_content_without_fixed_temp_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "config.json"
+            destination.write_text("old", encoding="utf-8")
+
+            clamav_ui_server.write_json_atomic(destination, {"value": 2})
+
+            self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {"value": 2})
+            self.assertEqual(list(destination.parent.glob(".config.json.*.tmp")), [])
+
+    def test_request_writer_rejects_embedded_newline(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "request.env"
+            with self.assertRaises(ValueError):
+                clamav_ui_server.write_key_value_file(
+                    destination,
+                    ["REQUEST_TARGET_PATHS=/downloads/good\nREQUEST_MODE=relative"],
+                )
+            self.assertFalse(destination.exists())
+
+    def test_persisted_json_reader_rejects_oversized_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            oversized = Path(temp_dir) / "oversized.json"
+            with oversized.open("wb") as handle:
+                handle.truncate(clamav_ui_server.MAX_PERSISTED_JSON_BYTES + 1)
+            with self.assertRaisesRegex(ValueError, "Persisted JSON exceeds"):
+                clamav_ui_server.read_json(oversized)
+
+    def test_malformed_history_does_not_prevent_ui_manager_startup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / "config"
+            state_dir = Path(temp_dir) / "state"
+            config_dir.mkdir()
+            history_path = config_dir / "ui-history.json"
+            history_path.write_text("{not-json", encoding="utf-8")
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            try:
+                status = manager.get_status()
+                self.assertFalse(status["configured"])
+                self.assertIn("could not be loaded", status["last_warning"])
+                self.assertEqual(history_path.read_text(encoding="utf-8"), "{not-json")
+            finally:
+                manager.shutdown()
 
 
 if __name__ == "__main__":

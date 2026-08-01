@@ -6,7 +6,9 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 
 - Dual-mode startup: headless env-driven mode or browser-based UI mode
 - Runs `clamd` inside the container
-- Uses a persistent socket-based scan client instead of spawning one `clamdscan` process per file
+- Uses persistent Unix-socket sessions and passes an already-open file descriptor to `clamd` (`FILDES`)
+- Verifies device, inode, size, modification time, and change time before scanning and again before quarantine
+- Uses NUL-delimited enumeration, so filenames containing newlines, tabs, colons, or non-UTF-8 bytes remain intact
 - Time-based full-scan schedule using `FULL_SCAN_DAYS` and `FULL_SCAN_TIMES`
 - Time-based changed-files schedule using `CHANGED_SCAN_DAYS` and `CHANGED_SCAN_TIMES`
 - Incremental changed-files scans between full scans
@@ -20,6 +22,8 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Treats files that vanish after list-building as non-fatal and reports them separately
 - Pauses and retries if any configured scan root becomes unavailable
 - Persistent state and ClamAV definitions via bind mounts
+- Runs as fixed non-root UID/GID `10001:10001`, supports a read-only root filesystem, and drops all Linux capabilities in the Compose example
+- Waits for complete external definitions at startup and exposes strict definition-age/container health checks
 
 ## Warning
 
@@ -32,7 +36,7 @@ The container can run in one of two modes:
 - `APP_MODE=headless` - the current behavior; scanner settings come directly from environment variables
 - `APP_MODE=ui` - starts a built-in web UI on port `8080`; scanner settings are loaded from `/config/ui-config.json` instead of from environment variables
 
-In UI mode, scheduler configuration environment variables are intentionally ignored. Only bootstrap variables such as `APP_MODE`, `UI_PORT`, `CONFIG_DIR`, and `STATE_DIR` are used directly from the container environment.
+In UI mode, scheduler configuration environment variables are intentionally ignored. Container/bootstrap settings (UI bounds, runtime paths, definition readiness, and clamd safety limits) still come from the environment; schedule and scan-path settings come from the saved UI config.
 
 ## Environment Variables
 
@@ -43,17 +47,28 @@ In UI mode, scheduler configuration environment variables are intentionally igno
 - `UI_PORT` - UI port in UI mode; defaults to `8080`
 - `CONFIG_DIR` - persistent UI configuration directory in UI mode; defaults to `/config`
 - `STATE_DIR` - persistent runtime state directory; defaults to `/state`
+- `RUNTIME_DIR` - private ephemeral clamd configuration/socket directory; defaults to `/tmp/clamav-runtime`
+- `UI_MAX_REQUEST_THREADS` - maximum simultaneous UI request threads; defaults to `32`, hard maximum `128`
+- `UI_REQUEST_QUEUE_SIZE` - listener backlog; defaults to `64`, hard maximum `256`
+- `UI_REQUEST_TIMEOUT_SECONDS` - per-connection timeout; defaults to `15`, hard maximum `120`
+- `DEFINITIONS_DIR` - read-only ClamAV database mount; defaults to `/var/lib/clamav`
+- `DEFINITIONS_WAIT_TIMEOUT` - startup wait for complete `main` and `daily` databases; defaults to `300` seconds
+- `DEFINITIONS_MAX_AGE_SECONDS` - maximum accepted `daily` database age; defaults to `172800` (48 hours)
+- `DEFINITIONS_STALE_ACTION` - `warn` or `fail` at startup; the container healthcheck is strict regardless
+- `MAX_SCHEDULED_FILES` - maximum unique paths indexed in one run; defaults to `1000000`, hard maximum `5000000`
+- `SCANLOG_MAX_BYTES` - rotates the main scan log during scans; defaults to `104857600` (100 MiB), hard maximum 1 GiB
+- `SCANLOG_ROTATIONS` - retained rotated scan logs; defaults to `5`, hard maximum `20`
 
 ### Headless scanner configuration
 
 These variables apply directly only in `APP_MODE=headless`. In `APP_MODE=ui`, the browser UI stores these settings persistently and the scheduler uses that saved config instead.
 
 - `TZ` - timezone
-- `MAXTHREADS` - clamd thread count
+- `MAXTHREADS` - clamd thread count; hard range `1..64`
 - `SCAN_PATHS` - colon-separated scan roots inside the container; defaults to `/downloads` and every listed path must be mounted and healthy before a scan runs
 - `EXCLUDE_PATHS` - optional colon-separated in-container file or directory paths to skip during both full and changed scans
-- `FULL_SCAN_PARALLEL_JOBS` - parallel persistent scan workers for full scans
-- `CHANGED_SCAN_PARALLEL_JOBS` - parallel persistent scan workers for changed-file scans
+- `FULL_SCAN_PARALLEL_JOBS` - parallel persistent scan workers for full scans; hard maximum `64` and cannot exceed `MAXTHREADS`
+- `CHANGED_SCAN_PARALLEL_JOBS` - parallel persistent scan workers for changed-file scans; hard maximum `64` and cannot exceed `MAXTHREADS`
 - `FULL_PROGRESS_STEPS` - target number of progress updates used to derive the full-scan progress interval
 - `CHANGED_PROGRESS_STEPS` - target number of progress updates used to derive the changed-scan progress interval
 - `FULL_CHUNK_SIZE` - optional fixed full-scan progress interval override; `0` keeps dynamic sizing
@@ -71,6 +86,23 @@ These variables apply directly only in `APP_MODE=headless`. In `APP_MODE=ui`, th
 - `QUARANTINE_DIR` - infected file destination
 - `SCANLOG` - log file path
 - `FORCE_FULL_FLAG` - full-scan trigger flag file path; defaults to the first path in `SCAN_PATHS`
+
+### Clamd safety limits
+
+These are bootstrap settings in both modes. They are validated before any clamd configuration is written:
+
+- `CLAMD_MAX_QUEUE` - queued commands; defaults to twice `MAXTHREADS`, must be at least `MAXTHREADS`, hard maximum `128`
+- `CLAMD_MAX_SCAN_SIZE` - maximum expanded content scanned per input; defaults to `512M`, hard maximum `16G`
+- `CLAMD_MAX_FILE_SIZE` - maximum individual file size clamd processes; defaults to `256M`, cannot exceed `CLAMD_MAX_SCAN_SIZE`, hard maximum `16G`
+- `CLAMD_LOG_MAX_SIZE` - clamd diagnostic log rotation threshold; defaults to `10M`, hard maximum `1G`
+- `CLAMD_MAX_RECURSION` - archive/container nesting depth; defaults to `32`, hard maximum `100`
+- `CLAMD_MAX_FILES` - files extracted from one container/archive; defaults to `10000`, hard maximum `1000000`
+- `CLAMD_MAX_SCAN_TIME` - milliseconds allowed per scan; defaults to `900000` (15 minutes), hard maximum one hour
+- `CLAMD_READ_TIMEOUT` and `CLAMD_COMMAND_READ_TIMEOUT` - socket timeouts; defaults to `900` and `30` seconds
+- `CLAMD_SELF_CHECK` - seconds between definition timestamp checks; defaults to `300`
+- `CLAMD_START_TIMEOUT` - maximum database-load/readiness wait; defaults to `180` seconds
+
+`AlertExceedsMax yes` is enabled, so a limit-exceeded object is reported instead of being silently treated as fully scanned. Archive expansion uses the bounded `/tmp` tmpfs in the Compose example.
 
 ## UI mode
 
@@ -104,8 +136,50 @@ volumes:
   - ./config:/config:rw
   - ./state:/state:rw
   - ./logs:/var/log/clamav:rw
-  - ./defs:/var/lib/clamav:rw
+  - ./defs:/var/lib/clamav:ro
 ```
+
+### ClamAV definitions updater and volume permissions
+
+This scanner intentionally does not run `freshclam`. Your separate `clamav-defs-updater` container is exactly the updater referenced here: it is the single writer to the shared definitions directory, while this scanner and any other consumers mount the same data read-only.
+
+For the arrangement to work reliably:
+
+- the updater must publish complete database files into the shared directory using FreshClam's atomic update behavior
+- the scanner must be able to read and traverse the directory (normally directories `0755` and definition files `0644`, or equivalent group permissions)
+- both containers must mount the exact same host directory or named volume at `/var/lib/clamav`
+- the updater must be the only process writing definitions; do not run a second FreshClam process in the scanner
+- startup waits for readable, non-empty `main.cvd/main.cld` and `daily.cvd/daily.cld`; it never creates or writes the definitions mount
+- `clamd` checks definition timestamps every `CLAMD_SELF_CHECK` seconds and reloads updates from the shared volume; concurrent reload is disabled to avoid a large temporary memory spike
+- an operator can request an immediate reload with `docker exec clamav-scheduled python3 /usr/local/bin/clamav_healthcheck.py --reload`
+- the built-in healthcheck fails when definitions are missing, incomplete, unreadable, or older than `DEFINITIONS_MAX_AGE_SECONDS`
+
+The updater does not need access to the scanner's private socket when `SelfCheck` is acceptable. Sharing the socket would couple two containers and expands the trust boundary; use it only if reload latency must be lower than the configured self-check interval.
+
+### Read/write contract
+
+The image runs as UID/GID `10001:10001`. At startup it performs an actual create-and-delete probe instead of trusting permission bits alone.
+
+| Path | Scanner access | Reason |
+| --- | --- | --- |
+| scan roots | read/write/search | clamd reads content; successful quarantine must unlink the infected source |
+| quarantine | read/write/search | creates no-overwrite mode-`0600` quarantine files |
+| `/config` (UI mode) | read/write | atomic UI config and history replacement |
+| `/state` | read/write | locks, checkpoints, and manual requests |
+| log directory | read/write | append-only operational log |
+| definitions | read-only | the external updater is the only writer |
+| `/tmp` and `/run` | tmpfs | clamd socket/config/temp extraction; root filesystem remains read-only |
+
+Prepare bind mounts before starting the container:
+
+```sh
+install -d -m 0750 -o 10001 -g 10001 downloads config state logs
+install -d -m 0755 defs
+find defs -type d -exec chmod 0755 {} +
+find defs -type f -exec chmod 0644 {} +
+```
+
+Do not place `STATE_DIR`, `RUNTIME_DIR`, `TMP_DIR`, definitions, or `SCANLOG` inside a scan root. The scanner rejects that layout because its own writes would change files while they are being scanned. Nested directories can still have stricter permissions; a later per-file permission failure is recorded as a scan error and prevents checkpoint advancement.
 
 ## Scan schedules
 
@@ -128,7 +202,9 @@ UI-queued full scans only advance the normal scheduled full/changed checkpoints 
 
 Changed-file scans treat either a newer content-modified time or a newer metadata-change time as "changed," which helps catch files copied in with preserved old modification times.
 
-If a file disappears after it was added to the scan list but before `clamd` can scan it, the run records that file as `vanished` instead of failing the entire scan. Real scan errors still fail the run and keep the previous checkpoints in place.
+If a file disappears after it was added to the scan list but before `clamd` can scan it, the run records that file as `vanished` instead of failing the entire scan. Real scan errors, quarantine failures, incomplete worker processing, and structured-result write failures fail the run and keep the previous checkpoints in place.
+
+Detected threat signatures are retained. Each detection is written to the main scan log as a JSON object with the scan type, ClamAV signature, source, quarantine destination, and quarantine result. Per-file temporary results use JSON Lines so paths and threat names cannot corrupt a delimiter-based record.
 
 Deprecated environment variables such as `DOWNLOADS_DIR`, `PARALLEL_JOBS`, `CHUNK_SIZE`, `SCAN_INTERVAL`, `CHANGED_SCAN_INTERVAL`, and `FULL_SCAN_INTERVAL` are no longer accepted.
 
@@ -164,6 +240,40 @@ If an entry points to a directory, everything under that directory is skipped. I
 ## Docker Compose
 
 See `docker-compose.example.yml`.
+
+## Image and update policy
+
+The image uses Alpine `3.24.1` pinned by its multi-architecture OCI digest and ClamAV `1.4.5-r0` pinned as a build argument. Alpine is used because it provides a small, supported runtime with maintained `amd64` and `arm64` packages; the `v3.24` branch is supported through June 2028. Each build applies patched packages from that same stable branch but never jumps to a new Alpine branch. ClamAV `1.4` is the current long-term-support line, and `1.4.5` includes the July 2026 security fixes. See the [Alpine release branches](https://www.alpinelinux.org/releases/), [Alpine 3.24.1 release](https://www.alpinelinux.org/posts/Alpine-3.24.1-released.html), and [ClamAV end-of-life table](https://docs.clamav.net/faq/faq-eol.html).
+
+`latest` is a discovery signal, not a reproducible deployment input. General OS patch revisions are updated only while building and are captured in that image's SBOM and digest; the engine is held for explicit compatibility review. Automatically replacing packages inside a running security scanner would:
+
+- make two builds from the same commit produce different software
+- bypass the architecture, reload, quarantine, permission, and regression tests
+- make rollback uncertain
+- combine code/engine updates with live state changes on a read-only container
+
+Virus definitions are different: they are data designed for frequent automatic updates, so the external updater refreshes them continuously and clamd reloads them. Engine/base-image updates follow a reviewed image rebuild.
+
+Updates are still automated up to the approval boundary:
+
+- Dependabot checks the pinned base image digest and SHA-pinned GitHub Actions weekly
+- the weekly dependency audit fails when Alpine's `v3.24` ClamAV candidate differs from `CLAMAV_PACKAGE_VERSION`
+- the same audit rebuilds the image and fails on newly disclosed fixed `HIGH` or `CRITICAL` OS vulnerabilities
+- every change runs unit tests, a real clamd database-reload/FILDES/quarantine test on `amd64` and `arm64`, and a vulnerability gate
+- releases publish provenance and an SBOM
+
+When an audit reports an update, review the upstream release notes, update the explicit version/digest in a pull request, let CI validate it, then deploy the resulting immutable application-image digest.
+
+### Canary rollout
+
+Use the following operational sequence for an engine/base migration:
+
+1. Back up UI config and state, and record the currently deployed image digest.
+2. Deploy the candidate digest to one canary with the same mount types and permissions as production.
+3. Confirm the healthcheck reports fresh definitions and a responsive scheduler/clamd.
+4. Force a definitions update or run the explicit reload command, then verify the database version/age changes without permission errors.
+5. Scan a controlled test threat and unusual filename; confirm the signature, source, quarantine path, `quarantine_success=true`, and mode `0600`.
+6. Observe at least one changed scan and one full scan, then roll out gradually. Roll back to the recorded digest if errors, memory pressure, or quarantine failures increase.
 
 ## Force a full scan
 

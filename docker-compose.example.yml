@@ -1,8 +1,16 @@
 services:
   clamav-scheduled:
-    image: ghcr.io/YOUR_GITHUB_USERNAME/clamav-scheduled:latest
+    # Replace vX.Y.Z with a tested release (or an immutable digest) for reproducible deployments.
+    image: ghcr.io/YOUR_GITHUB_USERNAME/clamav-scheduled:vX.Y.Z
     container_name: clamav-scheduled
+    user: "10001:10001"
+    init: true
     restart: unless-stopped
+    read_only: true
+    stop_grace_period: 30s
+    cpus: "2.0"
+    mem_limit: 6g
+    pids_limit: 256
     ports:
       - "8080:8080"
     environment:
@@ -10,6 +18,29 @@ services:
       UI_PORT: 8080
       CONFIG_DIR: /config
       STATE_DIR: /state
+      RUNTIME_DIR: /tmp/clamav-runtime
+      UI_MAX_REQUEST_THREADS: 32
+      UI_REQUEST_QUEUE_SIZE: 64
+      UI_REQUEST_TIMEOUT_SECONDS: 15
+      DEFINITIONS_DIR: /var/lib/clamav
+      DEFINITIONS_WAIT_TIMEOUT: 300
+      DEFINITIONS_MAX_AGE_SECONDS: 172800
+      # Startup warns, while the image healthcheck still becomes unhealthy when daily definitions exceed this age.
+      DEFINITIONS_STALE_ACTION: warn
+      CLAMD_MAX_QUEUE: 26
+      CLAMD_MAX_SCAN_SIZE: 512M
+      CLAMD_MAX_FILE_SIZE: 256M
+      CLAMD_LOG_MAX_SIZE: 10M
+      CLAMD_MAX_RECURSION: 32
+      CLAMD_MAX_FILES: 10000
+      CLAMD_MAX_SCAN_TIME: 900000
+      CLAMD_READ_TIMEOUT: 900
+      CLAMD_COMMAND_READ_TIMEOUT: 30
+      CLAMD_SELF_CHECK: 300
+      CLAMD_START_TIMEOUT: 180
+      MAX_SCHEDULED_FILES: 1000000
+      SCANLOG_MAX_BYTES: 104857600
+      SCANLOG_ROTATIONS: 5
       # Headless-only scanner env vars below are ignored when APP_MODE=ui.
       # Set APP_MODE=headless if you want to keep managing the scanner from environment variables.
       TZ: UTC
@@ -37,8 +68,23 @@ services:
       # Mount additional scan roots and append them to SCAN_PATHS as needed.
       # - ./archive:/archive:rw
       - ./config:/config:rw
-      - ./defs:/var/lib/clamav:rw
+      # A separate definitions updater owns writes; this scanner only needs read access.
+      - ./defs:/var/lib/clamav:ro
       - ./logs:/var/log/clamav:rw
       - ./state:/state:rw
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
+      - /run:rw,nosuid,nodev,noexec,size=16m,mode=0755
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

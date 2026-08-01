@@ -1,0 +1,43 @@
+name: Weekly Dependency and Vulnerability Audit
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Detect a newer ClamAV package in the pinned Alpine branch
+        run: |
+          pinned_version="$(awk -F= '/^ARG CLAMAV_PACKAGE_VERSION=/{print $2}' Dockerfile)"
+          available_version="$(docker run --rm alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b sh -ec 'apk update >/dev/null; apk policy clamav' | awk '$1 ~ /^[0-9]/ {gsub(":", "", $1); print $1; exit}')"
+          test -n "${pinned_version}"
+          test -n "${available_version}"
+          if [ "${pinned_version}" != "${available_version}" ]; then
+            echo "Pinned ClamAV ${pinned_version} differs from Alpine v3.24 candidate ${available_version}. Review release notes, update the ARG, and run integration tests."
+            exit 1
+          fi
+
+      - name: Build pinned image
+        run: docker build --tag clamav-scheduled:weekly-audit .
+
+      - name: Scan pinned image for newly disclosed vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: clamav-scheduled:weekly-audit
+          version: v0.70.0
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os
+          scanners: vuln
+          severity: HIGH,CRITICAL
