@@ -173,6 +173,98 @@ class SessionScannerTests(unittest.TestCase):
             self.assertEqual(fake_socket.sent, [])
 
 
+class LargeMediaPolicyTests(unittest.TestCase):
+    def test_window_ranges_cover_every_byte_with_overlap(self):
+        ranges = clamd_session_scan.large_media_window_ranges(25, 10, 2)
+        self.assertEqual(ranges, [(0, 10), (8, 10), (16, 9)])
+        covered = [False] * 25
+        for offset, length in ranges:
+            for index in range(offset, offset + length):
+                covered[index] = True
+        self.assertTrue(all(covered))
+
+    def test_media_probe_rejects_archive_and_unsafe_attachment(self):
+        with self.assertRaisesRegex(clamd_session_scan.LargeMediaPolicyError, "not an approved video"):
+            clamd_session_scan.parse_large_media_probe(
+                json.dumps(
+                    {
+                        "format": {"format_name": "zip"},
+                        "streams": [{"codec_type": "video"}],
+                    }
+                ),
+                "/downloads/renamed.mkv",
+            )
+        with self.assertRaisesRegex(clamd_session_scan.LargeMediaPolicyError, "attachment"):
+            clamd_session_scan.parse_large_media_probe(
+                json.dumps(
+                    {
+                        "format": {"format_name": "matroska,webm"},
+                        "streams": [
+                            {"codec_type": "video"},
+                            {
+                                "codec_type": "attachment",
+                                "tags": {"filename": "payload.exe"},
+                            },
+                        ],
+                    }
+                ),
+                "/downloads/movie.mkv",
+            )
+
+    def test_oversized_video_uses_all_overlapping_windows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "movie.mkv"
+            source.write_bytes(b"0123456789abcdefghijklmnop")
+            info = source.stat()
+            entry = clamd_session_scan.FileEntry(
+                path=str(source),
+                size_bytes=info.st_size,
+                root=temp_dir,
+                device=info.st_dev,
+                inode=info.st_ino,
+                modified_ns=info.st_mtime_ns,
+                changed_ns=info.st_ctime_ns,
+            )
+            policy = clamd_session_scan.LargeMediaPolicy(
+                enabled=True,
+                native_max_bytes=10,
+                maximum_bytes=1024,
+                window_bytes=10,
+                overlap_bytes=2,
+                probe_timeout_seconds=5,
+                scan_timeout_seconds=60,
+                ffprobe_binary="/unused/ffprobe",
+            )
+            scanned: list[bytes] = []
+
+            def fake_scan(_socket, descriptor, current, offset, length, _deadline):
+                self.assertEqual(current, entry)
+                scanned.append(os.pread(descriptor, length, offset))
+                return "CLEAN", current.path, ""
+
+            with (
+                mock.patch.object(
+                    clamd_session_scan,
+                    "probe_large_media",
+                    return_value="matroska,webm",
+                ),
+                mock.patch.object(
+                    clamd_session_scan,
+                    "scan_instream_range",
+                    side_effect=fake_scan,
+                ),
+            ):
+                status, scanned_path, threat, method = clamd_session_scan.scan_large_media_entry(
+                    "/tmp/clamd.sock",
+                    entry,
+                    policy,
+                )
+
+            self.assertEqual((status, scanned_path, threat), ("CLEAN", str(source), ""))
+            self.assertEqual(method, "large_media_full_byte_windows")
+            self.assertEqual(scanned, [b"0123456789", b"89abcdefgh", b"ghijklmnop"])
+
+
 class ScanListTests(unittest.TestCase):
     def test_nul_list_preserves_newlines_tabs_colons_and_non_utf8_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -542,6 +634,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(len(event_payloads), 1)
             self.assertEqual(event_payloads[0]["event_type"], "scan_failed")
             self.assertEqual(event_payloads[0]["failure_kind"], "scan_policy_limit")
+            self.assertTrue(event_payloads[0]["event_id"].startswith("scan-policy-"))
 
     def test_worker_write_failure_is_reported_to_coordinator(self):
         with tempfile.TemporaryDirectory() as temp_dir:

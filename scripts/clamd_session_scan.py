@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import array
 import errno
+import hashlib
 import json
 import os
 import queue
@@ -12,6 +13,8 @@ import re
 import shutil
 import socket
 import stat
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -36,6 +39,29 @@ CLAMD_POLICY_LIMIT_MARKERS = (
     "scan limit exceeded",
     "limits exceeded",
     "stream size limit exceeded",
+)
+MAX_FFPROBE_OUTPUT_BYTES = 1024 * 1024
+LARGE_MEDIA_FORMATS = frozenset(
+    {"avi", "matroska", "mov", "mp4", "mpeg", "mpegts", "ogg", "webm"}
+)
+LARGE_MEDIA_STREAM_TYPES = frozenset({"audio", "attachment", "subtitle", "video"})
+SAFE_ATTACHMENT_SUFFIXES = frozenset(
+    {
+        ".ass",
+        ".gif",
+        ".jpeg",
+        ".jpg",
+        ".nfo",
+        ".otf",
+        ".png",
+        ".srt",
+        ".ssa",
+        ".ttf",
+        ".txt",
+        ".webp",
+        ".woff",
+        ".woff2",
+    }
 )
 
 
@@ -68,6 +94,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vanished-failure-count", required=True, type=int)
     parser.add_argument("--vanished-failure-percent", required=True, type=int)
     parser.add_argument("--vanished-failure-minimum", required=True, type=int)
+    parser.add_argument("--native-max-bytes", required=True, type=int)
+    parser.add_argument("--large-media-enabled", choices=("true", "false"), required=True)
+    parser.add_argument("--large-media-max-gib", required=True, type=int)
+    parser.add_argument("--large-media-window-mib", required=True, type=int)
+    parser.add_argument("--large-media-overlap-kib", required=True, type=int)
+    parser.add_argument("--large-media-probe-timeout", required=True, type=int)
+    parser.add_argument("--large-media-scan-timeout", required=True, type=int)
+    parser.add_argument("--large-media-workers", required=True, type=int)
+    parser.add_argument("--ffprobe-binary", required=True)
     return parser.parse_args()
 
 
@@ -217,6 +252,7 @@ class ResultsWriter:
         threat_name: str = "",
         quarantine_path: str | None = None,
         quarantine_success: bool | None = None,
+        scan_method: str = "clamd_fildes",
     ) -> None:
         payload = {
             "scan": scan_label or None,
@@ -227,6 +263,7 @@ class ResultsWriter:
             "threat": threat_name or None,
             "quarantine": quarantine_path,
             "quarantine_success": quarantine_success,
+            "scan_method": scan_method,
         }
         with self._lock:
             self._handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
@@ -259,6 +296,22 @@ class QuarantineError(RuntimeError):
     def __init__(self, message: str, destination: str | None = None) -> None:
         super().__init__(message)
         self.destination = destination
+
+
+class LargeMediaPolicyError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class LargeMediaPolicy:
+    enabled: bool
+    native_max_bytes: int
+    maximum_bytes: int
+    window_bytes: int
+    overlap_bytes: int
+    probe_timeout_seconds: int
+    scan_timeout_seconds: int
+    ffprobe_binary: str
 
 
 def stat_matches_entry(stat_result: os.stat_result, entry: FileEntry) -> bool:
@@ -302,13 +355,21 @@ class Metrics:
         self.vanished_files = 0
         self.error_files = 0
         self.quarantine_failures = 0
+        self.large_media_files = 0
         self.slowest_files: list[tuple[int, str, str, int]] = []
         self.last_log_processed_files = 0
         self.last_log_processed_bytes = 0
         self.last_log_elapsed_ms = 0
         self._lock = threading.Lock()
 
-    def record(self, entry: FileEntry, status: str, duration_ms: int, quarantine_failed: bool) -> tuple[int, bool]:
+    def record(
+        self,
+        entry: FileEntry,
+        status: str,
+        duration_ms: int,
+        quarantine_failed: bool,
+        scan_method: str = "clamd_fildes",
+    ) -> tuple[int, bool]:
         with self._lock:
             self.processed_files += 1
             self.processed_bytes += entry.size_bytes
@@ -327,6 +388,8 @@ class Metrics:
 
             if quarantine_failed:
                 self.quarantine_failures += 1
+            if scan_method == "large_media_full_byte_windows":
+                self.large_media_files += 1
 
             self.slowest_files.append((duration_ms, status, entry.path, entry.size_bytes))
             self.slowest_files.sort(key=lambda item: item[0], reverse=True)
@@ -345,6 +408,7 @@ class Metrics:
                 "vanished_files": self.vanished_files,
                 "error_files": self.error_files,
                 "quarantine_failures": self.quarantine_failures,
+                "large_media_files": self.large_media_files,
             }
 
     def progress_snapshot(self, elapsed_ms: int) -> dict[str, int]:
@@ -360,6 +424,7 @@ class Metrics:
                 "vanished_files": self.vanished_files,
                 "error_files": self.error_files,
                 "quarantine_failures": self.quarantine_failures,
+                "large_media_files": self.large_media_files,
                 "window_files": self.processed_files - self.last_log_processed_files,
                 "window_bytes": self.processed_bytes - self.last_log_processed_bytes,
                 "window_elapsed_ms": window_elapsed_ms,
@@ -414,6 +479,226 @@ def open_scannable_descriptor(entry: FileEntry) -> int:
     except Exception:
         os.close(descriptor)
         raise
+
+
+def large_media_window_ranges(
+    total_bytes: int,
+    window_bytes: int,
+    overlap_bytes: int,
+) -> list[tuple[int, int]]:
+    if total_bytes < 0 or window_bytes <= 0:
+        raise ValueError("invalid large-media size or window")
+    if overlap_bytes < 0 or overlap_bytes >= window_bytes:
+        raise ValueError("large-media overlap must be smaller than its window")
+    if total_bytes == 0:
+        return [(0, 0)]
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    step = window_bytes - overlap_bytes
+    while offset < total_bytes:
+        length = min(window_bytes, total_bytes - offset)
+        ranges.append((offset, length))
+        if offset + length >= total_bytes:
+            break
+        offset += step
+    return ranges
+
+
+def parse_large_media_probe(raw_output: str, path: str) -> str:
+    try:
+        payload = json.loads(raw_output)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise LargeMediaPolicyError(f"oversized file is not a valid video container: {path}") from exc
+    if not isinstance(payload, dict):
+        raise LargeMediaPolicyError(f"ffprobe returned an invalid media description: {path}")
+    format_payload = payload.get("format")
+    format_name = format_payload.get("format_name") if isinstance(format_payload, dict) else None
+    detected = {
+        part.strip().casefold()
+        for part in str(format_name or "").split(",")
+        if part.strip()
+    }
+    approved = detected & LARGE_MEDIA_FORMATS
+    if not approved:
+        label = ",".join(sorted(detected)) or "unknown"
+        raise LargeMediaPolicyError(
+            f"oversized content is not an approved video container ({label}): {path}"
+        )
+    streams = payload.get("streams")
+    if not isinstance(streams, list) or len(streams) > 1024:
+        raise LargeMediaPolicyError(f"oversized media has an invalid or excessive stream table: {path}")
+    video_streams = 0
+    attachment_streams = 0
+    for stream in streams:
+        if not isinstance(stream, dict):
+            raise LargeMediaPolicyError(f"oversized media has a malformed stream entry: {path}")
+        stream_type = str(stream.get("codec_type") or "").casefold()
+        if stream_type not in LARGE_MEDIA_STREAM_TYPES:
+            raise LargeMediaPolicyError(
+                f"oversized media has unsupported stream type {stream_type or 'unknown'}: {path}"
+            )
+        if stream_type == "video":
+            video_streams += 1
+        elif stream_type == "attachment":
+            attachment_streams += 1
+            if attachment_streams > 64:
+                raise LargeMediaPolicyError(f"oversized media contains too many attachments: {path}")
+            tags = stream.get("tags")
+            filename = tags.get("filename") if isinstance(tags, dict) else None
+            if Path(str(filename or "")).suffix.casefold() not in SAFE_ATTACHMENT_SUFFIXES:
+                raise LargeMediaPolicyError(
+                    "oversized media contains an attachment that is not a recognized font, "
+                    f"image, subtitle, or text file ({filename or 'unnamed'}): {path}"
+                )
+    if video_streams == 0:
+        raise LargeMediaPolicyError(f"oversized container has no video stream: {path}")
+    return ",".join(sorted(approved))
+
+
+def probe_large_media(
+    descriptor: int,
+    entry: FileEntry,
+    policy: LargeMediaPolicy,
+    *,
+    deadline: float | None = None,
+) -> str:
+    command = [
+        policy.ffprobe_binary,
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-show_entries",
+        "format=format_name:stream=index,codec_type,codec_name:stream_tags=filename,mimetype",
+        "-of",
+        "json",
+        f"/proc/self/fd/{descriptor}",
+    ]
+    probe_timeout = max(float(policy.probe_timeout_seconds), 1.0)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LargeMediaPolicyError(
+                f"oversized media validation timed out: {entry.path}"
+            )
+        probe_timeout = min(probe_timeout, remaining)
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=probe_timeout,
+            check=False,
+            pass_fds=(descriptor,),
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"ffprobe is unavailable: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise LargeMediaPolicyError(f"oversized media validation timed out: {entry.path}") from exc
+    if len(completed.stdout.encode("utf-8", "replace")) > MAX_FFPROBE_OUTPUT_BYTES:
+        raise LargeMediaPolicyError(
+            f"oversized media has an excessive stream description: {entry.path}"
+        )
+    if completed.returncode != 0:
+        detail = " ".join(completed.stderr.strip().split())[:500]
+        raise LargeMediaPolicyError(
+            "oversized file failed video-container validation"
+            f"{': ' + detail if detail else ''}: {entry.path}"
+        )
+    return parse_large_media_probe(completed.stdout, entry.path)
+
+
+def receive_nul_reply(sock: socket.socket) -> bytes:
+    response = bytearray()
+    while len(response) <= 1024 * 1024:
+        chunk = sock.recv(min(65536, 1024 * 1024 + 1 - len(response)))
+        if not chunk:
+            raise ConnectionError("clamd closed an INSTREAM connection without a complete reply")
+        marker = chunk.find(b"\0")
+        response.extend(chunk if marker < 0 else chunk[:marker])
+        if marker >= 0:
+            return bytes(response)
+    raise RuntimeError("clamd returned an oversized INSTREAM reply")
+
+
+def scan_instream_range(
+    socket_path: str,
+    descriptor: int,
+    entry: FileEntry,
+    offset: int,
+    length: int,
+    deadline: float,
+) -> tuple[str, str, str]:
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        raise LargeMediaPolicyError("large-media scan exceeded its total time limit")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(min(max(remaining_seconds, 1.0), 930.0))
+        client.connect(socket_path)
+        client.sendall(b"zINSTREAM\0")
+        current_offset = offset
+        remaining = length
+        while remaining:
+            if time.monotonic() >= deadline:
+                raise LargeMediaPolicyError("large-media scan exceeded its total time limit")
+            chunk = os.pread(descriptor, min(1024 * 1024, remaining), current_offset)
+            if not chunk:
+                raise FileChangedError("oversized media became shorter during scanning")
+            client.sendall(struct.pack("!I", len(chunk)))
+            client.sendall(chunk)
+            current_offset += len(chunk)
+            remaining -= len(chunk)
+        client.sendall(struct.pack("!I", 0))
+        return parse_clamd_scan_reply(receive_nul_reply(client), entry.path)
+
+
+def scan_large_media_entry(
+    socket_path: str,
+    entry: FileEntry,
+    policy: LargeMediaPolicy,
+) -> tuple[str, str, str, str]:
+    if not policy.enabled:
+        raise LargeMediaPolicyError("large-media scanning is disabled")
+    if entry.size_bytes > policy.maximum_bytes:
+        raise LargeMediaPolicyError(
+            f"file exceeds bounded large-media ceiling: {entry.size_bytes} > {policy.maximum_bytes}"
+        )
+    if policy.window_bytes > policy.native_max_bytes:
+        raise LargeMediaPolicyError("large-media window exceeds native ClamD stream limit")
+    try:
+        ranges = large_media_window_ranges(entry.size_bytes, policy.window_bytes, policy.overlap_bytes)
+    except ValueError as exc:
+        raise LargeMediaPolicyError(f"invalid large-media window policy: {exc}") from exc
+
+    descriptor = open_scannable_descriptor(entry)
+    try:
+        deadline = time.monotonic() + policy.scan_timeout_seconds
+        probe_large_media(descriptor, entry, policy, deadline=deadline)
+        ensure_file_unchanged(entry)
+        for offset, length in ranges:
+            status, scanned_path, detail = scan_instream_range(
+                socket_path,
+                descriptor,
+                entry,
+                offset,
+                length,
+                deadline,
+            )
+            ensure_file_unchanged(entry)
+            if status != "CLEAN":
+                return status, scanned_path, detail, "large_media_full_byte_windows"
+        return "CLEAN", entry.path, "", "large_media_full_byte_windows"
+    finally:
+        os.close(descriptor)
+
+
+def policy_event_id(entry: FileEntry, reason: str) -> str:
+    identity = (
+        f"{entry.device}:{entry.inode}:{entry.size_bytes}:{entry.modified_ns}:"
+        f"{entry.changed_ns}:{reason}"
+    )
+    return f"scan-policy-{hashlib.sha256(identity.encode('utf-8', 'surrogateescape')).hexdigest()}"
 
 
 class SessionScanner:
@@ -690,6 +975,8 @@ def worker_loop(
     start_ns: int,
     worker_errors: "queue.SimpleQueue[BaseException] | None" = None,
     event_dir: Path | None = None,
+    large_media_policy: LargeMediaPolicy | None = None,
+    large_media_slots: threading.Semaphore | None = None,
 ) -> None:
     scanner = SessionScanner(socket_path)
     try:
@@ -705,20 +992,37 @@ def worker_loop(
             quarantine_destination: str | None = None
             quarantine_success: bool | None = None
             quarantine_failed = False
+            scan_method = "clamd_fildes"
             scan_start_ns = time.monotonic_ns()
 
             try:
                 ensure_file_unchanged(entry)
-                for attempt in range(2):
+                if large_media_policy is not None and entry.size_bytes > large_media_policy.native_max_bytes:
+                    if large_media_slots is None:
+                        raise RuntimeError("large-media worker limiter is unavailable")
                     try:
-                        status, scanned_path, threat_name = scanner.scan_entry(entry)
-                        break
-                    except (ConnectionError, BrokenPipeError, OSError):
-                        scanner.close()
-                        if attempt == 1:
-                            raise
+                        with large_media_slots:
+                            status, scanned_path, threat_name, scan_method = scan_large_media_entry(
+                                socket_path,
+                                entry,
+                                large_media_policy,
+                            )
+                    except LargeMediaPolicyError as exc:
+                        status = "POLICY_LIMIT"
+                        scanned_path = entry.path
+                        threat_name = str(exc)
+                        scan_method = "oversized_content_held"
                 else:
-                    raise RuntimeError("scanner retry loop exhausted")
+                    for attempt in range(2):
+                        try:
+                            status, scanned_path, threat_name = scanner.scan_entry(entry)
+                            break
+                        except (ConnectionError, BrokenPipeError, OSError):
+                            scanner.close()
+                            if attempt == 1:
+                                raise
+                    else:
+                        raise RuntimeError("scanner retry loop exhausted")
 
                 if status == "INFECTED":
                     if event_dir is not None:
@@ -734,6 +1038,7 @@ def worker_loop(
                             threat_name=threat_name,
                             action_success=False,
                             scan_type=label,
+                            scan_method=scan_method,
                         )
                     try:
                         ensure_file_unchanged(entry)
@@ -772,6 +1077,7 @@ def worker_loop(
                                 threat_name=threat_name,
                                 action_success=True,
                                 scan_type=label,
+                                scan_method=scan_method,
                             )
                         else:
                             emit_event(
@@ -784,6 +1090,7 @@ def worker_loop(
                                 threat_name=threat_name,
                                 action_success=False,
                                 scan_type=label,
+                                scan_method=scan_method,
                             )
                     threat_event = {
                         "event": "threat_detected",
@@ -792,6 +1099,7 @@ def worker_loop(
                         "source": entry.path,
                         "quarantine": quarantine_destination,
                         "quarantine_success": quarantine_success,
+                        "scan_method": scan_method,
                     }
                     logger.log(json.dumps(threat_event, ensure_ascii=True, sort_keys=True))
                 elif status == "POLICY_LIMIT":
@@ -811,6 +1119,8 @@ def worker_loop(
                             action_success=False,
                             failure_kind="scan_policy_limit",
                             scan_type=label,
+                            scan_method=scan_method,
+                            event_id=policy_event_id(entry, policy_reason),
                         )
                 elif status == "VANISHED":
                     logger.log(
@@ -846,9 +1156,16 @@ def worker_loop(
                 threat_name=threat_name,
                 quarantine_path=quarantine_destination,
                 quarantine_success=quarantine_success,
+                scan_method=scan_method,
             )
 
-            processed_files, should_log = metrics.record(entry, status, duration_ms, quarantine_failed)
+            processed_files, should_log = metrics.record(
+                entry,
+                status,
+                duration_ms,
+                quarantine_failed,
+                scan_method,
+            )
 
             if should_log:
                 elapsed_ms = max(1, (time.monotonic_ns() - start_ns) // 1_000_000)
@@ -1019,6 +1336,33 @@ def main() -> int:
     if not 1 <= args.vanished_failure_minimum <= MAX_VANISHED_FILE_CAP:
         print(f"[ERROR] --vanished-failure-minimum must be between 1 and {MAX_VANISHED_FILE_CAP}", file=sys.stderr)
         return 2
+    if not 1 <= args.native_max_bytes <= 2000 * 1024 * 1024:
+        print("[ERROR] --native-max-bytes must be between 1 byte and 2000 MiB", file=sys.stderr)
+        return 2
+    if not 1 <= args.large_media_max_gib <= 1000:
+        print("[ERROR] --large-media-max-gib must be between 1 and 1000", file=sys.stderr)
+        return 2
+    if not 1 <= args.large_media_window_mib <= 2000:
+        print("[ERROR] --large-media-window-mib must be between 1 and 2000", file=sys.stderr)
+        return 2
+    if args.large_media_window_mib * 1024 * 1024 > args.native_max_bytes:
+        print("[ERROR] large-media window must not exceed the native ClamD limit", file=sys.stderr)
+        return 2
+    if not 0 <= args.large_media_overlap_kib < args.large_media_window_mib * 1024:
+        print("[ERROR] large-media overlap must be nonnegative and smaller than its window", file=sys.stderr)
+        return 2
+    if not 1 <= args.large_media_probe_timeout <= 3600:
+        print("[ERROR] --large-media-probe-timeout must be between 1 and 3600", file=sys.stderr)
+        return 2
+    if not 60 <= args.large_media_scan_timeout <= 86400:
+        print("[ERROR] --large-media-scan-timeout must be between 60 and 86400", file=sys.stderr)
+        return 2
+    if not 1 <= args.large_media_workers <= MAX_SCAN_WORKERS:
+        print(f"[ERROR] --large-media-workers must be between 1 and {MAX_SCAN_WORKERS}", file=sys.stderr)
+        return 2
+    if not os.path.isabs(args.ffprobe_binary):
+        print("[ERROR] --ffprobe-binary must be an absolute path", file=sys.stderr)
+        return 2
 
     logger = Logger(args.scanlog, args.scanlog_max_bytes, args.scanlog_rotations)
     results = ResultsWriter(args.results_file)
@@ -1065,11 +1409,36 @@ def main() -> int:
         metrics = Metrics(total_files, total_bytes, root_stats, progress_interval)
         start_ns = time.monotonic_ns()
         worker_errors: "queue.SimpleQueue[BaseException]" = queue.SimpleQueue()
+        large_media_policy = LargeMediaPolicy(
+            enabled=args.large_media_enabled == "true",
+            native_max_bytes=args.native_max_bytes,
+            maximum_bytes=args.large_media_max_gib * 1024**3,
+            window_bytes=args.large_media_window_mib * 1024**2,
+            overlap_bytes=args.large_media_overlap_kib * 1024,
+            probe_timeout_seconds=args.large_media_probe_timeout,
+            scan_timeout_seconds=args.large_media_scan_timeout,
+            ffprobe_binary=args.ffprobe_binary,
+        )
+        large_media_slots = threading.Semaphore(args.large_media_workers)
 
         threads = [
             threading.Thread(
                 target=worker_loop,
-                args=(work_queue, logger, results, metrics, args.socket_path, args.quarantine_dir, roots, args.label, start_ns, worker_errors, Path(args.event_dir)),
+                args=(
+                    work_queue,
+                    logger,
+                    results,
+                    metrics,
+                    args.socket_path,
+                    args.quarantine_dir,
+                    roots,
+                    args.label,
+                    start_ns,
+                    worker_errors,
+                    Path(args.event_dir),
+                    large_media_policy,
+                    large_media_slots,
+                ),
                 daemon=True,
             )
             for _ in range(effective_workers)
@@ -1098,6 +1467,7 @@ def main() -> int:
             f"[{args.label}] Summary: scheduled_files={metrics.total_files} indexed_files={metrics.total_files} "
             f"processed_files={metrics.processed_files} clean={clean_files} infected={metrics.infected_files} vanished={metrics.vanished_files} "
             f"errors={metrics.error_files} quarantine_failures={metrics.quarantine_failures} "
+            f"large_media_files={metrics.large_media_files} "
             f"bytes={format_bytes(metrics.total_bytes)} "
             f"elapsed={format_duration_ms(elapsed_ms)} "
             f"avg_throughput={format_files_per_second(metrics.processed_files, elapsed_ms)} "

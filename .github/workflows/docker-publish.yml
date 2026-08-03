@@ -44,6 +44,7 @@ jobs:
       - name: Smoke-test image tools
         run: |
           docker run --rm --entrypoint clamd clamav-scheduled:test --version | grep -E '^ClamAV 1\.4\.5($|/)'
+          docker run --rm --entrypoint ffprobe clamav-scheduled:test -version
           docker run --rm --entrypoint id clamav-scheduled:test -u | grep -qx 10001
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g --entrypoint python3 clamav-scheduled:test -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("/usr/local/bin/clamav_entrypoint.py", "/usr/local/bin/clamav_ui_server.py", "/usr/local/bin/clamd_session_scan.py", "/usr/local/bin/scan_list_filter.py", "/usr/local/bin/clamav_healthcheck.py")]'
 

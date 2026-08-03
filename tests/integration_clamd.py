@@ -197,6 +197,39 @@ def main() -> int:
                 if infected_result != ("INFECTED", unusual_path, reported_threat_name):
                     raise AssertionError(f"signature reload or threat retention failed: {infected_result}")
 
+                windowed_path = scan_root / "window-boundary.bin"
+                windowed_path.write_bytes(b"A" * 50 + marker + b"B" * 50)
+                windowed_entry = file_entry(str(windowed_path), str(scan_root))
+                window_results = []
+                window_descriptor = os.open(windowed_path, os.O_RDONLY)
+                try:
+                    window_deadline = time.monotonic() + 30
+                    for offset, length in scanner_module.large_media_window_ranges(
+                        windowed_entry.size_bytes,
+                        64,
+                        32,
+                    ):
+                        window_results.append(
+                            scanner_module.scan_instream_range(
+                                socket_path,
+                                window_descriptor,
+                                windowed_entry,
+                                offset,
+                                length,
+                                window_deadline,
+                            )
+                        )
+                finally:
+                    os.close(window_descriptor)
+                if window_results[0][0] != "CLEAN" or not any(
+                    result[0] == "INFECTED" and result[2] == reported_threat_name
+                    for result in window_results[1:]
+                ):
+                    raise AssertionError(
+                        "overlapping ClamD windows did not retain a boundary-spanning signature: "
+                        f"{window_results}"
+                    )
+
                 entry = file_entry(unusual_path, str(scan_root))
                 destination = scanner_module.move_to_quarantine(
                     unusual_path,
@@ -230,7 +263,8 @@ def main() -> int:
 
                 print(
                     f"integration passed: {version}; policy_limit={limit_result[2]}; "
-                    f"threat={reported_threat_name}; quarantine_mode=0600"
+                    f"threat={reported_threat_name}; overlapping_windows=detected; "
+                    "quarantine_mode=0600"
                 )
             except Exception:
                 output_handle.flush()

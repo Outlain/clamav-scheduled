@@ -7,6 +7,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Dual-mode startup: headless env-driven mode or browser-based UI mode
 - Runs `clamd` inside the container
 - Uses persistent Unix-socket sessions and passes an already-open file descriptor to `clamd` (`FILDES`)
+- Validates oversized video containers with `ffprobe` and reads every byte through bounded overlapping ClamD windows
 - Verifies device, inode, size, modification time, and change time before scanning and again before quarantine
 - Uses NUL-delimited enumeration, so filenames containing newlines, tabs, colons, or non-UTF-8 bytes remain intact
 - Time-based full-scan schedule using `FULL_SCAN_DAYS` and `FULL_SCAN_TIMES`
@@ -65,6 +66,14 @@ In UI mode, scheduler configuration environment variables are intentionally igno
 - `VANISHED_FILE_FAILURE_COUNT` - absolute vanished-file threshold; defaults to `100`
 - `VANISHED_FILE_FAILURE_PERCENT` - vanished percentage threshold; defaults to `10`
 - `VANISHED_FILE_FAILURE_MINIMUM` - minimum vanished count before applying the percentage threshold; defaults to `10`
+- `LARGE_MEDIA_ENABLED` - enables the oversized-video route; defaults to `true`
+- `LARGE_MEDIA_MAX_FILE_GIB` - hard individual-video ceiling; defaults to `100`
+- `LARGE_MEDIA_CHUNK_MIB` - independent ClamD window; defaults to `1024` and cannot exceed the native ClamD file limit
+- `LARGE_MEDIA_OVERLAP_KIB` - bytes repeated across adjacent windows; defaults to `1024`
+- `LARGE_MEDIA_PROBE_TIMEOUT_SECONDS` - ffprobe validation deadline; defaults to `120`
+- `LARGE_MEDIA_SCAN_TIMEOUT_SECONDS` - total deadline for one oversized video; defaults to `21600` (six hours)
+- `MAX_LARGE_MEDIA_WORKERS` - separate concurrency ceiling for oversized videos; defaults to `1`
+- `FFPROBE_BINARY` - image-provided validation executable; defaults to `/usr/bin/ffprobe`
 
 ### Headless scanner configuration
 
@@ -113,13 +122,25 @@ These are bootstrap settings in both modes. They are validated before any clamd 
 of being silently treated as fully scanned. Responses whose signature starts
 with `Heuristics.Limits.Exceeded`, and ClamD limit-error replies, are classified
 as `POLICY_LIMIT`: they emit `scan_failed`, remain in place, are never
-quarantined as malware, and prevent checkpoint advancement. Archive expansion
-uses the bounded `/tmp` tmpfs in the Compose example.
+quarantined as malware, and prevent checkpoint advancement.
 
-ClamAV cannot certify a file it did not fully scan. Files beyond these bounds are
-therefore not called clean or allowed by filename extension. This is intentionally
-fail-closed; an operator who chooses to accept trusted oversized media must do so
-outside the scanner's clean-verdict path.
+The `2000M` native limit is now a routing boundary. Above it, an approved video
+container must pass `ffprobe`, contain a real video stream, and contain no
+unsupported stream or attachment type. The scanner then reads every byte in
+independent `1024 MiB` ClamD streams with `1024 KiB` overlap and records
+`scan_method=large_media_full_byte_windows`. This supports ordinary 5-50 GiB
+MKV/MP4 files without claiming that separate windows are identical to one native
+whole-file parser invocation; signatures can see all raw bytes, while whole-file
+hashes and parser state cannot cross a window boundary.
+
+Oversized ZIP/RAR/7z archives, disk images, executables, audio-only files,
+unknown formats, unsafe media attachments, files above the configured ceiling,
+and validation/time/ClamD failures remain `POLICY_LIMIT`. The scheduled scanner
+does not automatically expand those archives: it continues checking other files,
+leaves the original in place, marks the run incomplete, and keeps the previous
+checkpoint. The event ID is derived from the unchanged file identity and reason,
+so the notifier does not resend the same archive warning after every retry. A
+changed file receives a new identity and a new alert.
 
 ## UI mode
 
