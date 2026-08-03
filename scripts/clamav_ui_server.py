@@ -458,7 +458,9 @@ def normalize_int(value: Any, field_name: str, minimum: int = 0, maximum: int | 
     return integer
 
 
-def validate_and_normalize_config(payload: dict[str, Any]) -> dict[str, Any]:
+def validate_and_normalize_config(
+    payload: dict[str, Any], *, preserve_updated_at: bool = False
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Configuration must be a JSON object.")
     normalized = deepcopy(DEFAULT_CONFIG)
@@ -507,6 +509,10 @@ def validate_and_normalize_config(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("quarantine_dir must not contain a scan root.")
     if any(path_within_scan_root(scanlog, scan_path) for scan_path in scan_paths):
         raise ValueError("scanlog must be outside every scan root so logging cannot mutate a file being scanned.")
+
+    updated_at = utc_now_iso()
+    if preserve_updated_at:
+        updated_at = normalize_optional_string(normalized.get("updated_at")) or updated_at
 
     result = {
         "version": 1,
@@ -590,7 +596,7 @@ def validate_and_normalize_config(payload: dict[str, Any]) -> dict[str, Any]:
         "quarantine_dir": quarantine_dir,
         "scanlog": scanlog,
         "force_full_flag": force_full_flag,
-        "updated_at": utc_now_iso(),
+        "updated_at": updated_at,
     }
 
     if result["full_scan_parallel_jobs"] > result["maxthreads"]:
@@ -918,6 +924,10 @@ def validate_manual_request_paths(
     return paths
 
 
+class ServiceUnavailableError(RuntimeError):
+    """A required runtime resource is temporarily unavailable."""
+
+
 class SchedulerManager:
     def __init__(self, config_dir: Path, state_dir: Path) -> None:
         self.config_dir = config_dir
@@ -1040,8 +1050,13 @@ class SchedulerManager:
                 raise ValueError("UI mode is not configured yet.")
             force_full_flag = serialize_config_for_scheduler(self._config)["FORCE_FULL_FLAG"]
             flag_path = Path(force_full_flag)
-            flag_path.parent.mkdir(parents=True, exist_ok=True)
-            flag_path.touch()
+            try:
+                flag_path.parent.mkdir(parents=True, exist_ok=True)
+                flag_path.touch()
+            except OSError as exc:
+                raise ServiceUnavailableError(
+                    f"STATE_DIR is not writable by the container user: {self.state_dir} ({exc})"
+                ) from exc
             self._last_event = f"Force-full flag created at {force_full_flag}."
 
     def restart_scanner(self) -> dict[str, Any]:
@@ -1074,7 +1089,12 @@ class SchedulerManager:
                 f"REQUEST_IGNORE_PATHS={':'.join(ignore_paths)}",
                 f"REQUEST_CREATED_AT={int(time.time())}",
             ]
-            write_key_value_file(self.manual_full_request_path, request_lines)
+            try:
+                write_key_value_file(self.manual_full_request_path, request_lines)
+            except OSError as exc:
+                raise ServiceUnavailableError(
+                    f"STATE_DIR is not writable by the container user: {self.state_dir} ({exc})"
+                ) from exc
 
             target_label = ":".join(target_paths) if target_paths else "all configured scan paths"
             if ignore_paths:
@@ -1128,7 +1148,12 @@ class SchedulerManager:
                 f"REQUEST_IGNORE_PATHS={':'.join(ignore_paths)}",
                 f"REQUEST_CREATED_AT={int(time.time())}",
             ]
-            write_key_value_file(self.manual_changed_request_path, request_lines)
+            try:
+                write_key_value_file(self.manual_changed_request_path, request_lines)
+            except OSError as exc:
+                raise ServiceUnavailableError(
+                    f"STATE_DIR is not writable by the container user: {self.state_dir} ({exc})"
+                ) from exc
 
             target_label = ":".join(target_paths) if target_paths else "all configured scan paths"
             ignore_suffix = ""
@@ -1155,9 +1180,10 @@ class SchedulerManager:
         raw_config: Any = None
         try:
             raw_config = read_json(self.config_path, default={}) or {}
-            self._config = validate_and_normalize_config(raw_config)
+            self._config = validate_and_normalize_config(raw_config, preserve_updated_at=True)
             self._repair_config = None
-            if self._config.get("updated_at") != raw_config.get("updated_at"):
+            if self._config != raw_config:
+                self._config["updated_at"] = utc_now_iso()
                 write_json_atomic(self.config_path, self._config)
             self._attach_log_file(Path(self._config["scanlog"]), replay=False)
             self._phase = "starting"
@@ -1264,6 +1290,14 @@ class SchedulerManager:
         if reset_backoff:
             self._restart_failures = 0
             self._next_restart_monotonic = 0.0
+
+        try:
+            validate_runtime_permissions(self._config, self.config_dir, self.state_dir)
+        except ValueError as exc:
+            self._process = None
+            self._process_exit_code = None
+            self._schedule_restart_locked(f"Scanner preflight failed: {exc}")
+            return
 
         env = build_runtime_env(self._config, self.state_dir)
         self._attach_log_file(Path(self._config["scanlog"]), replay=True)
@@ -1776,6 +1810,9 @@ class UIRequestHandler(BaseHTTPRequestHandler):
                 reason = "initial UI configuration is required"
             elif not scheduler_running:
                 reason = "scanner scheduler is not running"
+                warning = health_detail(status_payload["last_warning"])
+                if warning:
+                    reason = f"{reason}: {warning}"
             elif phase not in ready_phases:
                 reason = f"scanner scheduler phase is {phase}"
             else:
@@ -1846,6 +1883,9 @@ class UIRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/actions/force-full":
             try:
                 MANAGER.force_full_scan()
+            except ServiceUnavailableError as exc:
+                self._handle_service_unavailable(exc)
+                return
             except ValueError as exc:
                 json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -1859,6 +1899,9 @@ class UIRequestHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json_body()
                 status = MANAGER.queue_manual_full_scan(payload)
+            except ServiceUnavailableError as exc:
+                self._handle_service_unavailable(exc)
+                return
             except ValueError as exc:
                 json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -1872,6 +1915,9 @@ class UIRequestHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json_body()
                 status = MANAGER.queue_manual_changed_scan(payload)
+            except ServiceUnavailableError as exc:
+                self._handle_service_unavailable(exc)
+                return
             except ValueError as exc:
                 json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -1920,6 +1966,11 @@ class UIRequestHandler(BaseHTTPRequestHandler):
     def _handle_internal_error(self, exc: Exception) -> None:
         print(f"[ui] request handling failed: {exc!r}", file=sys.stderr, flush=True)
         json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Internal server error."})
+
+    def _handle_service_unavailable(self, exc: ServiceUnavailableError) -> None:
+        detail = health_detail(exc)
+        print(f"[ui] request unavailable: {detail}", file=sys.stderr, flush=True)
+        json_response(self, HTTPStatus.SERVICE_UNAVAILABLE, {"error": detail})
 
     def _serve_static(self, filename: str, content_type: str) -> None:
         assert MANAGER is not None

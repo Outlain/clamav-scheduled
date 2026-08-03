@@ -62,6 +62,21 @@ class UIConfigValidationTests(unittest.TestCase):
         self.assertEqual(draft["changed_scan_times"], ["07:00", "bad"])
         self.assertNotIn("unknown_field", draft)
 
+    def test_loading_normalized_config_preserves_updated_timestamp(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scan_root = Path(temp_dir) / "downloads"
+            scan_root.mkdir()
+            saved = clamav_ui_server.validate_and_normalize_config(
+                {"scan_paths": [str(scan_root)]}
+            )
+
+            loaded = clamav_ui_server.validate_and_normalize_config(
+                saved,
+                preserve_updated_at=True,
+            )
+
+            self.assertEqual(loaded, saved)
+
     def test_validate_and_normalize_config_rejects_invalid_time(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             payload = {
@@ -656,6 +671,64 @@ class UISchedulerManagerTests(unittest.TestCase):
 
             self.assertEqual(status["pending_manual_changed_request"]["reference_epoch"], 12345)
 
+    def test_manual_changed_scan_reports_unwritable_state_as_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            scan_root = temp_path / "downloads"
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            scan_root.mkdir()
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            manager._config = {
+                **clamav_ui_server.DEFAULT_CONFIG,
+                "scan_paths": [str(scan_root)],
+            }
+            manager._config_error = ""
+
+            try:
+                with mock.patch.object(
+                    clamav_ui_server,
+                    "write_key_value_file",
+                    side_effect=PermissionError(13, "Permission denied"),
+                ):
+                    with self.assertRaisesRegex(
+                        clamav_ui_server.ServiceUnavailableError,
+                        "STATE_DIR is not writable",
+                    ):
+                        manager.queue_manual_changed_scan({"mode": "since_last"})
+            finally:
+                manager.shutdown()
+
+    def test_scheduler_preflight_failure_enters_restart_wait_with_detail(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            manager._config = dict(clamav_ui_server.DEFAULT_CONFIG)
+            manager._config_error = ""
+
+            try:
+                with manager._lock:
+                    with mock.patch.object(
+                        clamav_ui_server,
+                        "validate_runtime_permissions",
+                        side_effect=ValueError("STATE_DIR is not writable: /state"),
+                    ), mock.patch.object(clamav_ui_server.subprocess, "Popen") as popen:
+                        manager._start_scheduler_locked(reset_backoff=True)
+
+                    self.assertEqual(manager._phase, "restart_wait")
+                    self.assertIn("STATE_DIR is not writable", manager._last_warning)
+                    popen.assert_not_called()
+            finally:
+                manager.shutdown()
+
     def test_progress_trace_is_saved_with_completed_scan_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -711,6 +784,7 @@ class UISchedulerManagerTests(unittest.TestCase):
             manager._config = {
                 **clamav_ui_server.DEFAULT_CONFIG,
                 "scan_paths": [temp_dir],
+                "quarantine_dir": str(temp_path / "quarantine"),
                 "scanlog": str(temp_path / "scan.log"),
             }
             fake_process = mock.Mock()

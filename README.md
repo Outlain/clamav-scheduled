@@ -246,6 +246,13 @@ find "$defs" -type d -exec chmod 0755 {} +
 find "$defs" -type f -exec chmod 0644 {} +
 ```
 
+The numeric owner must match the Compose `user` setting (`SCANNER_UID` and
+`SCANNER_GID`). For example, use owner `3000:3000` when the service runs as
+`3000:3000`. A `:rw` bind-mount suffix only permits writes at the Docker mount
+layer; it does not change normal host ownership or mode bits. If Docker creates
+a missing bind source automatically, it is commonly created as `root:root`, so
+prepare every writable source directory before the first deployment.
+
 Do not place `STATE_DIR`, `RUNTIME_DIR`, `TMP_DIR`, definitions, or `SCANLOG` inside a scan root. The scanner rejects that layout because its own writes would change files while they are being scanned. Nested directories can still have stricter permissions; a later per-file permission failure is recorded as a scan error and prevents checkpoint advancement.
 
 ## Scan schedules
