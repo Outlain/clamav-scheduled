@@ -23,7 +23,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Pauses and retries if any configured scan root becomes unavailable
 - Captures scan-root and optional marker identities before enumeration and verifies them again after all workers finish
 - Stores full/changed checkpoints together in one atomic JSON state file with legacy-file migration
-- Emits durable schema-v1 detection, quarantine, mount, definition, and scan-failure events for the central notifier
+- Emits durable schema-v1 detection, quarantine, mount, definition, scan-failure, and restart-safe recovery events for the central notifier
 - Persistent state and ClamAV definitions via bind mounts
 - Runs as fixed non-root UID/GID `10001:10001`, supports a read-only root filesystem, and drops all Linux capabilities in the Compose example
 - Waits for complete external definitions at startup and exposes strict definition-age/container health checks
@@ -99,8 +99,8 @@ These variables apply directly only in `APP_MODE=headless`. In `APP_MODE=ui`, th
 These are bootstrap settings in both modes. They are validated before any clamd configuration is written:
 
 - `CLAMD_MAX_QUEUE` - queued commands; defaults to twice `MAXTHREADS`, must be at least `MAXTHREADS`, hard maximum `128`
-- `CLAMD_MAX_SCAN_SIZE` - maximum expanded content scanned per input; defaults to `512M`, hard maximum `16G`
-- `CLAMD_MAX_FILE_SIZE` - maximum individual file size clamd processes; defaults to `256M`, cannot exceed `CLAMD_MAX_SCAN_SIZE`, hard maximum `16G`
+- `CLAMD_MAX_SCAN_SIZE` - maximum expanded content scanned per input; defaults to and is capped at `2000M`
+- `CLAMD_MAX_FILE_SIZE` - maximum individual file size clamd processes; defaults to and is capped at `2000M`, and cannot exceed `CLAMD_MAX_SCAN_SIZE`
 - `CLAMD_LOG_MAX_SIZE` - clamd diagnostic log rotation threshold; defaults to `10M`, hard maximum `1G`
 - `CLAMD_MAX_RECURSION` - archive/container nesting depth; defaults to `32`, hard maximum `100`
 - `CLAMD_MAX_FILES` - files extracted from one container/archive; defaults to `10000`, hard maximum `1000000`
@@ -109,7 +109,17 @@ These are bootstrap settings in both modes. They are validated before any clamd 
 - `CLAMD_SELF_CHECK` - seconds between definition timestamp checks; defaults to `300`
 - `CLAMD_START_TIMEOUT` - maximum database-load/readiness wait; defaults to `180` seconds
 
-`AlertExceedsMax yes` is enabled, so a limit-exceeded object is reported instead of being silently treated as fully scanned. Archive expansion uses the bounded `/tmp` tmpfs in the Compose example.
+`AlertExceedsMax yes` is enabled, so a limit-exceeded object is reported instead
+of being silently treated as fully scanned. Responses whose signature starts
+with `Heuristics.Limits.Exceeded`, and ClamD limit-error replies, are classified
+as `POLICY_LIMIT`: they emit `scan_failed`, remain in place, are never
+quarantined as malware, and prevent checkpoint advancement. Archive expansion
+uses the bounded `/tmp` tmpfs in the Compose example.
+
+ClamAV cannot certify a file it did not fully scan. Files beyond these bounds are
+therefore not called clean or allowed by filename extension. This is intentionally
+fail-closed; an operator who chooses to accept trusted oversized media must do so
+outside the scanner's clean-verdict path.
 
 ## UI mode
 

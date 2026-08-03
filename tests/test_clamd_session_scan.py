@@ -100,6 +100,26 @@ class SessionScannerTests(unittest.TestCase):
         self.assertEqual(scanned_path, "/downloads/file.exe")
         self.assertEqual(threat_name, "Win.Trojan.Agent")
 
+    def test_limit_alert_is_a_policy_failure_not_an_infection(self):
+        status, scanned_path, reason = clamd_session_scan.parse_clamd_scan_reply(
+            b"1: fd[12]: Heuristics.Limits.Exceeded.MaxFileSize FOUND",
+            "/downloads/movie.mkv",
+        )
+
+        self.assertEqual(status, "POLICY_LIMIT")
+        self.assertEqual(scanned_path, "/downloads/movie.mkv")
+        self.assertEqual(reason, "Heuristics.Limits.Exceeded.MaxFileSize")
+
+    def test_stream_limit_error_is_a_policy_failure(self):
+        status, scanned_path, reason = clamd_session_scan.parse_clamd_scan_reply(
+            b"1: fd[13]: INSTREAM size limit exceeded. ERROR",
+            "/downloads/movie.mkv",
+        )
+
+        self.assertEqual(status, "POLICY_LIMIT")
+        self.assertEqual(scanned_path, "/downloads/movie.mkv")
+        self.assertEqual(reason, "INSTREAM size limit exceeded.")
+
     def test_scan_entry_transfers_verified_descriptor(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "sample.bin"
@@ -454,6 +474,74 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(results.write.call_args.kwargs["scan_label"], "FULL")
             self.assertTrue(results.write.call_args.kwargs["quarantine_success"])
             self.assertEqual(metrics.infected_files, 1)
+
+    def test_policy_limit_fails_scan_without_quarantining(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "downloads"
+            events = Path(temp_dir) / "events"
+            source = root / "movie.mkv"
+            root.mkdir()
+            source.write_bytes(b"oversized-media-placeholder")
+            stat_result = source.stat()
+            entry = clamd_session_scan.FileEntry(
+                path=str(source),
+                size_bytes=stat_result.st_size,
+                root=str(root),
+                device=stat_result.st_dev,
+                inode=stat_result.st_ino,
+                modified_ns=stat_result.st_mtime_ns,
+                changed_ns=stat_result.st_ctime_ns,
+            )
+            work_queue = clamd_session_scan.queue.Queue()
+            work_queue.put(entry)
+            root_stats = {
+                str(root): {
+                    "files": 1,
+                    "bytes": stat_result.st_size,
+                    "processed_files": 0,
+                    "processed_bytes": 0,
+                    "infected": 0,
+                    "vanished": 0,
+                    "errors": 0,
+                }
+            }
+            metrics = clamd_session_scan.Metrics(1, stat_result.st_size, root_stats, 1)
+            fake_scanner = mock.Mock()
+            fake_scanner.scan_entry.return_value = (
+                "POLICY_LIMIT",
+                str(source),
+                "Heuristics.Limits.Exceeded.MaxFileSize",
+            )
+            results = mock.Mock()
+
+            with mock.patch.object(clamd_session_scan, "SessionScanner", return_value=fake_scanner), mock.patch.object(
+                clamd_session_scan,
+                "move_to_quarantine",
+            ) as quarantine_move:
+                clamd_session_scan.worker_loop(
+                    work_queue,
+                    mock.Mock(),
+                    results,
+                    metrics,
+                    "/tmp/clamd.sock",
+                    "/quarantine",
+                    [str(root)],
+                    "FULL",
+                    clamd_session_scan.time.monotonic_ns(),
+                    event_dir=events,
+                )
+
+            quarantine_move.assert_not_called()
+            self.assertTrue(source.exists())
+            self.assertEqual(metrics.infected_files, 0)
+            self.assertEqual(metrics.error_files, 1)
+            self.assertFalse(clamd_session_scan.scan_completed_successfully(metrics))
+            self.assertEqual(results.write.call_args.args[0], "POLICY_LIMIT")
+            self.assertEqual(results.write.call_args.kwargs["threat_name"], "")
+            event_payloads = [json.loads(path.read_text(encoding="utf-8")) for path in events.glob("*.json")]
+            self.assertEqual(len(event_payloads), 1)
+            self.assertEqual(event_payloads[0]["event_type"], "scan_failed")
+            self.assertEqual(event_payloads[0]["failure_kind"], "scan_policy_limit")
 
     def test_worker_write_failure_is_reported_to_coordinator(self):
         with tempfile.TemporaryDirectory() as temp_dir:

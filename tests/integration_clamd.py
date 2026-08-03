@@ -154,6 +154,21 @@ def main() -> int:
                 if clean_result[0] != "CLEAN":
                     raise AssertionError(f"custom threat was detected before reload: {clean_result}")
 
+                limit_path = scan_root / "policy-limit.bin"
+                with limit_path.open("wb") as limit_handle:
+                    limit_handle.truncate(33 * 1024 * 1024)
+                limit_scanner = scanner_module.SessionScanner(socket_path, timeout_seconds=30)
+                try:
+                    limit_result = limit_scanner.scan_entry(
+                        file_entry(str(limit_path), str(scan_root))
+                    )
+                finally:
+                    limit_scanner.close()
+                if limit_result[0] != "POLICY_LIMIT":
+                    raise AssertionError(
+                        f"MaxFileSize alert was not classified as a policy limit: {limit_result}"
+                    )
+
                 write_signature(definitions / "daily.ndb", threat_name, marker)
                 reload_reply = clamd_command(socket_path, b"RELOAD")
                 if "RELOADING" not in reload_reply.upper():
@@ -213,7 +228,10 @@ def main() -> int:
                 if payload["source"] != unusual_path or not payload["quarantine_success"]:
                     raise AssertionError(f"structured quarantine result is incomplete: {payload}")
 
-                print(f"integration passed: {version}; threat={reported_threat_name}; quarantine_mode=0600")
+                print(
+                    f"integration passed: {version}; policy_limit={limit_result[2]}; "
+                    f"threat={reported_threat_name}; quarantine_mode=0600"
+                )
             except Exception:
                 output_handle.flush()
                 try:

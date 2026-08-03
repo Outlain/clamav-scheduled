@@ -30,6 +30,13 @@ MAX_PROGRESS_STEPS = 10_000
 MAX_PROGRESS_INTERVAL = 1_000_000
 MAX_SCHEDULED_FILE_CAP = 5_000_000
 MAX_VANISHED_FILE_CAP = 1_000_000
+CLAMD_POLICY_LIMIT_MARKERS = (
+    "heuristics.limits.exceeded",
+    "size limit exceeded",
+    "scan limit exceeded",
+    "limits exceeded",
+    "stream size limit exceeded",
+)
 
 
 def is_missing_path_error(detail: str, path: str) -> bool:
@@ -314,7 +321,7 @@ class Metrics:
             elif status == "VANISHED":
                 self.vanished_files += 1
                 self.root_stats[entry.root]["vanished"] += 1
-            elif status == "ERROR":
+            elif status not in {"CLEAN", "VANISHED"}:
                 self.error_files += 1
                 self.root_stats[entry.root]["errors"] += 1
 
@@ -373,12 +380,17 @@ def parse_clamd_scan_reply(reply: bytes, requested_path: str) -> tuple[str, str,
     _response_identifier, detail = decoded.split(": ", 1)
     if detail == "OK":
         return "CLEAN", requested_path, ""
+    is_policy_limit = any(marker in detail.casefold() for marker in CLAMD_POLICY_LIMIT_MARKERS)
     if detail.endswith(" FOUND"):
         threat_name = detail.removesuffix(" FOUND").strip()
         if not threat_name:
             raise RuntimeError(f"Unexpected clamd infection reply without a signature: {decoded}")
+        if is_policy_limit:
+            return "POLICY_LIMIT", requested_path, threat_name
         return "INFECTED", requested_path, threat_name
     if detail.endswith("ERROR"):
+        if is_policy_limit:
+            return "POLICY_LIMIT", requested_path, detail.removesuffix("ERROR").strip()
         if is_missing_path_error(detail, requested_path):
             return "VANISHED", requested_path, ""
         return "ERROR", requested_path, ""
@@ -782,6 +794,24 @@ def worker_loop(
                         "quarantine_success": quarantine_success,
                     }
                     logger.log(json.dumps(threat_event, ensure_ascii=True, sort_keys=True))
+                elif status == "POLICY_LIMIT":
+                    policy_reason = threat_name or "ClamAV scan policy limit exceeded"
+                    threat_name = ""
+                    logger.log(
+                        f"[ERROR] [{label}] ClamAV could not fully scan the file because a policy limit was reached: "
+                        f"path={format_log_value(entry.path)} reason={format_log_value(policy_reason)}"
+                    )
+                    if event_dir is not None:
+                        emit_event(
+                            event_dir,
+                            "scan_failed",
+                            "warning",
+                            "A scheduled scan file exceeded a ClamAV policy limit",
+                            source_path=entry.path,
+                            action_success=False,
+                            failure_kind="scan_policy_limit",
+                            scan_type=label,
+                        )
                 elif status == "VANISHED":
                     logger.log(
                         f"[{label}] File vanished before scan completed: path={format_log_value(entry.path)}"

@@ -27,8 +27,8 @@ umask 077
 : "${DEFINITIONS_WAIT_TIMEOUT:=300}"
 : "${DEFINITIONS_MAX_AGE_SECONDS:=172800}"
 : "${DEFINITIONS_STALE_ACTION:=warn}"
-: "${CLAMD_MAX_SCAN_SIZE:=512M}"
-: "${CLAMD_MAX_FILE_SIZE:=256M}"
+: "${CLAMD_MAX_SCAN_SIZE:=2000M}"
+: "${CLAMD_MAX_FILE_SIZE:=2000M}"
 : "${CLAMD_LOG_MAX_SIZE:=10M}"
 : "${CLAMD_MAX_RECURSION:=32}"
 : "${CLAMD_MAX_FILES:=10000}"
@@ -401,9 +401,9 @@ CLAMD_LOG_MAX_SIZE=$(normalize_clamd_size "CLAMD_LOG_MAX_SIZE" "$CLAMD_LOG_MAX_S
 CLAMD_MAX_SCAN_SIZE_BYTES=$(clamd_size_bytes "$CLAMD_MAX_SCAN_SIZE")
 CLAMD_MAX_FILE_SIZE_BYTES=$(clamd_size_bytes "$CLAMD_MAX_FILE_SIZE")
 CLAMD_LOG_MAX_SIZE_BYTES=$(clamd_size_bytes "$CLAMD_LOG_MAX_SIZE")
-CLAMD_ABSOLUTE_SIZE_LIMIT=$((16 * 1024 * 1024 * 1024))
+CLAMD_ABSOLUTE_SIZE_LIMIT=$((2000 * 1024 * 1024))
 if [ "$CLAMD_MAX_SCAN_SIZE_BYTES" -gt "$CLAMD_ABSOLUTE_SIZE_LIMIT" ] || [ "$CLAMD_MAX_FILE_SIZE_BYTES" -gt "$CLAMD_ABSOLUTE_SIZE_LIMIT" ]; then
-  echo "[ERROR] CLAMD_MAX_SCAN_SIZE and CLAMD_MAX_FILE_SIZE must not exceed 16G." >&2
+  echo "[ERROR] CLAMD_MAX_SCAN_SIZE and CLAMD_MAX_FILE_SIZE must not exceed 2000M." >&2
   exit 1
 fi
 if [ "$CLAMD_MAX_FILE_SIZE_BYTES" -gt "$CLAMD_MAX_SCAN_SIZE_BYTES" ]; then
@@ -471,6 +471,33 @@ emit_scan_event() {
     echo "[ERROR] Could not persist a structured notification event." | tee -a "$SCANLOG"
     return 1
   fi
+}
+
+SCHEDULED_FAILURE_MARKER="$STATE_DIR/.scheduled-service-failure"
+
+mark_scheduled_failure() {
+  if mkdir -- "$SCHEDULED_FAILURE_MARKER" 2>/dev/null; then
+    return 0
+  fi
+  if [ -d "$SCHEDULED_FAILURE_MARKER" ] && [ ! -L "$SCHEDULED_FAILURE_MARKER" ]; then
+    return 0
+  fi
+  echo "[ERROR] Could not persist the scheduled-service failure marker." | tee -a "$SCANLOG"
+  return 1
+}
+
+emit_scheduled_recovery() {
+  RECOVERY_MESSAGE="$1"
+  if [ ! -d "$SCHEDULED_FAILURE_MARKER" ] || [ -L "$SCHEDULED_FAILURE_MARKER" ]; then
+    return 0
+  fi
+  if emit_scan_event --event-type service_recovered --severity info --message "$RECOVERY_MESSAGE" --action-success true; then
+    if rmdir -- "$SCHEDULED_FAILURE_MARKER"; then
+      return 0
+    fi
+    echo "[ERROR] Recovery event was written but its failure marker could not be cleared." | tee -a "$SCANLOG"
+  fi
+  return 1
 }
 
 OLD_IFS="$IFS"
@@ -571,6 +598,8 @@ done
 
 if [ ! -S "$CLAMD_SOCKET" ]; then
   echo "[ERROR] clamd socket never appeared. Last clamd output:" | tee -a "$SCANLOG"
+  mark_scheduled_failure || true
+  emit_scan_event --event-type scan_failed --severity warning --message "Scheduled scanner ClamD socket did not become ready" --action-success false || true
   tail -n 200 "$CLAMD_OUTPUT_FILE" >&2 2>/dev/null || true
   exit 1
 fi
@@ -591,6 +620,8 @@ rm -f -- "$READY_TEST_FILE"
 
 if [ $i -ge "$CLAMD_START_TIMEOUT" ]; then
   echo "[ERROR] clamd started but never accepted descriptor scans. Last clamd output:" | tee -a "$SCANLOG"
+  mark_scheduled_failure || true
+  emit_scan_event --event-type scan_failed --severity warning --message "Scheduled scanner ClamD did not accept descriptor scans" --action-success false || true
   tail -n 200 "$CLAMD_OUTPUT_FILE" >&2 2>/dev/null || true
   exit 1
 fi
@@ -601,6 +632,8 @@ ensure_clamd_alive() {
   fi
 
   echo "[ERROR] clamd exited unexpectedly; the scheduler must restart the complete scanner process group." | tee -a "$SCANLOG"
+  mark_scheduled_failure || true
+  emit_scan_event --event-type scan_failed --severity warning --message "Scheduled scanner ClamD exited unexpectedly" --action-success false || true
   tail -n 200 "$CLAMD_OUTPUT_FILE" >&2 2>/dev/null || true
   return 1
 }
@@ -1013,6 +1046,7 @@ check_scan_path_health() {
   fi
 
   emit_scan_event --event-type mount_unavailable --severity warning --message "Scheduled scan root is unavailable" --source-path "$SCAN_PATH" --action-success false || true
+  mark_scheduled_failure || true
 
   return 1
 }
@@ -1025,6 +1059,7 @@ capture_scan_root_guard() {
   fi
   echo "[WARN] [$LABEL] Could not capture scan-root identities before enumeration." | tee -a "$SCANLOG"
   emit_scan_event --event-type mount_unavailable --severity warning --message "Scheduled scan root identity could not be captured" --action-success false --scan-type "$LABEL" || true
+  mark_scheduled_failure || true
   return 1
 }
 
@@ -1036,6 +1071,7 @@ verify_scan_root_guard() {
   fi
   echo "[WARN] [$LABEL] A scan root or configured marker changed during the scan." | tee -a "$SCANLOG"
   emit_scan_event --event-type mount_unavailable --severity warning --message "Scheduled scan root or marker changed during scan" --action-success false --scan-type "$LABEL" || true
+  mark_scheduled_failure || true
   return 1
 }
 
@@ -1235,6 +1271,7 @@ run_scan_list() {
   fi
 
   echo "[WARN] ${LABEL} scan incomplete. The structured results file is ${RESULTS_FILE}." | tee -a "$SCANLOG"
+  mark_scheduled_failure || true
   emit_scan_event --event-type scan_failed --severity warning --message "Scheduled scan did not complete" --action-success false --scan-type "$LABEL" || true
   return 1
 }
@@ -1360,6 +1397,7 @@ while true; do
           fi
           if ! update_checkpoints "$FULL_SUCCESS_EPOCH" "$NEW_CHANGED_EPOCH"; then
             echo "[ERROR] Atomic checkpoint update failed after the full scan; stopping so it will be retried." | tee -a "$SCANLOG"
+            mark_scheduled_failure || true
             emit_scan_event --event-type scan_failed --severity warning --message "Scheduled full-scan checkpoint could not be persisted" --action-success false --scan-type FULL || true
             exit 1
           fi
@@ -1372,6 +1410,7 @@ while true; do
         else
           echo "[FULL] Scoped on-demand full scan completed; scheduled full and changed checkpoints were left unchanged." | tee -a "$SCANLOG"
         fi
+        emit_scheduled_recovery "Scheduled scanning recovered after a successful full scan" || true
         NEXT_FULL_RETRY_EPOCH=0
         echo "=== FULL SCAN finished ===" | tee -a "$SCANLOG"
 
@@ -1398,6 +1437,8 @@ while true; do
         fi
       fi
     else
+      mark_scheduled_failure || true
+      emit_scan_event --event-type scan_failed --severity warning --message "Scheduled full-scan file enumeration did not complete" --action-success false --scan-type FULL || true
       if [ "$RC" -eq 2 ]; then
         CYCLE_ABORT=1
         NEXT_FULL_RETRY_EPOCH=$(( $(date +%s) + PATH_UNAVAILABLE_RETRY_INTERVAL ))
@@ -1464,11 +1505,13 @@ while true; do
         else
           if ! update_checkpoints "$LAST_FULL_EPOCH" "$CHANGED_SCAN_CUTOFF"; then
             echo "[ERROR] Atomic checkpoint update failed after the changed-files scan; stopping so it will be retried." | tee -a "$SCANLOG"
+            mark_scheduled_failure || true
             emit_scan_event --event-type scan_failed --severity warning --message "Changed-file scan checkpoint could not be persisted" --action-success false --scan-type CHANGED || true
             exit 1
           fi
           LAST_CHANGED_EPOCH="$CHANGED_SCAN_CUTOFF"
         fi
+        emit_scheduled_recovery "Scheduled scanning recovered after a successful changed-file scan" || true
       else
         NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
         if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
@@ -1478,6 +1521,8 @@ while true; do
         fi
       fi
     else
+      mark_scheduled_failure || true
+      emit_scan_event --event-type scan_failed --severity warning --message "Scheduled changed-file enumeration did not complete" --action-success false --scan-type CHANGED || true
       if [ "$RC" -eq 2 ]; then
         CYCLE_ABORT=1
         NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + PATH_UNAVAILABLE_RETRY_INTERVAL ))
