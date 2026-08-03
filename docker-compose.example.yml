@@ -11,8 +11,9 @@ services:
     mem_limit: 6g
     pids_limit: 256
     ports:
-      # The UI has no authentication; expose it only on the Docker host by default.
-      - "127.0.0.1:${UI_HOST_PORT:-8080}:8080"
+      # These are Docker-host settings; the UI continues listening on container
+      # port 8080. Keep the loopback default because the UI has no authentication.
+      - "${UI_PUBLISH_IP:-127.0.0.1}:${UI_HOST_PORT:-8080}:8080"
     environment:
       APP_MODE: ${APP_MODE:-ui}
       UI_BIND: 0.0.0.0

@@ -119,7 +119,22 @@ def check_ui(port: int, timeout_seconds: float = 5.0) -> dict[str, object]:
                 raise RuntimeError("UI health endpoint did not report a ready application")
             return payload
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"UI health endpoint returned HTTP {exc.code}") from exc
+        body = exc.read(65537)
+        detail = ""
+        if len(body) <= 65536:
+            try:
+                payload = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                reason = payload.get("reason")
+                phase = payload.get("phase")
+                if isinstance(reason, str) and reason:
+                    detail = reason
+                elif isinstance(phase, str) and phase:
+                    detail = f"phase={phase}"
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"UI health endpoint returned HTTP {exc.code}{suffix}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"UI health endpoint is unavailable: {exc.reason}") from exc
 

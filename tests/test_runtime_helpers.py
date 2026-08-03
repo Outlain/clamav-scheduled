@@ -119,6 +119,22 @@ class UIHealthTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not report a ready application"):
                 clamav_healthcheck.check_ui(8080)
 
+    def test_ui_health_reports_reason_from_error_response(self):
+        error = clamav_healthcheck.urllib.error.HTTPError(
+            "http://127.0.0.1:8080/healthz",
+            503,
+            "Service Unavailable",
+            {},
+            None,
+        )
+        error.read = mock.Mock(
+            return_value=b'{"ok":false,"reason":"scanner scheduler is not running","phase":"restart_wait"}'
+        )
+
+        with mock.patch.object(clamav_healthcheck.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "scanner scheduler is not running"):
+                clamav_healthcheck.check_ui(8080)
+
 
 class ScanRootGuardTests(unittest.TestCase):
     def test_marker_traversal_is_rejected(self) -> None:

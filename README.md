@@ -144,7 +144,26 @@ changed file receives a new identity and a new alert.
 
 ## UI mode
 
-In UI mode the container exposes a browser UI on port `8080` by default.
+In UI mode the application listens on container port `8080`. Docker publishes
+that private listener using two Compose-time variables:
+
+- `UI_PUBLISH_IP` defaults to `127.0.0.1` and selects the Docker-host address.
+- `UI_HOST_PORT` defaults to `8080` and selects the Docker-host port.
+
+These are Compose interpolation settings, not saved scanner settings and not
+container environment variables. Define them in `.env` or in Portainer's stack
+environment before deploying. `UI_BIND=0.0.0.0` and `UI_PORT=8080` should
+normally remain unchanged inside the container. For example, a Docker host whose
+trusted-LAN address is `192.0.2.10` can publish an otherwise unused host port:
+
+```dotenv
+UI_PUBLISH_IP=192.0.2.10
+UI_HOST_PORT=8094
+```
+
+The UI is then reached at `http://192.0.2.10:8094`. It has no application-level
+authentication, so do not publish it on an untrusted interface; retaining the
+loopback default and using an authenticated reverse proxy or SSH tunnel is safer.
 
 On first run:
 
@@ -290,7 +309,9 @@ If an entry points to a directory, everything under that directory is skipped. I
 See `docker-compose.example.yml`. It preserves `/mnt/media:/downloads:rw` while
 moving definitions, logs, events, state, and quarantine to dedicated paths below
 `/opt/docker/clamav-shared`, outside the media tree. The UI binds only to
-`127.0.0.1` by default because it has no authentication.
+`127.0.0.1` by default because it has no authentication. Change the Docker-host
+publish address with `UI_PUBLISH_IP` rather than changing the application's
+internal `UI_BIND` setting.
 
 ## Image and update policy
 

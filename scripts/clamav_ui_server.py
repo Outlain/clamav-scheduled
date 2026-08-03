@@ -1700,6 +1700,8 @@ class UIRequestHandler(BaseHTTPRequestHandler):
         self.connection.settimeout(request_timeout)
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        if urlparse(self.path).path == "/healthz":
+            return
         print(f"[ui] {self.address_string()} - {fmt % args}", flush=True)
 
     def do_GET(self) -> None:
@@ -1710,21 +1712,34 @@ class UIRequestHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             status_payload = MANAGER.get_status()
             ready_phases = {"idle", "scanning", "cycle_complete", "waiting_lock"}
-            healthy = not status_payload["config_error"] and (
-                not status_payload["configured"]
-                or (
-                    status_payload["scheduler_running"]
-                    and status_payload["phase"] in ready_phases
-                )
+            configured = bool(status_payload["configured"])
+            scheduler_running = bool(status_payload["scheduler_running"])
+            phase = str(status_payload["phase"])
+            config_error = bool(status_payload["config_error"])
+            healthy = not config_error and (
+                not configured or (scheduler_running and phase in ready_phases)
             )
+            if config_error:
+                reason = "saved UI configuration is invalid"
+            elif not configured:
+                reason = "initial UI configuration is required"
+            elif not scheduler_running:
+                reason = "scanner scheduler is not running"
+            elif phase not in ready_phases:
+                reason = f"scanner scheduler phase is {phase}"
+            else:
+                reason = "ready"
             json_response(
                 self,
                 HTTPStatus.OK if healthy else HTTPStatus.SERVICE_UNAVAILABLE,
                 {
                     "ok": healthy,
-                    "configured": status_payload["configured"],
-                    "scheduler_running": status_payload["scheduler_running"],
-                    "phase": status_payload["phase"],
+                    "reason": reason,
+                    "configured": configured,
+                    "scheduler_running": scheduler_running,
+                    "scheduler_exit_code": status_payload["scheduler_exit_code"],
+                    "restart_in_seconds": status_payload["restart_in_seconds"],
+                    "phase": phase,
                 },
             )
             return
