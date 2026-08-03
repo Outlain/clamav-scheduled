@@ -19,8 +19,11 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Separate full-scan and changed-scan concurrency controls
 - Richer scan metrics including bytes, infected/error counts, per-root summaries, and slowest files
 - Live progress logs show both running-average and since-last-update throughput/data rates
-- Treats files that vanish after list-building as non-fatal and reports them separately
+- Reports isolated files that vanish after list-building and fails the run when the configured count/percentage is suspicious
 - Pauses and retries if any configured scan root becomes unavailable
+- Captures scan-root and optional marker identities before enumeration and verifies them again after all workers finish
+- Stores full/changed checkpoints together in one atomic JSON state file with legacy-file migration
+- Emits durable schema-v1 detection, quarantine, mount, definition, and scan-failure events for the central notifier
 - Persistent state and ClamAV definitions via bind mounts
 - Runs as fixed non-root UID/GID `10001:10001`, supports a read-only root filesystem, and drops all Linux capabilities in the Compose example
 - Waits for complete external definitions at startup and exposes strict definition-age/container health checks
@@ -47,6 +50,7 @@ In UI mode, scheduler configuration environment variables are intentionally igno
 - `UI_PORT` - UI port in UI mode; defaults to `8080`
 - `CONFIG_DIR` - persistent UI configuration directory in UI mode; defaults to `/config`
 - `STATE_DIR` - persistent runtime state directory; defaults to `/state`
+- `EVENT_DIR` - durable event spool for `clamav-notifier`; defaults to `/events`
 - `RUNTIME_DIR` - private ephemeral clamd configuration/socket directory; defaults to `/tmp/clamav-runtime`
 - `UI_MAX_REQUEST_THREADS` - maximum simultaneous UI request threads; defaults to `32`, hard maximum `128`
 - `UI_REQUEST_QUEUE_SIZE` - listener backlog; defaults to `64`, hard maximum `256`
@@ -58,6 +62,9 @@ In UI mode, scheduler configuration environment variables are intentionally igno
 - `MAX_SCHEDULED_FILES` - maximum unique paths indexed in one run; defaults to `1000000`, hard maximum `5000000`
 - `SCANLOG_MAX_BYTES` - rotates the main scan log during scans; defaults to `104857600` (100 MiB), hard maximum 1 GiB
 - `SCANLOG_ROTATIONS` - retained rotated scan logs; defaults to `5`, hard maximum `20`
+- `VANISHED_FILE_FAILURE_COUNT` - absolute vanished-file threshold; defaults to `100`
+- `VANISHED_FILE_FAILURE_PERCENT` - vanished percentage threshold; defaults to `10`
+- `VANISHED_FILE_FAILURE_MINIMUM` - minimum vanished count before applying the percentage threshold; defaults to `10`
 
 ### Headless scanner configuration
 
@@ -133,10 +140,13 @@ Recommended UI-mode mounts:
 
 ```yaml
 volumes:
-  - ./config:/config:rw
-  - ./state:/state:rw
-  - ./logs:/var/log/clamav:rw
-  - ./defs:/var/lib/clamav:ro
+  - /mnt/media:/downloads:rw
+  - /opt/docker/clamav-scheduled/config:/config:rw
+  - /opt/docker/clamav-shared/state/clamav-scheduled:/state:rw
+  - /opt/docker/clamav-shared/events/clamav-scheduled:/events:rw
+  - /opt/docker/clamav-shared/logs/clamav-scheduled:/var/log/clamav:rw
+  - /opt/docker/clamav-shared/quarantine/clamav-scheduled:/quarantine:rw
+  - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
 ```
 
 ### ClamAV definitions updater and volume permissions
@@ -166,17 +176,24 @@ The image runs as UID/GID `10001:10001`. At startup it performs an actual create
 | quarantine | read/write/search | creates no-overwrite mode-`0600` quarantine files |
 | `/config` (UI mode) | read/write | atomic UI config and history replacement |
 | `/state` | read/write | locks, checkpoints, and manual requests |
+| `/events` | read/write | atomic structured events for the central notifier |
 | log directory | read/write | append-only operational log |
 | definitions | read-only | the external updater is the only writer |
-| `/tmp` and `/run` | tmpfs | clamd socket/config/temp extraction; root filesystem remains read-only |
+| `/tmp` | tmpfs | private clamd socket/config and temporary extraction; root filesystem remains read-only |
 
 Prepare bind mounts before starting the container:
 
 ```sh
-install -d -m 0750 -o 10001 -g 10001 downloads config state logs
-install -d -m 0755 defs
-find defs -type d -exec chmod 0755 {} +
-find defs -type f -exec chmod 0644 {} +
+install -d -m 0750 -o 10001 -g 10001 \
+  /opt/docker/clamav-scheduled/config \
+  /opt/docker/clamav-shared/state/clamav-scheduled \
+  /opt/docker/clamav-shared/events/clamav-scheduled \
+  /opt/docker/clamav-shared/logs/clamav-scheduled \
+  /opt/docker/clamav-shared/quarantine/clamav-scheduled \
+  /opt/docker/clamav-shared/defs
+defs=/opt/docker/clamav-shared/defs
+find "$defs" -type d -exec chmod 0755 {} +
+find "$defs" -type f -exec chmod 0644 {} +
 ```
 
 Do not place `STATE_DIR`, `RUNTIME_DIR`, `TMP_DIR`, definitions, or `SCANLOG` inside a scan root. The scanner rejects that layout because its own writes would change files while they are being scanned. Nested directories can still have stricter permissions; a later per-file permission failure is recorded as a scan error and prevents checkpoint advancement.
@@ -202,9 +219,9 @@ UI-queued full scans only advance the normal scheduled full/changed checkpoints 
 
 Changed-file scans treat either a newer content-modified time or a newer metadata-change time as "changed," which helps catch files copied in with preserved old modification times.
 
-If a file disappears after it was added to the scan list but before `clamd` can scan it, the run records that file as `vanished` instead of failing the entire scan. Real scan errors, quarantine failures, incomplete worker processing, and structured-result write failures fail the run and keep the previous checkpoints in place.
+If a file disappears after it was added to the scan list but before `clamd` can scan it, the run records it as `vanished`. Isolated normal churn is tolerated, but a count or percentage above the configured thresholds fails the run. Real scan errors, quarantine failures, incomplete enumeration/worker processing, a missing or replaced mount/marker, a dead ClamD, and structured-result or event-write failures keep the previous atomic checkpoints in place.
 
-Detected threat signatures are retained. Each detection is written to the main scan log as a JSON object with the scan type, ClamAV signature, source, quarantine destination, and quarantine result. Per-file temporary results use JSON Lines so paths and threat names cannot corrupt a delimiter-based record.
+Detected threat signatures are retained. Each detection is durably spooled before filesystem action, then a quarantine-success or quarantine-failure event is emitted. The same details remain in the structured scan log for the UI and operators; the notifier does not tail that human log. Per-file temporary results use JSON Lines so paths and threat names cannot corrupt a delimiter-based record.
 
 Deprecated environment variables such as `DOWNLOADS_DIR`, `PARALLEL_JOBS`, `CHUNK_SIZE`, `SCAN_INTERVAL`, `CHANGED_SCAN_INTERVAL`, and `FULL_SCAN_INTERVAL` are no longer accepted.
 
@@ -239,7 +256,10 @@ If an entry points to a directory, everything under that directory is skipped. I
 
 ## Docker Compose
 
-See `docker-compose.example.yml`.
+See `docker-compose.example.yml`. It preserves `/mnt/media:/downloads:rw` while
+moving definitions, logs, events, state, and quarantine to dedicated paths below
+`/opt/docker/clamav-shared`, outside the media tree. The UI binds only to
+`127.0.0.1` by default because it has no authentication.
 
 ## Image and update policy
 
@@ -280,7 +300,7 @@ Use the following operational sequence for an engine/base migration:
 Create the configured flag file, for example:
 
 ```sh
- touch ./downloads/.clamav_force_full_scan.flag
+touch /opt/docker/clamav-shared/state/clamav-scheduled/force_full_scan.flag
 ```
 
 The flag is consumed and deleted after a successful forced full scan.

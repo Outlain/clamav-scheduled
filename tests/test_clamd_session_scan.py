@@ -238,6 +238,14 @@ class RuntimeLimitTests(unittest.TestCase):
 
         self.assertFalse(clamd_session_scan.scan_completed_successfully(metrics))
 
+    def test_suspicious_vanished_portion_prevents_successful_checkpoint(self):
+        self.assertTrue(
+            clamd_session_scan.vanished_count_is_suspicious(100, 11, 100, 10, 10)
+        )
+        self.assertFalse(
+            clamd_session_scan.vanished_count_is_suspicious(100, 9, 100, 10, 10)
+        )
+
 
 class QuarantineTests(unittest.TestCase):
     def test_move_is_no_overwrite_and_preserves_relative_path(self):

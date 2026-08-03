@@ -143,6 +143,10 @@ BOOTSTRAP_ENV_KEYS = {
     "SCANLOG_MAX_BYTES",
     "SCANLOG_ROTATIONS",
     "CLAMD_LOG_MAX_SIZE",
+    "EVENT_DIR",
+    "VANISHED_FILE_FAILURE_COUNT",
+    "VANISHED_FILE_FAILURE_PERCENT",
+    "VANISHED_FILE_FAILURE_MINIMUM",
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -167,9 +171,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "path_enumeration_timeout": 300,
     "path_unavailable_retry_interval": 300,
     "scan_path_marker": "",
-    "quarantine_dir": "/downloads/quarantine",
+    "quarantine_dir": "/quarantine",
     "scanlog": "/var/log/clamav/clamav_scheduled.log",
-    "force_full_flag": "",
+    "force_full_flag": "/state/force_full_scan.flag",
 }
 
 
@@ -444,7 +448,7 @@ def validate_and_normalize_config(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     quarantine_dir = canonicalize_path_entry(
-        normalize_optional_string(payload.get("quarantine_dir")) or f"{scan_paths[0]}/quarantine",
+        normalize_optional_string(normalized.get("quarantine_dir")) or str(DEFAULT_CONFIG["quarantine_dir"]),
         "quarantine_dir",
         require_existing=False,
     )
@@ -563,8 +567,7 @@ def validate_and_normalize_config(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def serialize_config_for_scheduler(config: dict[str, Any]) -> dict[str, str]:
-    first_scan_path = config["scan_paths"][0]
-    force_full_flag = config.get("force_full_flag") or f"{first_scan_path}/.clamav_force_full_scan.flag"
+    force_full_flag = config.get("force_full_flag") or str(DEFAULT_CONFIG["force_full_flag"])
 
     return {
         "TZ": config["tz"],
@@ -827,6 +830,21 @@ def read_epoch_file(path: Path) -> int:
         return 0
 
 
+def read_scan_checkpoint(state_dir: Path, field: str) -> int:
+    if field not in {"full", "changed"}:
+        raise ValueError("checkpoint field must be full or changed")
+    checkpoint_path = state_dir / "scan-checkpoints.json"
+    if checkpoint_path.exists():
+        value = read_json(checkpoint_path)
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise ValueError("Saved scan checkpoint state is invalid.")
+        epoch = int(value.get(f"last_{field}_scan_epoch", 0))
+        if epoch < 0:
+            raise ValueError("Saved scan checkpoint must not be negative.")
+        return epoch
+    return read_epoch_file(state_dir / f"last_{field}_scan_epoch")
+
+
 def write_key_value_file(path: Path, lines: list[str]) -> None:
     for line in lines:
         if "\n" in line or "\r" in line or "\0" in line:
@@ -1045,7 +1063,7 @@ class SchedulerManager:
 
             lookback_seconds = 0
             if mode == "since_last":
-                reference_epoch = read_epoch_file(self.state_dir / "last_changed_scan_epoch")
+                reference_epoch = read_scan_checkpoint(self.state_dir, "changed")
             else:
                 lookback_seconds = normalize_int(
                     payload.get("lookback_seconds"),
@@ -1138,7 +1156,7 @@ class SchedulerManager:
         if self._config is not None:
             payload["effective_force_full_flag"] = serialize_config_for_scheduler(self._config)["FORCE_FULL_FLAG"]
         else:
-            payload["effective_force_full_flag"] = f"{DEFAULT_CONFIG['scan_paths'][0]}/.clamav_force_full_scan.flag"
+            payload["effective_force_full_flag"] = DEFAULT_CONFIG["force_full_flag"]
         return payload
 
     def _read_manual_request_locked(self, request_path: Path | None = None) -> dict[str, Any] | None:

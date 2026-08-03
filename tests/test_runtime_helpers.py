@@ -20,6 +20,9 @@ def load_script_module(name: str):
 
 scan_list_filter = load_script_module("scan_list_filter")
 clamav_healthcheck = load_script_module("clamav_healthcheck")
+scan_root_guard = load_script_module("scan_root_guard")
+checkpoint_state = load_script_module("checkpoint_state")
+event_writer = load_script_module("event_writer")
 
 
 class ScanListFilterTests(unittest.TestCase):
@@ -115,6 +118,58 @@ class UIHealthTests(unittest.TestCase):
         with mock.patch.object(clamav_healthcheck.urllib.request, "urlopen", return_value=response):
             with self.assertRaisesRegex(RuntimeError, "did not report a ready application"):
                 clamav_healthcheck.check_ui(8080)
+
+
+class ScanRootGuardTests(unittest.TestCase):
+    def test_marker_traversal_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            root.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "relative path"):
+                scan_root_guard.capture([root], "../outside")
+
+    def test_marker_removal_fails_post_scan_verification(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "downloads"
+            root.mkdir()
+            marker = root / ".mounted"
+            marker.write_text("ok", encoding="ascii")
+            captured = scan_root_guard.capture([root], ".mounted")
+            scan_root_guard.verify(captured)
+            marker.unlink()
+            with self.assertRaises(OSError):
+                scan_root_guard.verify(captured)
+
+
+class CheckpointStateTests(unittest.TestCase):
+    def test_legacy_epochs_migrate_on_first_atomic_update(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            (state_dir / "last_full_scan_epoch").write_text("10\n", encoding="ascii")
+            (state_dir / "last_changed_scan_epoch").write_text("20\n", encoding="ascii")
+            self.assertEqual(
+                checkpoint_state.load_checkpoints(state_dir)["last_changed_scan_epoch"], 20
+            )
+            checkpoint_state.update_checkpoints(state_dir, 30, 40)
+            self.assertEqual(
+                checkpoint_state.load_checkpoints(state_dir),
+                {"last_full_scan_epoch": 30, "last_changed_scan_epoch": 40},
+            )
+
+
+class EventWriterTests(unittest.TestCase):
+    def test_writes_schema_v1_event_atomically(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = event_writer.emit_event(
+                Path(temp_dir),
+                "scan_failed",
+                "warning",
+                "failure",
+                source_path="/downloads/file.bin",
+            )
+            payload = __import__("json").loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["service"], "clamav-scheduled")
 
 
 if __name__ == "__main__":

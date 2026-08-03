@@ -19,6 +19,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from event_writer import emit_event
+
 
 SESSION_PREFIX_RE = re.compile(r"^\d+:\s+")
 QUARANTINE_MOVE_LOCK = threading.Lock()
@@ -26,6 +29,7 @@ MAX_SCAN_WORKERS = 64
 MAX_PROGRESS_STEPS = 10_000
 MAX_PROGRESS_INTERVAL = 1_000_000
 MAX_SCHEDULED_FILE_CAP = 5_000_000
+MAX_VANISHED_FILE_CAP = 1_000_000
 
 
 def is_missing_path_error(detail: str, path: str) -> bool:
@@ -53,6 +57,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label", required=True)
     parser.add_argument("--scanlog", required=True)
     parser.add_argument("--scan-paths", required=True)
+    parser.add_argument("--event-dir", required=True)
+    parser.add_argument("--vanished-failure-count", required=True, type=int)
+    parser.add_argument("--vanished-failure-percent", required=True, type=int)
+    parser.add_argument("--vanished-failure-minimum", required=True, type=int)
     return parser.parse_args()
 
 
@@ -669,6 +677,7 @@ def worker_loop(
     label: str,
     start_ns: int,
     worker_errors: "queue.SimpleQueue[BaseException] | None" = None,
+    event_dir: Path | None = None,
 ) -> None:
     scanner = SessionScanner(socket_path)
     try:
@@ -700,6 +709,20 @@ def worker_loop(
                     raise RuntimeError("scanner retry loop exhausted")
 
                 if status == "INFECTED":
+                    if event_dir is not None:
+                        # Make the detection durable before moving the source. If
+                        # event storage fails, the scan fails closed with the file
+                        # still at its scanned path.
+                        emit_event(
+                            event_dir,
+                            "threat_detected",
+                            "critical",
+                            "Malware detected by scheduled scan",
+                            source_path=entry.path,
+                            threat_name=threat_name,
+                            action_success=False,
+                            scan_type=label,
+                        )
                     try:
                         ensure_file_unchanged(entry)
                         quarantine_destination = move_to_quarantine(
@@ -725,6 +748,31 @@ def worker_loop(
                             f"path={format_log_value(entry.path)} error={format_log_value(exc)}"
                         )
 
+                    if event_dir is not None:
+                        if quarantine_success:
+                            emit_event(
+                                event_dir,
+                                "infected_content_quarantined",
+                                "critical",
+                                "Infected scheduled-scan file was quarantined",
+                                source_path=entry.path,
+                                destination_path=quarantine_destination,
+                                threat_name=threat_name,
+                                action_success=True,
+                                scan_type=label,
+                            )
+                        else:
+                            emit_event(
+                                event_dir,
+                                "quarantine_failed",
+                                "critical",
+                                "An infected file could not be quarantined",
+                                source_path=entry.path,
+                                destination_path=quarantine_destination,
+                                threat_name=threat_name,
+                                action_success=False,
+                                scan_type=label,
+                            )
                     threat_event = {
                         "event": "threat_detected",
                         "scan": label,
@@ -747,6 +795,16 @@ def worker_loop(
                     f"error={format_log_value(exc)}"
                 )
                 status = "ERROR"
+                if event_dir is not None:
+                    emit_event(
+                        event_dir,
+                        "scan_failed",
+                        "warning",
+                        "A scheduled scan file failed",
+                        source_path=entry.path,
+                        action_success=False,
+                        scan_type=label,
+                    )
 
             duration_ms = max(0, (time.monotonic_ns() - scan_start_ns) // 1_000_000)
             results.write(
@@ -872,11 +930,40 @@ def build_entries(
     return entries, root_stats, total_bytes
 
 
-def scan_completed_successfully(metrics: Metrics) -> bool:
+def vanished_count_is_suspicious(
+    total_files: int,
+    vanished_files: int,
+    failure_count: int,
+    failure_percent: int,
+    minimum_for_percent: int,
+) -> bool:
+    if vanished_files <= 0:
+        return False
+    count_exceeded = vanished_files > failure_count
+    percent_exceeded = (
+        vanished_files >= minimum_for_percent
+        and vanished_files * 100 > max(total_files, 1) * failure_percent
+    )
+    return count_exceeded or percent_exceeded
+
+
+def scan_completed_successfully(
+    metrics: Metrics,
+    vanished_failure_count: int = 100,
+    vanished_failure_percent: int = 10,
+    vanished_failure_minimum: int = 10,
+) -> bool:
     return (
         metrics.processed_files == metrics.total_files
         and metrics.error_files == 0
         and metrics.quarantine_failures == 0
+        and not vanished_count_is_suspicious(
+            metrics.total_files,
+            metrics.vanished_files,
+            vanished_failure_count,
+            vanished_failure_percent,
+            vanished_failure_minimum,
+        )
     )
 
 
@@ -892,6 +979,15 @@ def main() -> int:
         return 2
     if not 1 <= args.scanlog_rotations <= 20:
         print("[ERROR] --scanlog-rotations must be between 1 and 20", file=sys.stderr)
+        return 2
+    if not 0 <= args.vanished_failure_count <= MAX_VANISHED_FILE_CAP:
+        print(f"[ERROR] --vanished-failure-count must be between 0 and {MAX_VANISHED_FILE_CAP}", file=sys.stderr)
+        return 2
+    if not 0 <= args.vanished_failure_percent <= 100:
+        print("[ERROR] --vanished-failure-percent must be between 0 and 100", file=sys.stderr)
+        return 2
+    if not 1 <= args.vanished_failure_minimum <= MAX_VANISHED_FILE_CAP:
+        print(f"[ERROR] --vanished-failure-minimum must be between 1 and {MAX_VANISHED_FILE_CAP}", file=sys.stderr)
         return 2
 
     logger = Logger(args.scanlog, args.scanlog_max_bytes, args.scanlog_rotations)
@@ -943,7 +1039,7 @@ def main() -> int:
         threads = [
             threading.Thread(
                 target=worker_loop,
-                args=(work_queue, logger, results, metrics, args.socket_path, args.quarantine_dir, roots, args.label, start_ns, worker_errors),
+                args=(work_queue, logger, results, metrics, args.socket_path, args.quarantine_dir, roots, args.label, start_ns, worker_errors, Path(args.event_dir)),
                 daemon=True,
             )
             for _ in range(effective_workers)
@@ -994,7 +1090,32 @@ def main() -> int:
                 f"status={status} size={format_bytes(size_bytes)} path={format_log_value(path)}"
             )
 
-        return 0 if scan_completed_successfully(metrics) else 1
+        completed = scan_completed_successfully(
+            metrics,
+            args.vanished_failure_count,
+            args.vanished_failure_percent,
+            args.vanished_failure_minimum,
+        )
+        if not completed and vanished_count_is_suspicious(
+            metrics.total_files,
+            metrics.vanished_files,
+            args.vanished_failure_count,
+            args.vanished_failure_percent,
+            args.vanished_failure_minimum,
+        ):
+            logger.log(
+                f"[ERROR] [{args.label}] Suspicious vanished-file volume prevents checkpoint advancement: "
+                f"vanished={metrics.vanished_files} total={metrics.total_files}"
+            )
+            emit_event(
+                Path(args.event_dir),
+                "mount_unavailable",
+                "warning",
+                "A suspicious portion of scheduled scan files vanished",
+                action_success=False,
+                scan_type=args.label,
+            )
+        return 0 if completed else 1
     finally:
         results.close()
         logger.close()

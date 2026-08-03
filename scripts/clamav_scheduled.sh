@@ -44,6 +44,10 @@ umask 077
 : "${PATH_ENUMERATION_TIMEOUT:=300}"
 : "${PATH_UNAVAILABLE_RETRY_INTERVAL:=300}"
 : "${SCAN_PATH_MARKER:=}"
+: "${EVENT_DIR:=/events}"
+: "${VANISHED_FILE_FAILURE_COUNT:=100}"
+: "${VANISHED_FILE_FAILURE_PERCENT:=10}"
+: "${VANISHED_FILE_FAILURE_MINIMUM:=10}"
 
 reject_deprecated_env() {
   VAR_NAME="$1"
@@ -259,8 +263,8 @@ PRIMARY_SCAN_PATH=$(get_primary_scan_path "$SCAN_PATHS")
   exit 1
 }
 
-: "${QUARANTINE_DIR:=${PRIMARY_SCAN_PATH}/quarantine}"
-: "${FORCE_FULL_FLAG:=${PRIMARY_SCAN_PATH}/.clamav_force_full_scan.flag}"
+: "${QUARANTINE_DIR:=/quarantine}"
+: "${FORCE_FULL_FLAG:=${STATE_DIR}/force_full_scan.flag}"
 
 reject_control_characters "TZ" "$TZ"
 reject_control_characters "SCAN_PATH_MARKER" "$SCAN_PATH_MARKER"
@@ -280,6 +284,7 @@ DEFINITIONS_DIR=$(normalize_absolute_path "DEFINITIONS_DIR" "$DEFINITIONS_DIR")
 QUARANTINE_DIR=$(normalize_absolute_path "QUARANTINE_DIR" "$QUARANTINE_DIR")
 FORCE_FULL_FLAG=$(normalize_absolute_path "FORCE_FULL_FLAG" "$FORCE_FULL_FLAG")
 SCANLOG=$(normalize_absolute_path "SCANLOG" "$SCANLOG")
+EVENT_DIR=$(normalize_absolute_path "EVENT_DIR" "$EVENT_DIR")
 CLAMD_SOCKET="$RUNTIME_DIR/clamd.sock"
 CLAMD_CONFIG="$RUNTIME_DIR/clamd.conf"
 CLAMD_PID_FILE="$RUNTIME_DIR/clamd.pid"
@@ -379,6 +384,9 @@ validate_bounded_int "CLAMD_START_TIMEOUT" "$CLAMD_START_TIMEOUT" 30 900
 validate_bounded_int "MAX_SCHEDULED_FILES" "$MAX_SCHEDULED_FILES" 1 5000000
 validate_bounded_int "SCANLOG_MAX_BYTES" "$SCANLOG_MAX_BYTES" 1048576 1073741824
 validate_bounded_int "SCANLOG_ROTATIONS" "$SCANLOG_ROTATIONS" 1 20
+validate_bounded_int "VANISHED_FILE_FAILURE_COUNT" "$VANISHED_FILE_FAILURE_COUNT" 0 1000000
+validate_bounded_int "VANISHED_FILE_FAILURE_PERCENT" "$VANISHED_FILE_FAILURE_PERCENT" 0 100
+validate_bounded_int "VANISHED_FILE_FAILURE_MINIMUM" "$VANISHED_FILE_FAILURE_MINIMUM" 1 1000000
 
 if [ "$FULL_SCAN_PARALLEL_JOBS" -gt "$MAXTHREADS" ] || [ "$CHANGED_SCAN_PARALLEL_JOBS" -gt "$MAXTHREADS" ]; then
   echo "[ERROR] Scan parallel jobs must not exceed MAXTHREADS=${MAXTHREADS}." >&2
@@ -445,7 +453,7 @@ ensure_writable_directory() {
 }
 
 SCANLOG_DIR=$(dirname -- "$SCANLOG")
-for REQUIRED_DIRECTORY in "$QUARANTINE_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$SCANLOG_DIR"; do
+for REQUIRED_DIRECTORY in "$QUARANTINE_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$SCANLOG_DIR" "$EVENT_DIR"; do
   if ! mkdir -p -- "$REQUIRED_DIRECTORY"; then
     echo "[ERROR] Could not create required writable directory: ${REQUIRED_DIRECTORY}" >&2
     exit 1
@@ -456,6 +464,14 @@ ensure_writable_directory "$STATE_DIR" "State directory"
 ensure_writable_directory "$RUNTIME_DIR" "Runtime directory"
 ensure_writable_directory "$TMP_DIR" "Temporary work directory"
 ensure_writable_directory "$SCANLOG_DIR" "Scan-log directory"
+ensure_writable_directory "$EVENT_DIR" "Structured-event directory"
+
+emit_scan_event() {
+  if ! python3 /usr/local/bin/event_writer.py --event-dir "$EVENT_DIR" "$@"; then
+    echo "[ERROR] Could not persist a structured notification event." | tee -a "$SCANLOG"
+    return 1
+  fi
+}
 
 OLD_IFS="$IFS"
 IFS=':'
@@ -469,7 +485,7 @@ for SCAN_PATH_PERMISSION_CHECK do
       exit 1
       ;;
   esac
-  for INTERNAL_PATH in "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$DEFINITIONS_DIR" "$SCANLOG"; do
+  for INTERNAL_PATH in "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$DEFINITIONS_DIR" "$SCANLOG" "$EVENT_DIR"; do
     case "$INTERNAL_PATH" in
       "$SCAN_PATH_PERMISSION_CHECK"|"$SCAN_PATH_PERMISSION_CHECK"/*)
         echo "[ERROR] Mutable state, runtime files, definitions, and logs must be outside scan roots (path: ${INTERNAL_PATH}, root: ${SCAN_PATH_PERMISSION_CHECK})." >&2
@@ -485,11 +501,12 @@ if ! : >> "$SCANLOG"; then
 fi
 
 echo "=== Starting scheduled ClamAV scanner ===" | tee -a "$SCANLOG"
-echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL FORCE_FULL_POLL_INTERVAL=$FORCE_FULL_POLL_INTERVAL SCAN_PATHS=$SCAN_PATHS EXCLUDE_PATHS=$EXCLUDE_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR DEFINITIONS_DIR=$DEFINITIONS_DIR DEFINITIONS_MAX_AGE_SECONDS=$DEFINITIONS_MAX_AGE_SECONDS PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER" | tee -a "$SCANLOG"
+echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL FORCE_FULL_POLL_INTERVAL=$FORCE_FULL_POLL_INTERVAL SCAN_PATHS=$SCAN_PATHS EXCLUDE_PATHS=$EXCLUDE_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR EVENT_DIR=$EVENT_DIR DEFINITIONS_DIR=$DEFINITIONS_DIR DEFINITIONS_MAX_AGE_SECONDS=$DEFINITIONS_MAX_AGE_SECONDS PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER VANISHED_FILE_FAILURE_COUNT=$VANISHED_FILE_FAILURE_COUNT VANISHED_FILE_FAILURE_PERCENT=$VANISHED_FILE_FAILURE_PERCENT VANISHED_FILE_FAILURE_MINIMUM=$VANISHED_FILE_FAILURE_MINIMUM" | tee -a "$SCANLOG"
 
 echo "Waiting up to ${DEFINITIONS_WAIT_TIMEOUT}s for external definitions..." | tee -a "$SCANLOG"
 if ! python3 /usr/local/bin/clamav_healthcheck.py --wait; then
   echo "[ERROR] ClamAV definitions did not pass startup readiness checks." | tee -a "$SCANLOG"
+  emit_scan_event --event-type definitions_stale --severity critical --message "Scheduled scanner definitions failed startup readiness" --action-success false || true
   exit 1
 fi
 
@@ -588,12 +605,18 @@ ensure_clamd_alive() {
   return 1
 }
 
-LAST_CHANGED="$STATE_DIR/last_changed_scan_epoch"
-LAST_FULL="$STATE_DIR/last_full_scan_epoch"
 MANUAL_FULL_REQUEST_FILE="$STATE_DIR/manual_full_scan_request.env"
 MANUAL_CHANGED_REQUEST_FILE="$STATE_DIR/manual_changed_scan_request.env"
 NEXT_CHANGED_RETRY_EPOCH=0
 NEXT_FULL_RETRY_EPOCH=0
+
+read_checkpoint() {
+  python3 /usr/local/bin/checkpoint_state.py read --state-dir "$STATE_DIR" --field "$1"
+}
+
+update_checkpoints() {
+  python3 /usr/local/bin/checkpoint_state.py update --state-dir "$STATE_DIR" --full "$1" --changed "$2"
+}
 
 min_int() {
   A="$1"
@@ -989,6 +1012,30 @@ check_scan_path_health() {
     echo "[WARN] [$LABEL] Expected marker '$SCAN_PATH_MARKER' under $SCAN_PATH." | tee -a "$SCANLOG"
   fi
 
+  emit_scan_event --event-type mount_unavailable --severity warning --message "Scheduled scan root is unavailable" --source-path "$SCAN_PATH" --action-success false || true
+
+  return 1
+}
+
+capture_scan_root_guard() {
+  LABEL="$1"
+  GUARD_FILE="$TMP_DIR/${LABEL}_scan_roots.json"
+  if python3 /usr/local/bin/scan_root_guard.py capture --roots "$SCAN_PATHS" --marker "$SCAN_PATH_MARKER" --output "$GUARD_FILE"; then
+    return 0
+  fi
+  echo "[WARN] [$LABEL] Could not capture scan-root identities before enumeration." | tee -a "$SCANLOG"
+  emit_scan_event --event-type mount_unavailable --severity warning --message "Scheduled scan root identity could not be captured" --action-success false --scan-type "$LABEL" || true
+  return 1
+}
+
+verify_scan_root_guard() {
+  LABEL="$1"
+  GUARD_FILE="$TMP_DIR/${LABEL}_scan_roots.json"
+  if python3 /usr/local/bin/scan_root_guard.py verify --input "$GUARD_FILE"; then
+    return 0
+  fi
+  echo "[WARN] [$LABEL] A scan root or configured marker changed during the scan." | tee -a "$SCANLOG"
+  emit_scan_event --event-type mount_unavailable --severity warning --message "Scheduled scan root or marker changed during scan" --action-success false --scan-type "$LABEL" || true
   return 1
 }
 
@@ -1053,6 +1100,7 @@ build_scan_list() {
   PATH_COUNT=0
   OLD_IFS="$IFS"
 
+  capture_scan_root_guard "$LABEL" || return 2
   : > "$LIST_FILE"
 
   IFS=':'
@@ -1137,6 +1185,7 @@ build_targeted_scan_list() {
   TARGET_COUNT=0
   OLD_IFS="$IFS"
 
+  capture_scan_root_guard "$LABEL" || return 2
   : > "$LIST_FILE"
 
   IFS=':'
@@ -1178,12 +1227,15 @@ run_scan_list() {
   PROGRESS_STEPS="$5"
 
   RESULTS_FILE="$TMP_DIR/${LABEL}_results.jsonl"
-  if python3 /usr/local/bin/clamd_session_scan.py --socket "$CLAMD_SOCKET" --list-file "$LIST_FILE" --results-file "$RESULTS_FILE" --quarantine-dir "$QUARANTINE_DIR" --configured-workers "$CONFIGURED_PARALLEL_JOBS" --requested-progress-interval "$REQUESTED_CHUNK_SIZE" --progress-steps "$PROGRESS_STEPS" --max-files "$MAX_SCHEDULED_FILES" --scanlog-max-bytes "$SCANLOG_MAX_BYTES" --scanlog-rotations "$SCANLOG_ROTATIONS" --label "$LABEL" --scanlog "$SCANLOG" --scan-paths "$SCAN_PATHS"; then
-    echo "[$LABEL] Completed successfully." | tee -a "$SCANLOG"
-    return 0
+  if python3 /usr/local/bin/clamd_session_scan.py --socket "$CLAMD_SOCKET" --list-file "$LIST_FILE" --results-file "$RESULTS_FILE" --quarantine-dir "$QUARANTINE_DIR" --configured-workers "$CONFIGURED_PARALLEL_JOBS" --requested-progress-interval "$REQUESTED_CHUNK_SIZE" --progress-steps "$PROGRESS_STEPS" --max-files "$MAX_SCHEDULED_FILES" --scanlog-max-bytes "$SCANLOG_MAX_BYTES" --scanlog-rotations "$SCANLOG_ROTATIONS" --label "$LABEL" --scanlog "$SCANLOG" --scan-paths "$SCAN_PATHS" --event-dir "$EVENT_DIR" --vanished-failure-count "$VANISHED_FILE_FAILURE_COUNT" --vanished-failure-percent "$VANISHED_FILE_FAILURE_PERCENT" --vanished-failure-minimum "$VANISHED_FILE_FAILURE_MINIMUM"; then
+    if ensure_clamd_alive && verify_scan_root_guard "$LABEL"; then
+      echo "[$LABEL] Completed successfully." | tee -a "$SCANLOG"
+      return 0
+    fi
   fi
 
   echo "[WARN] ${LABEL} scan incomplete. The structured results file is ${RESULTS_FILE}." | tee -a "$SCANLOG"
+  emit_scan_event --event-type scan_failed --severity warning --message "Scheduled scan did not complete" --action-success false --scan-type "$LABEL" || true
   return 1
 }
 
@@ -1201,11 +1253,8 @@ while true; do
   fi
 
   NOW=$(date +%s)
-  [ -f "$LAST_CHANGED" ] || echo 0 > "$LAST_CHANGED"
-  [ -f "$LAST_FULL" ] || echo 0 > "$LAST_FULL"
-
-  LAST_CHANGED_EPOCH=$(cat "$LAST_CHANGED" 2>/dev/null || echo 0)
-  LAST_FULL_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
+  LAST_CHANGED_EPOCH=$(read_checkpoint changed)
+  LAST_FULL_EPOCH=$(read_checkpoint full)
 
   FORCE=0
   MANUAL_FULL_REQUEST=0
@@ -1304,10 +1353,19 @@ while true; do
     if [ "$FULL_BUILD_OK" -eq 1 ]; then
       if run_scan_list "$FULL_LIST" "FULL" "$FULL_SCAN_PARALLEL_JOBS" "$FULL_CHUNK_SIZE" "$FULL_PROGRESS_STEPS"; then
         if [ "$FULL_ADVANCES_CHECKPOINTS" -eq 1 ]; then
-          date +%s > "$LAST_FULL" || true
+          FULL_SUCCESS_EPOCH=$(date +%s)
+          NEW_CHANGED_EPOCH="$LAST_CHANGED_EPOCH"
           if [ "$FULL_SCAN_CUTOFF" -gt "$LAST_CHANGED_EPOCH" ]; then
-            echo "$FULL_SCAN_CUTOFF" > "$LAST_CHANGED" || true
-            LAST_CHANGED_EPOCH="$FULL_SCAN_CUTOFF"
+            NEW_CHANGED_EPOCH="$FULL_SCAN_CUTOFF"
+          fi
+          if ! update_checkpoints "$FULL_SUCCESS_EPOCH" "$NEW_CHANGED_EPOCH"; then
+            echo "[ERROR] Atomic checkpoint update failed after the full scan; stopping so it will be retried." | tee -a "$SCANLOG"
+            emit_scan_event --event-type scan_failed --severity warning --message "Scheduled full-scan checkpoint could not be persisted" --action-success false --scan-type FULL || true
+            exit 1
+          fi
+          LAST_FULL_EPOCH="$FULL_SUCCESS_EPOCH"
+          if [ "$NEW_CHANGED_EPOCH" -gt "$LAST_CHANGED_EPOCH" ]; then
+            LAST_CHANGED_EPOCH="$NEW_CHANGED_EPOCH"
             echo "[CHANGED] Updated changed-file checkpoint to successful full-scan cutoff $(date -d "@$FULL_SCAN_CUTOFF")." | tee -a "$SCANLOG"
           fi
           NEXT_CHANGED_RETRY_EPOCH=0
@@ -1404,7 +1462,12 @@ while true; do
           rm -f -- "$MANUAL_CHANGED_REQUEST_FILE"
           echo "[MANUAL] On-demand changed scan finished successfully; request consumed." | tee -a "$SCANLOG"
         else
-          echo "$CHANGED_SCAN_CUTOFF" > "$LAST_CHANGED" || true
+          if ! update_checkpoints "$LAST_FULL_EPOCH" "$CHANGED_SCAN_CUTOFF"; then
+            echo "[ERROR] Atomic checkpoint update failed after the changed-files scan; stopping so it will be retried." | tee -a "$SCANLOG"
+            emit_scan_event --event-type scan_failed --severity warning --message "Changed-file scan checkpoint could not be persisted" --action-success false --scan-type CHANGED || true
+            exit 1
+          fi
+          LAST_CHANGED_EPOCH="$CHANGED_SCAN_CUTOFF"
         fi
       else
         NEXT_CHANGED_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
@@ -1445,8 +1508,8 @@ while true; do
 
   END=$(date +%s)
   NOW="$END"
-  LAST_CHANGED_EPOCH=$(cat "$LAST_CHANGED" 2>/dev/null || echo 0)
-  LAST_FULL_EPOCH=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
+  LAST_CHANGED_EPOCH=$(read_checkpoint changed)
+  LAST_FULL_EPOCH=$(read_checkpoint full)
   FORCE=0
   MANUAL_FULL_REQUEST=0
   MANUAL_CHANGED_REQUEST=0

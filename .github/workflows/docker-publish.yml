@@ -23,7 +23,7 @@ jobs:
 
       - name: Check Python and shell syntax
         run: |
-          python3 -m py_compile scripts/clamav_entrypoint.py scripts/clamav_ui_server.py scripts/clamd_session_scan.py scripts/scan_list_filter.py scripts/clamav_healthcheck.py tests/integration_clamd.py
+          python3 -m py_compile scripts/clamav_entrypoint.py scripts/clamav_ui_server.py scripts/clamd_session_scan.py scripts/scan_list_filter.py scripts/clamav_healthcheck.py scripts/event_writer.py scripts/scan_root_guard.py scripts/checkpoint_state.py tests/integration_clamd.py
           sh -n scripts/clamav_scheduled.sh
 
       - name: Check browser JavaScript

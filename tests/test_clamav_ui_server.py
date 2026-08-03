@@ -135,7 +135,7 @@ class UIConfigValidationTests(unittest.TestCase):
 
         serialized = clamav_ui_server.serialize_config_for_scheduler(config)
 
-        self.assertEqual(serialized["FORCE_FULL_FLAG"], "/downloads/.clamav_force_full_scan.flag")
+        self.assertEqual(serialized["FORCE_FULL_FLAG"], "/state/force_full_scan.flag")
 
     def test_validate_manual_request_paths_rejects_paths_outside_scan_roots(self):
         with tempfile.TemporaryDirectory() as temp_dir:

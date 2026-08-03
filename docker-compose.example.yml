@@ -1,9 +1,8 @@
 services:
   clamav-scheduled:
-    # Replace vX.Y.Z with a tested release (or an immutable digest) for reproducible deployments.
-    image: ghcr.io/YOUR_GITHUB_USERNAME/clamav-scheduled:vX.Y.Z
+    image: ghcr.io/${GITHUB_OWNER:-outlain}/clamav-scheduled:${IMAGE_TAG:-latest}
     container_name: clamav-scheduled
-    user: "10001:10001"
+    user: "${SCANNER_UID:-10001}:${SCANNER_GID:-10001}"
     init: true
     restart: unless-stopped
     read_only: true
@@ -12,21 +11,23 @@ services:
     mem_limit: 6g
     pids_limit: 256
     ports:
-      - "8080:8080"
+      # The UI has no authentication; expose it only on the Docker host by default.
+      - "127.0.0.1:${UI_HOST_PORT:-8080}:8080"
     environment:
-      APP_MODE: ui
+      APP_MODE: ${APP_MODE:-ui}
+      UI_BIND: 0.0.0.0
       UI_PORT: 8080
       CONFIG_DIR: /config
       STATE_DIR: /state
+      EVENT_DIR: /events
       RUNTIME_DIR: /tmp/clamav-runtime
       UI_MAX_REQUEST_THREADS: 32
       UI_REQUEST_QUEUE_SIZE: 64
       UI_REQUEST_TIMEOUT_SECONDS: 15
       DEFINITIONS_DIR: /var/lib/clamav
       DEFINITIONS_WAIT_TIMEOUT: 300
-      DEFINITIONS_MAX_AGE_SECONDS: 172800
-      # Startup warns, while the image healthcheck still becomes unhealthy when daily definitions exceed this age.
-      DEFINITIONS_STALE_ACTION: warn
+      DEFINITIONS_MAX_AGE_SECONDS: ${DEFINITIONS_MAX_AGE_SECONDS:-172800}
+      DEFINITIONS_STALE_ACTION: fail
       CLAMD_MAX_QUEUE: 26
       CLAMD_MAX_SCAN_SIZE: 512M
       CLAMD_MAX_FILE_SIZE: 256M
@@ -36,17 +37,20 @@ services:
       CLAMD_MAX_SCAN_TIME: 900000
       CLAMD_READ_TIMEOUT: 900
       CLAMD_COMMAND_READ_TIMEOUT: 30
-      CLAMD_SELF_CHECK: 300
+      CLAMD_SELF_CHECK: ${CLAMD_SELF_CHECK:-300}
       CLAMD_START_TIMEOUT: 180
       MAX_SCHEDULED_FILES: 1000000
       SCANLOG_MAX_BYTES: 104857600
       SCANLOG_ROTATIONS: 5
-      # Headless-only scanner env vars below are ignored when APP_MODE=ui.
-      # Set APP_MODE=headless if you want to keep managing the scanner from environment variables.
+      VANISHED_FILE_FAILURE_COUNT: ${VANISHED_FILE_FAILURE_COUNT:-100}
+      VANISHED_FILE_FAILURE_PERCENT: ${VANISHED_FILE_FAILURE_PERCENT:-10}
+      VANISHED_FILE_FAILURE_MINIMUM: ${VANISHED_FILE_FAILURE_MINIMUM:-10}
+      # These scanner settings are used directly in headless mode. In UI mode,
+      # configure their equivalents in the UI after first launch.
       TZ: UTC
       MAXTHREADS: 13
       SCAN_PATHS: /downloads
-      EXCLUDE_PATHS: /downloads/private:/downloads/tmp
+      EXCLUDE_PATHS: /downloads/private:/downloads/tmp:/downloads/docker
       FULL_SCAN_PARALLEL_JOBS: 8
       CHANGED_SCAN_PARALLEL_JOBS: 8
       FULL_PROGRESS_STEPS: 100
@@ -60,21 +64,20 @@ services:
       PATH_CHECK_TIMEOUT: 10
       PATH_ENUMERATION_TIMEOUT: 300
       PATH_UNAVAILABLE_RETRY_INTERVAL: 300
-      QUARANTINE_DIR: /downloads/quarantine
+      SCAN_PATH_MARKER: ${SCAN_PATH_MARKER:-}
+      QUARANTINE_DIR: /quarantine
       SCANLOG: /var/log/clamav/clamav_scheduled.log
-      FORCE_FULL_FLAG: /downloads/.clamav_force_full_scan.flag
+      FORCE_FULL_FLAG: /state/force_full_scan.flag
     volumes:
-      - ./downloads:/downloads:rw
-      # Mount additional scan roots and append them to SCAN_PATHS as needed.
-      # - ./archive:/archive:rw
-      - ./config:/config:rw
-      # A separate definitions updater owns writes; this scanner only needs read access.
-      - ./defs:/var/lib/clamav:ro
-      - ./logs:/var/log/clamav:rw
-      - ./state:/state:rw
+      - /mnt/media:/downloads:rw
+      - /opt/docker/clamav-scheduled/config:/config:rw
+      - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
+      - /opt/docker/clamav-shared/logs/clamav-scheduled:/var/log/clamav:rw
+      - /opt/docker/clamav-shared/events/clamav-scheduled:/events:rw
+      - /opt/docker/clamav-shared/state/clamav-scheduled:/state:rw
+      - /opt/docker/clamav-shared/quarantine/clamav-scheduled:/quarantine:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
-      - /run:rw,nosuid,nodev,noexec,size=16m,mode=0755
     cap_drop:
       - ALL
     security_opt:
