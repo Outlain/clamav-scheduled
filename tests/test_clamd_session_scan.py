@@ -693,8 +693,156 @@ class WorkerTests(unittest.TestCase):
             self.assertIsInstance(worker_errors.get_nowait(), OSError)
             self.assertEqual(metrics.processed_files, 0)
 
+    def test_busy_large_media_slot_does_not_block_an_ordinary_file_behind_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "downloads"
+            root.mkdir()
+            large_source = root / "large.mkv"
+            small_source = root / "small.txt"
+            large_source.write_bytes(b"0123456789")
+            small_source.write_bytes(b"x")
+
+            def entry_for(path: Path) -> clamd_session_scan.FileEntry:
+                info = path.stat()
+                return clamd_session_scan.FileEntry(
+                    path=str(path),
+                    size_bytes=info.st_size,
+                    root=str(root),
+                    device=info.st_dev,
+                    inode=info.st_ino,
+                    modified_ns=info.st_mtime_ns,
+                    changed_ns=info.st_ctime_ns,
+                )
+
+            large_entry = entry_for(large_source)
+            small_entry = entry_for(small_source)
+            work_queue = clamd_session_scan.queue.Queue()
+            work_queue.put(large_entry)
+            work_queue.put(small_entry)
+            root_stats = {
+                str(root): {
+                    "files": 2,
+                    "bytes": 11,
+                    "processed_files": 0,
+                    "processed_bytes": 0,
+                    "infected": 0,
+                    "vanished": 0,
+                    "errors": 0,
+                }
+            }
+            metrics = clamd_session_scan.Metrics(2, 11, root_stats, 100)
+            policy = clamd_session_scan.LargeMediaPolicy(
+                enabled=True,
+                native_max_bytes=5,
+                maximum_bytes=100,
+                window_bytes=5,
+                overlap_bytes=1,
+                probe_timeout_seconds=5,
+                scan_timeout_seconds=60,
+                ffprobe_binary="/unused/ffprobe",
+            )
+            slot = mock.Mock()
+            slot.acquire.side_effect = [False, True]
+            fake_scanner = mock.Mock()
+            fake_scanner.scan_entry.return_value = ("CLEAN", str(small_source), "")
+
+            with mock.patch.object(
+                clamd_session_scan,
+                "SessionScanner",
+                return_value=fake_scanner,
+            ), mock.patch.object(
+                clamd_session_scan,
+                "scan_large_media_entry",
+                return_value=(
+                    "CLEAN",
+                    str(large_source),
+                    "",
+                    "large_media_full_byte_windows",
+                ),
+            ) as large_scan:
+                clamd_session_scan.worker_loop(
+                    work_queue,
+                    mock.Mock(),
+                    mock.Mock(),
+                    metrics,
+                    "/tmp/clamd.sock",
+                    "/quarantine",
+                    [str(root)],
+                    "FULL",
+                    clamd_session_scan.time.monotonic_ns(),
+                    large_media_policy=policy,
+                    large_media_slots=slot,
+                )
+
+            fake_scanner.scan_entry.assert_called_once_with(small_entry)
+            large_scan.assert_called_once_with("/tmp/clamd.sock", large_entry, policy)
+            self.assertEqual(slot.acquire.call_count, 2)
+            slot.release.assert_called_once_with()
+            self.assertEqual(metrics.processed_files, 2)
+            self.assertEqual(metrics.large_media_files, 1)
+
 
 class MetricsTests(unittest.TestCase):
+    def test_first_completion_is_logged_even_when_file_interval_is_large(self):
+        root_stats = {
+            "/downloads": {
+                "files": 3,
+                "bytes": 3,
+                "processed_files": 0,
+                "processed_bytes": 0,
+                "infected": 0,
+                "vanished": 0,
+                "errors": 0,
+            }
+        }
+        metrics = clamd_session_scan.Metrics(3, 3, root_stats, 100)
+        first = clamd_session_scan.FileEntry("/downloads/one", 1, "/downloads")
+        second = clamd_session_scan.FileEntry("/downloads/two", 1, "/downloads")
+
+        _processed, first_should_log = metrics.record(first, "CLEAN", 1, False)
+        _processed, second_should_log = metrics.record(second, "CLEAN", 1, False)
+
+        self.assertTrue(first_should_log)
+        self.assertFalse(second_should_log)
+
+    def test_scan_heartbeat_reports_liveness_without_changing_progress_window(self):
+        root_stats = {
+            "/downloads": {
+                "files": 2,
+                "bytes": 2,
+                "processed_files": 0,
+                "processed_bytes": 0,
+                "infected": 0,
+                "vanished": 0,
+                "errors": 0,
+            }
+        }
+        metrics = clamd_session_scan.Metrics(2, 2, root_stats, 100)
+        entry = clamd_session_scan.FileEntry("/downloads/one", 1, "/downloads")
+        metrics.record(entry, "ERROR", 1, False)
+        logger = mock.Mock()
+        start_ns = 1_000_000_000
+
+        with mock.patch.object(
+            clamd_session_scan.time,
+            "monotonic_ns",
+            return_value=start_ns + 30_000_000_000,
+        ):
+            clamd_session_scan.log_scan_heartbeat(
+                logger,
+                metrics,
+                "FULL",
+                start_ns,
+                queued_files=0,
+                active_workers=1,
+            )
+
+        message = logger.log.call_args.args[0]
+        self.assertIn("processed=1/2", message)
+        self.assertIn("active_workers=1", message)
+        self.assertIn("errors=1", message)
+        self.assertEqual(metrics.last_log_processed_files, 0)
+
     def test_progress_snapshot_tracks_window_deltas_between_logs(self):
         root_stats = {
             "/downloads": {

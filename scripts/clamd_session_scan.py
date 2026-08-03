@@ -33,6 +33,8 @@ MAX_PROGRESS_STEPS = 10_000
 MAX_PROGRESS_INTERVAL = 1_000_000
 MAX_SCHEDULED_FILE_CAP = 5_000_000
 MAX_VANISHED_FILE_CAP = 1_000_000
+SCAN_HEARTBEAT_SECONDS = 30
+LARGE_MEDIA_SLOT_RETRY_SECONDS = 1.0
 CLAMD_POLICY_LIMIT_MARKERS = (
     "heuristics.limits.exceeded",
     "size limit exceeded",
@@ -396,7 +398,11 @@ class Metrics:
             if len(self.slowest_files) > 3:
                 self.slowest_files = self.slowest_files[:3]
 
-            should_log = self.processed_files % self.progress_interval == 0 or self.processed_files == self.total_files
+            should_log = (
+                self.processed_files == 1
+                or self.processed_files % self.progress_interval == 0
+                or self.processed_files == self.total_files
+            )
             return self.processed_files, should_log
 
     def snapshot(self) -> dict[str, int]:
@@ -434,6 +440,31 @@ class Metrics:
             self.last_log_processed_bytes = self.processed_bytes
             self.last_log_elapsed_ms = elapsed_ms
             return snapshot
+
+
+def log_scan_heartbeat(
+    logger: Logger,
+    metrics: Metrics,
+    label: str,
+    start_ns: int,
+    queued_files: int,
+    active_workers: int,
+) -> None:
+    elapsed_ms = max(1, (time.monotonic_ns() - start_ns) // 1_000_000)
+    snapshot = metrics.snapshot()
+    clean_files = max(
+        0,
+        snapshot["processed_files"]
+        - snapshot["infected_files"]
+        - snapshot["vanished_files"]
+        - snapshot["error_files"],
+    )
+    logger.log(
+        f"[{label}] Scan heartbeat: processed={snapshot['processed_files']}/{metrics.total_files} "
+        f"queued={max(0, queued_files)} active_workers={max(0, active_workers)} "
+        f"clean={clean_files} infected={snapshot['infected_files']} vanished={snapshot['vanished_files']} "
+        f"errors={snapshot['error_files']} elapsed={format_duration_ms(elapsed_ms)}."
+    )
 
 
 def parse_clamd_scan_reply(reply: bytes, requested_path: str) -> tuple[str, str, str]:
@@ -1000,18 +1031,27 @@ def worker_loop(
                 if large_media_policy is not None and entry.size_bytes > large_media_policy.native_max_bytes:
                     if large_media_slots is None:
                         raise RuntimeError("large-media worker limiter is unavailable")
+                    if not large_media_slots.acquire(timeout=LARGE_MEDIA_SLOT_RETRY_SECONDS):
+                        # Do not let an early run of oversized files occupy every
+                        # worker while only one large-media scan is allowed. Move
+                        # this entry behind pending ordinary files and try again.
+                        work_queue.put(entry)
+                        work_queue.task_done()
+                        continue
                     try:
-                        with large_media_slots:
+                        try:
                             status, scanned_path, threat_name, scan_method = scan_large_media_entry(
                                 socket_path,
                                 entry,
                                 large_media_policy,
                             )
-                    except LargeMediaPolicyError as exc:
-                        status = "POLICY_LIMIT"
-                        scanned_path = entry.path
-                        threat_name = str(exc)
-                        scan_method = "oversized_content_held"
+                        except LargeMediaPolicyError as exc:
+                            status = "POLICY_LIMIT"
+                            scanned_path = entry.path
+                            threat_name = str(exc)
+                            scan_method = "oversized_content_held"
+                    finally:
+                        large_media_slots.release()
                 else:
                     for attempt in range(2):
                         try:
@@ -1408,7 +1448,8 @@ def main() -> int:
         )
         logger.log(
             f"[{args.label}] Progress logging uses file-count checkpoints, not scan chunks: "
-            f"mode={progress_mode} progress_interval={progress_interval} {progress_detail}"
+            f"mode={progress_mode} progress_interval={progress_interval} {progress_detail}; "
+            f"the first completion and {SCAN_HEARTBEAT_SECONDS}s liveness heartbeats are also logged"
         )
 
         work_queue: "queue.Queue[FileEntry]" = queue.Queue()
@@ -1455,6 +1496,25 @@ def main() -> int:
 
         for thread in threads:
             thread.start()
+
+        next_heartbeat = time.monotonic() + SCAN_HEARTBEAT_SECONDS
+        while True:
+            active_workers = sum(1 for thread in threads if thread.is_alive())
+            if active_workers == 0:
+                break
+            current_monotonic = time.monotonic()
+            if current_monotonic >= next_heartbeat:
+                log_scan_heartbeat(
+                    logger,
+                    metrics,
+                    args.label,
+                    start_ns,
+                    work_queue.qsize(),
+                    active_workers,
+                )
+                next_heartbeat = current_monotonic + SCAN_HEARTBEAT_SECONDS
+            time.sleep(1.0)
+
         for thread in threads:
             thread.join()
 

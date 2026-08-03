@@ -302,7 +302,11 @@ function updateCurrentScan(scan) {
   setText("vanished-count", String(scan.vanished ?? 0));
   setText("error-count", String(scan.errors ?? 0));
   setText("progress-interval-value", scan.progress_interval ? `${scan.progress_interval} files` : "n/a");
-  setText("workers-value", scan.workers ? String(scan.workers) : "n/a");
+  if (Number.isFinite(Number(scan.active_workers)) && scan.workers) {
+    setText("workers-value", `${scan.active_workers} active / ${scan.workers} configured`);
+  } else {
+    setText("workers-value", scan.workers ? String(scan.workers) : "n/a");
+  }
 }
 
 function formatElapsedSince(startedAt) {

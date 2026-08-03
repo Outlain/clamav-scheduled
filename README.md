@@ -19,7 +19,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Dynamic chunk sizing for clearer progress logging
 - Separate full-scan and changed-scan concurrency controls
 - Richer scan metrics including bytes, infected/error counts, per-root summaries, and slowest files
-- Live progress logs show both running-average and since-last-update throughput/data rates
+- Live progress logs report the first completed file, regular throughput checkpoints, and 30-second worker/queue heartbeats
 - Reports isolated files that vanish after list-building and fails the run when the configured count/percentage is suspicious
 - Pauses and retries if any configured scan root becomes unavailable
 - Captures scan-root and optional marker identities before enumeration and verifies them again after all workers finish
@@ -141,6 +141,11 @@ leaves the original in place, marks the run incomplete, and keeps the previous
 checkpoint. The event ID is derived from the unchanged file identity and reason,
 so the notifier does not resend the same archive warning after every retry. A
 changed file receives a new identity and a new alert.
+
+Only `MAX_LARGE_MEDIA_WORKERS` oversized-video jobs run at once. When that slot
+is busy, standard workers put later oversized entries back behind pending work
+instead of all waiting for the same slot. Ordinary files therefore continue to
+make progress even when a directory contains several very large files.
 
 ## UI mode
 

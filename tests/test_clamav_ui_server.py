@@ -574,6 +574,16 @@ class UISchedulerManagerTests(unittest.TestCase):
                 self.assertEqual(manager._phase, "scanning")
                 self.assertEqual(manager._current_scan["stage"], "scanning")
                 self.assertEqual(manager._current_scan["workers"], 8)
+
+                manager._handle_log_line(
+                    "[FULL] Scan heartbeat: processed=1/42 queued=33 active_workers=8 "
+                    "clean=0 infected=0 vanished=0 errors=1 elapsed=30.00s."
+                )
+
+                self.assertEqual(manager._current_scan["processed_files"], 1)
+                self.assertEqual(manager._current_scan["queued_files"], 33)
+                self.assertEqual(manager._current_scan["active_workers"], 8)
+                self.assertEqual(manager._current_scan["errors"], 1)
             finally:
                 manager.shutdown()
 

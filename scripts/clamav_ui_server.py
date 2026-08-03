@@ -101,6 +101,12 @@ INDEXING_COMPLETE_RE = re.compile(
     r"bytes=(?P<bytes>.+?) elapsed=(?P<elapsed>.+?)\.$"
 )
 NO_FILES_RE = re.compile(r"^\[(?P<label>FULL|CHANGED)\] No files found to scan\.$")
+SCAN_HEARTBEAT_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Scan heartbeat: "
+    r"processed=(?P<processed>\d+)/(?P<total>\d+) queued=(?P<queued>\d+) "
+    r"active_workers=(?P<active_workers>\d+) clean=(?P<clean>\d+) infected=(?P<infected>\d+) "
+    r"vanished=(?P<vanished>\d+) errors=(?P<errors>\d+) elapsed=(?P<elapsed>.+?)\.$"
+)
 PROGRESS_CONFIG_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Progress logging uses file-count checkpoints, not scan chunks: "
     r"mode=(?P<mode>\w+) progress_interval=(?P<interval>\d+) (?P<detail>.+)$"
@@ -1747,6 +1753,36 @@ class SchedulerManager:
                     }
                 )
             self._phase = "cycle_complete"
+            self._last_event = line
+            return
+
+        heartbeat_match = SCAN_HEARTBEAT_RE.match(line)
+        if heartbeat_match:
+            if replay:
+                self._last_event = line
+                return
+            label = heartbeat_match.group("label")
+            if self._current_scan is not None and self._current_scan.get("label") == label:
+                self._current_scan.update(
+                    {
+                        "stage": "scanning",
+                        "processed_files": int(heartbeat_match.group("processed")),
+                        "total_files": int(heartbeat_match.group("total")),
+                        "queued_files": int(heartbeat_match.group("queued")),
+                        "active_workers": int(heartbeat_match.group("active_workers")),
+                        "clean": int(heartbeat_match.group("clean")),
+                        "infected": int(heartbeat_match.group("infected")),
+                        "vanished": int(heartbeat_match.group("vanished")),
+                        "errors": int(heartbeat_match.group("errors")),
+                        "elapsed": heartbeat_match.group("elapsed"),
+                        "status_message": (
+                            f"Workers are active: {heartbeat_match.group('processed')} files completed, "
+                            f"{heartbeat_match.group('queued')} still queued."
+                        ),
+                        "updated_at": utc_now_iso(),
+                    }
+                )
+            self._phase = "scanning"
             self._last_event = line
             return
 
