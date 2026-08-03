@@ -40,6 +40,28 @@ class UIConfigValidationTests(unittest.TestCase):
             self.assertEqual(normalized["changed_scan_times"], ["07:00", "14:00"])
             self.assertEqual(normalized["full_scan_days"], [7])
 
+    def test_health_configuration_error_is_safe_for_one_line_output(self):
+        self.assertEqual(
+            clamav_ui_server.health_detail("bad value\r\nnext line"),
+            "bad value  next line",
+        )
+        self.assertEqual(len(clamav_ui_server.health_detail("x" * 600)), 512)
+
+    def test_repair_draft_preserves_compatible_saved_values(self):
+        draft = clamav_ui_server.config_repair_draft(
+            {
+                "scan_paths": "/downloads:/missing",
+                "maxthreads": "not-a-number",
+                "changed_scan_times": ["07:00", "bad"],
+                "unknown_field": "ignored",
+            }
+        )
+
+        self.assertEqual(draft["scan_paths"], ["/downloads", "/missing"])
+        self.assertEqual(draft["maxthreads"], "not-a-number")
+        self.assertEqual(draft["changed_scan_times"], ["07:00", "bad"])
+        self.assertNotIn("unknown_field", draft)
+
     def test_validate_and_normalize_config_rejects_invalid_time(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             payload = {
@@ -156,6 +178,36 @@ class UIConfigValidationTests(unittest.TestCase):
 
 
 class UISchedulerManagerTests(unittest.TestCase):
+    def test_invalid_saved_config_opens_with_repair_draft(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            config_dir = base / "config"
+            state_dir = base / "state"
+            config_dir.mkdir()
+            state_dir.mkdir()
+            (config_dir / "ui-config.json").write_text(
+                json.dumps(
+                    {
+                        "scan_paths": [str(base / "missing")],
+                        "maxthreads": "bad",
+                        "full_scan_times": ["04:15"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            try:
+                bootstrap = manager.get_bootstrap()
+            finally:
+                manager.shutdown()
+
+            self.assertTrue(bootstrap["repair_mode"])
+            self.assertIn("does not exist", bootstrap["config_error"])
+            self.assertEqual(bootstrap["config"]["scan_paths"], [str(base / "missing")])
+            self.assertEqual(bootstrap["config"]["maxthreads"], "bad")
+            self.assertEqual(bootstrap["config"]["full_scan_times"], ["04:15"])
+
     def test_live_history_append_keeps_nearby_identical_scans_with_different_timestamps(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

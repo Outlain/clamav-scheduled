@@ -176,9 +176,49 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "force_full_flag": "/state/force_full_scan.flag",
 }
 
+REPAIR_LIST_FIELDS = {
+    "scan_paths": ":",
+    "exclude_paths": ":",
+    "changed_scan_days": ",",
+    "changed_scan_times": ",",
+    "full_scan_days": ",",
+    "full_scan_times": ",",
+}
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def health_detail(value: Any) -> str:
+    return str(value).replace("\r", " ").replace("\n", " ")[:512]
+
+
+def config_repair_draft(value: Any) -> dict[str, Any]:
+    draft = deepcopy(DEFAULT_CONFIG)
+    if not isinstance(value, dict):
+        return draft
+
+    for field_name, default_value in DEFAULT_CONFIG.items():
+        if field_name not in value:
+            continue
+        candidate = value[field_name]
+        separator = REPAIR_LIST_FIELDS.get(field_name)
+        if separator is not None:
+            if isinstance(candidate, str):
+                draft[field_name] = [part.strip() for part in candidate.split(separator) if part.strip()]
+            elif isinstance(candidate, list):
+                draft[field_name] = [
+                    item for item in candidate if isinstance(item, (str, int, float)) and not isinstance(item, bool)
+                ]
+            continue
+        if isinstance(default_value, int):
+            if isinstance(candidate, (str, int, float)) and not isinstance(candidate, bool):
+                draft[field_name] = candidate
+            continue
+        if isinstance(default_value, str) and isinstance(candidate, (str, int, float)):
+            draft[field_name] = str(candidate)
+    return draft
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -896,6 +936,7 @@ class SchedulerManager:
         self._next_restart_monotonic = 0.0
         self._config_error = ""
         self._config: dict[str, Any] | None = None
+        self._repair_config: dict[str, Any] | None = None
         history_warning = ""
         history_should_rewrite = False
         raw_history: list[Any] = []
@@ -955,7 +996,12 @@ class SchedulerManager:
             return {
                 "configured": self._config is not None and not self._config_error,
                 "config_error": self._config_error,
-                "config": deepcopy(self._config) if self._config is not None else deepcopy(DEFAULT_CONFIG),
+                "config": deepcopy(
+                    self._config
+                    if self._config is not None
+                    else self._repair_config or DEFAULT_CONFIG
+                ),
+                "repair_mode": bool(self._config_error),
                 "defaults": deepcopy(DEFAULT_CONFIG),
                 "day_options": [{"value": day, "label": label} for day, label in DAY_LABELS.items()],
                 "status": self._status_payload_locked(),
@@ -974,7 +1020,7 @@ class SchedulerManager:
         with self._lock:
             if self._config is not None:
                 return deepcopy(self._config)
-            return deepcopy(DEFAULT_CONFIG)
+            return deepcopy(self._repair_config or DEFAULT_CONFIG)
 
     def save_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = validate_and_normalize_config(payload)
@@ -982,6 +1028,7 @@ class SchedulerManager:
             validate_runtime_permissions(normalized, self.config_dir, self.state_dir)
             write_json_atomic(self.config_path, normalized)
             self._config = normalized
+            self._repair_config = None
             self._config_error = ""
             self._attach_log_file(Path(normalized["scanlog"]), replay=True)
             self._restart_scheduler_locked()
@@ -1100,13 +1147,16 @@ class SchedulerManager:
     def _load_config_from_disk(self) -> None:
         if not self.config_path.exists():
             self._config = None
+            self._repair_config = None
             self._config_error = ""
             self._phase = "unconfigured"
             return
 
+        raw_config: Any = None
         try:
             raw_config = read_json(self.config_path, default={}) or {}
             self._config = validate_and_normalize_config(raw_config)
+            self._repair_config = None
             if self._config.get("updated_at") != raw_config.get("updated_at"):
                 write_json_atomic(self.config_path, self._config)
             self._attach_log_file(Path(self._config["scanlog"]), replay=False)
@@ -1114,6 +1164,7 @@ class SchedulerManager:
             self._last_event = "Loaded UI configuration from disk."
         except Exception as exc:
             self._config = None
+            self._repair_config = config_repair_draft(raw_config)
             self._config_error = str(exc)
             self._phase = "config_error"
             self._last_event = "UI configuration could not be loaded."
@@ -1720,7 +1771,7 @@ class UIRequestHandler(BaseHTTPRequestHandler):
                 not configured or (scheduler_running and phase in ready_phases)
             )
             if config_error:
-                reason = "saved UI configuration is invalid"
+                reason = f"saved UI configuration is invalid: {health_detail(status_payload['config_error'])}"
             elif not configured:
                 reason = "initial UI configuration is required"
             elif not scheduler_running:

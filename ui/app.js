@@ -498,6 +498,14 @@ function updateStatusView(payload) {
 
   setVisible("setup-banner", !status.configured);
   if (!status.configured) {
+    const configError = payload.config_error || status.config_error || "";
+    if (configError) {
+      setText("setup-title", "Configuration Repair Required");
+      setText("setup-message", "The saved settings were not started. Review the highlighted error in Settings, correct the pre-filled repair draft, and save it to start the scanner.");
+    } else {
+      setText("setup-title", "Initial Setup Required");
+      setText("setup-message", "The scheduler will stay idle until this UI has a valid saved configuration.");
+    }
     openSettings();
   }
 }
@@ -628,7 +636,7 @@ async function bootstrap() {
   populateForm(payload.config || payload.defaults);
   updateStatusView(payload);
   if (payload.config_error) {
-    $("form-status").textContent = payload.config_error;
+    $("form-status").textContent = `Saved configuration error: ${payload.config_error}`;
   }
 }
 
