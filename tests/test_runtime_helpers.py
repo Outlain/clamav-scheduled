@@ -64,6 +64,28 @@ class ScanListFilterTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 scan_list_filter.append_filtered_paths(str(input_path), str(output_path), [], [])
 
+    def test_cli_prints_appended_file_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "raw.nul"
+            output_path = Path(temp_dir) / "filtered.nul"
+            input_path.write_bytes(b"/downloads/one.bin\0/downloads/two.bin\0")
+
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "scan_list_filter.py",
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                ],
+            ), mock.patch("builtins.print") as print_mock:
+                result = scan_list_filter.main()
+
+            self.assertEqual(result, 0)
+            print_mock.assert_called_once_with(2)
+
 
 class DefinitionHealthTests(unittest.TestCase):
     def test_definition_status_requires_main_and_daily_and_reports_daily_age(self):

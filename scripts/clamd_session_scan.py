@@ -1373,12 +1373,21 @@ def main() -> int:
                 f"[ERROR] [{args.label}] max files must be between 1 and {MAX_SCHEDULED_FILE_CAP}"
             )
             return 2
+        indexing_started_ns = time.monotonic_ns()
+        logger.log(
+            f"[{args.label}] Indexing enumerated file list and capturing file identities before scanning."
+        )
         try:
             entries, root_stats, total_bytes = build_entries(args.list_file, roots, args.max_files)
         except (OSError, ValueError) as exc:
             logger.log(f"[ERROR] [{args.label}] Could not index scan list: {format_log_value(exc)}")
             return 2
         total_files = len(entries)
+        indexing_elapsed_ms = max(0, (time.monotonic_ns() - indexing_started_ns) // 1_000_000)
+        logger.log(
+            f"[{args.label}] Indexing completed: files={total_files} bytes={format_bytes(total_bytes)} "
+            f"elapsed={format_duration_ms(indexing_elapsed_ms)}."
+        )
         try:
             effective_workers, progress_interval, progress_mode, progress_detail = calculate_scan_runtime(
                 max(1, total_files),

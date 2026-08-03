@@ -176,6 +176,8 @@ body {
   box-shadow: 0 0 0 0.35rem rgba(156, 163, 175, 0.15);
 }
 
+.status-dot.phase-enumerating,
+.status-dot.phase-indexing,
 .status-dot.phase-scanning {
   background: var(--accent);
   box-shadow: 0 0 0 0.35rem rgba(15, 118, 110, 0.16);
@@ -260,6 +262,13 @@ body {
   color: var(--accent);
 }
 
+.scan-stage-message {
+  min-height: 1.5rem;
+  margin: -0.25rem 0 1rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .progress-wrap {
   margin-bottom: 1rem;
 }
@@ -278,6 +287,20 @@ body {
   border-radius: inherit;
   background: linear-gradient(90deg, #0f766e 0%, #0d9488 52%, #b45309 100%);
   transition: width 360ms ease;
+}
+
+.progress-bar.indeterminate {
+  width: 38%;
+  animation: enumeration-progress 1.8s ease-in-out infinite alternate;
+}
+
+@keyframes enumeration-progress {
+  from {
+    transform: translateX(-45%);
+  }
+  to {
+    transform: translateX(210%);
+  }
 }
 
 .progress-stats {

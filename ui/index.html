@@ -55,6 +55,8 @@
             <span id="scan-kind-badge" class="badge hidden">Idle</span>
           </div>
 
+          <p id="scan-stage-message" class="scan-stage-message">Waiting for the next scan.</p>
+
           <div id="progress-wrap" class="progress-wrap">
             <div class="progress-track">
               <div id="progress-bar" class="progress-bar"></div>
@@ -296,6 +298,7 @@
               <label>
                 <span>File Listing Timeout Per Path</span>
                 <input name="path_enumeration_timeout" type="number" min="1" required>
+                <small>Maximum seconds for one complete file-tree walk. Large NAS trees commonly need 1800 seconds or more; this is listing time, not malware scan time.</small>
               </label>
               <label>
                 <span>Retry Delay When Path Unavailable</span>

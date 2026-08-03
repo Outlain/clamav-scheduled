@@ -526,6 +526,57 @@ class UISchedulerManagerTests(unittest.TestCase):
             self.assertEqual(manager._phase, "idle")
             self.assertEqual(manager._last_event, "clamd ready.")
 
+    def test_pre_scan_log_lines_expose_enumeration_and_indexing_stages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            state_dir = temp_path / "state"
+            config_dir = temp_path / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            try:
+                manager._handle_log_line("=== FULL SCAN starting ===")
+                manager._handle_log_line(
+                    "[FULL] Enumeration started for /downloads (timeout=1800s)."
+                )
+
+                self.assertEqual(manager._phase, "enumerating")
+                self.assertEqual(manager._current_scan["stage"], "enumerating")
+                self.assertEqual(manager._current_scan["current_path"], "/downloads")
+                self.assertEqual(manager._current_scan["enumeration_timeout_seconds"], 1800)
+
+                manager._handle_log_line(
+                    "[FULL] Enumeration completed for /downloads: eligible_files=42 elapsed=17s."
+                )
+                manager._handle_log_line(
+                    "[FULL] File-list build completed: eligible_files=42 sources=1."
+                )
+
+                self.assertEqual(manager._phase, "indexing")
+                self.assertEqual(manager._current_scan["enumerated_files"], 42)
+                self.assertEqual(manager._current_scan["enumeration_sources"], 1)
+
+                manager._handle_log_line(
+                    "[FULL] Indexing enumerated file list and capturing file identities before scanning."
+                )
+                manager._handle_log_line(
+                    "[FULL] Indexing completed: files=42 bytes=7.50 GiB elapsed=2.50s."
+                )
+
+                self.assertEqual(manager._current_scan["total_files"], 42)
+                self.assertEqual(manager._current_scan["total_bytes"], "7.50 GiB")
+
+                manager._handle_log_line(
+                    "[FULL] Scanning 42 files with persistent_session_workers=8"
+                )
+
+                self.assertEqual(manager._phase, "scanning")
+                self.assertEqual(manager._current_scan["stage"], "scanning")
+                self.assertEqual(manager._current_scan["workers"], 8)
+            finally:
+                manager.shutdown()
+
     def test_log_replay_does_not_restore_historical_in_progress_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

@@ -65,6 +65,8 @@ function formatPhase(phase) {
     config_error: "Configuration Error",
     starting: "Starting Scanner",
     idle: "Idle",
+    enumerating: "Building File List",
+    indexing: "Indexing Files",
     scanning: "Scanning",
     cycle_complete: "Cycle Complete",
     waiting_lock: "Waiting For Lock",
@@ -227,10 +229,13 @@ function applyPhaseVisuals(status) {
 }
 
 function updateCurrentScan(scan) {
+  const progressBar = $("progress-bar");
   if (!scan) {
     setText("scan-title", "No active scan");
+    setText("scan-stage-message", "Waiting for the next scan.");
     setVisible("scan-kind-badge", false);
-    $("progress-bar").style.width = "0%";
+    progressBar.classList.remove("indeterminate");
+    progressBar.style.width = "0%";
     setText("progress-percent", "0%");
     setText("progress-numbers", "0 / 0 files");
     setText("bytes-progress", "0 / 0");
@@ -248,14 +253,46 @@ function updateCurrentScan(scan) {
     return;
   }
 
-  setText("scan-title", scan.display_label || "Scan in progress");
+  const stage = scan.stage || "scanning";
+  const preparing = stage === "enumerating" || stage === "indexing";
+  const stageLabels = {
+    enumerating: "Building File List",
+    indexing: "Indexing Files",
+    scanning: "Scanning",
+    complete: "Complete",
+  };
+  const titleSuffix = stageLabels[stage] || "In Progress";
+  setText("scan-title", `${scan.display_label || "Scan"} — ${titleSuffix}`);
+  setText("scan-stage-message", scan.status_message || "Scan activity is in progress.");
   $("scan-kind-badge").textContent = scan.label || "SCAN";
   setVisible("scan-kind-badge", true);
-  $("progress-bar").style.width = `${scan.percent || 0}%`;
-  setText("progress-percent", `${scan.percent || 0}%`);
-  setText("progress-numbers", `${scan.processed_files || 0} / ${scan.total_files || 0} files`);
-  setText("bytes-progress", `${scan.processed_bytes || "0"} / ${scan.total_bytes || "0"}`);
-  setText("elapsed-value", scan.elapsed || "n/a");
+  progressBar.classList.toggle("indeterminate", preparing);
+
+  if (preparing) {
+    progressBar.style.width = "38%";
+    setText("progress-percent", "Preparing");
+    if (stage === "enumerating") {
+      const discovered = Number(scan.enumerated_files || 0);
+      setText(
+        "progress-numbers",
+        discovered > 0 ? `${discovered} eligible files discovered` : "Discovering files; total not known yet",
+      );
+    } else {
+      const discovered = Number(scan.enumerated_files || scan.total_files || 0);
+      setText(
+        "progress-numbers",
+        discovered > 0 ? `${discovered} files awaiting identity indexing` : "Indexing the completed file list",
+      );
+    }
+    setText("bytes-progress", scan.total_bytes ? `Total ${scan.total_bytes}` : "Calculated during indexing");
+  } else {
+    progressBar.style.width = `${scan.percent || 0}%`;
+    setText("progress-percent", `${scan.percent || 0}%`);
+    setText("progress-numbers", `${scan.processed_files || 0} / ${scan.total_files || 0} files`);
+    setText("bytes-progress", `${scan.processed_bytes || "0"} / ${scan.total_bytes || "0"}`);
+  }
+
+  setText("elapsed-value", scan.elapsed || formatElapsedSince(scan.started_at));
   setText("avg-throughput-value", scan.avg_throughput || "n/a");
   setText("window-throughput-value", scan.window_throughput || "n/a");
   setText("avg-data-rate-value", scan.avg_data_rate || "n/a");
@@ -266,6 +303,24 @@ function updateCurrentScan(scan) {
   setText("error-count", String(scan.errors ?? 0));
   setText("progress-interval-value", scan.progress_interval ? `${scan.progress_interval} files` : "n/a");
   setText("workers-value", scan.workers ? String(scan.workers) : "n/a");
+}
+
+function formatElapsedSince(startedAt) {
+  const startedMillis = Date.parse(startedAt || "");
+  if (!Number.isFinite(startedMillis)) {
+    return "n/a";
+  }
+  const totalSeconds = Math.max(0, Math.floor((Date.now() - startedMillis) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
 }
 
 function updateRuntimePanel(status) {

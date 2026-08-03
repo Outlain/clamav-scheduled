@@ -81,6 +81,26 @@ SCHEDULER_STABLE_RUNTIME_SECONDS = 60
 SCAN_START_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Scanning (?P<total>\d+) files with persistent_session_workers=(?P<workers>\d+)$"
 )
+ENUMERATION_START_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Enumeration started for (?P<path>.+) "
+    r"\(timeout=(?P<timeout>\d+)s\)\.$"
+)
+ENUMERATION_COMPLETE_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Enumeration completed for (?P<path>.+): "
+    r"eligible_files=(?P<files>\d+) elapsed=(?P<elapsed>\d+)s\.$"
+)
+FILE_LIST_COMPLETE_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] File-list build completed: "
+    r"eligible_files=(?P<files>\d+) sources=(?P<sources>\d+)\.$"
+)
+INDEXING_START_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Indexing enumerated file list and capturing file identities before scanning\.$"
+)
+INDEXING_COMPLETE_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Indexing completed: files=(?P<files>\d+) "
+    r"bytes=(?P<bytes>.+?) elapsed=(?P<elapsed>.+?)\.$"
+)
+NO_FILES_RE = re.compile(r"^\[(?P<label>FULL|CHANGED)\] No files found to scan\.$")
 PROGRESS_CONFIG_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Progress logging uses file-count checkpoints, not scan chunks: "
     r"mode=(?P<mode>\w+) progress_interval=(?P<interval>\d+) (?P<detail>.+)$"
@@ -168,7 +188,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "scan_failure_retry_interval": 300,
     "force_full_poll_interval": 60,
     "path_check_timeout": 10,
-    "path_enumeration_timeout": 300,
+    "path_enumeration_timeout": 1800,
     "path_unavailable_retry_interval": 300,
     "scan_path_marker": "",
     "quarantine_dir": "/quarantine",
@@ -1206,7 +1226,8 @@ class SchedulerManager:
         elif not scheduler_running and phase not in {"unconfigured", "config_error", "restart_wait"}:
             phase = "stopped"
 
-        current_scan = deepcopy(self._current_scan) if scheduler_running and phase == "scanning" else None
+        active_scan_phases = {"enumerating", "indexing", "scanning"}
+        current_scan = deepcopy(self._current_scan) if scheduler_running and phase in active_scan_phases else None
 
         payload = {
             "mode": "ui",
@@ -1405,7 +1426,7 @@ class SchedulerManager:
 
         if self._current_scan is not None:
             self._current_scan = None
-            if self._phase in {"scanning", "waiting_lock", "starting", "cycle_complete"}:
+            if self._phase in {"enumerating", "indexing", "scanning", "waiting_lock", "starting", "cycle_complete"}:
                 self._phase = "idle" if self._next_wake else "stopped"
 
         try:
@@ -1521,16 +1542,19 @@ class SchedulerManager:
                 self._last_scan_kind = "FULL"
                 self._last_event = "Historical full scan start detected in log replay."
                 return
-            self._phase = "scanning"
+            self._phase = "enumerating"
             self._last_scan_kind = "FULL"
             self._current_scan_trace = []
             self._current_scan = {
                 "label": "FULL",
                 "display_label": format_scan_label("FULL"),
-                "started_at": self._current_cycle_started_at or utc_now_iso(),
+                "started_at": utc_now_iso(),
+                "stage": "enumerating",
+                "status_message": "Preparing scan roots and building a safe file list.",
+                "enumerated_files": 0,
                 "progress_trace": [],
             }
-            self._last_event = "Full scan started."
+            self._last_event = "Full scan file discovery started."
             return
 
         if line.startswith("=== CHANGED-FILES scan starting ==="):
@@ -1538,16 +1562,129 @@ class SchedulerManager:
                 self._last_scan_kind = "CHANGED"
                 self._last_event = "Historical changed-files scan start detected in log replay."
                 return
-            self._phase = "scanning"
+            self._phase = "enumerating"
             self._last_scan_kind = "CHANGED"
             self._current_scan_trace = []
             self._current_scan = {
                 "label": "CHANGED",
                 "display_label": format_scan_label("CHANGED"),
-                "started_at": self._current_cycle_started_at or utc_now_iso(),
+                "started_at": utc_now_iso(),
+                "stage": "enumerating",
+                "status_message": "Preparing scan roots and finding changed files.",
+                "enumerated_files": 0,
                 "progress_trace": [],
             }
-            self._last_event = "Changed-files scan started."
+            self._last_event = "Changed-files scan file discovery started."
+            return
+
+        enumeration_start_match = ENUMERATION_START_RE.match(line)
+        if enumeration_start_match:
+            if replay:
+                self._last_event = line
+                return
+            label = enumeration_start_match.group("label")
+            if self._current_scan is None or self._current_scan.get("label") != label:
+                self._current_scan_trace = []
+                self._current_scan = {
+                    "label": label,
+                    "display_label": format_scan_label(label),
+                    "started_at": utc_now_iso(),
+                    "enumerated_files": 0,
+                    "progress_trace": [],
+                }
+            self._phase = "enumerating"
+            self._current_scan.update(
+                {
+                    "stage": "enumerating",
+                    "current_path": enumeration_start_match.group("path"),
+                    "enumeration_timeout_seconds": int(enumeration_start_match.group("timeout")),
+                    "stage_started_at": utc_now_iso(),
+                    "status_message": (
+                        f"Walking {enumeration_start_match.group('path')} and building the NUL-safe file list. "
+                        "The final total is not known until enumeration finishes."
+                    ),
+                }
+            )
+            self._last_event = line
+            return
+
+        enumeration_complete_match = ENUMERATION_COMPLETE_RE.match(line)
+        if enumeration_complete_match:
+            if replay:
+                self._last_event = line
+                return
+            label = enumeration_complete_match.group("label")
+            if self._current_scan is not None and self._current_scan.get("label") == label:
+                discovered = int(enumeration_complete_match.group("files"))
+                self._current_scan["enumerated_files"] = int(
+                    self._current_scan.get("enumerated_files", 0)
+                ) + discovered
+                self._current_scan["enumeration_elapsed"] = (
+                    f"{enumeration_complete_match.group('elapsed')}s"
+                )
+                self._current_scan["status_message"] = (
+                    f"Finished {enumeration_complete_match.group('path')}; "
+                    f"{discovered} eligible files were added."
+                )
+            self._last_event = line
+            return
+
+        file_list_complete_match = FILE_LIST_COMPLETE_RE.match(line)
+        if file_list_complete_match:
+            if replay:
+                self._last_event = line
+                return
+            label = file_list_complete_match.group("label")
+            if self._current_scan is not None and self._current_scan.get("label") == label:
+                self._current_scan.update(
+                    {
+                        "stage": "indexing",
+                        "enumerated_files": int(file_list_complete_match.group("files")),
+                        "enumeration_sources": int(file_list_complete_match.group("sources")),
+                        "stage_started_at": utc_now_iso(),
+                        "status_message": "File discovery completed. Preparing to capture file identities and sizes.",
+                    }
+                )
+            self._phase = "indexing"
+            self._last_event = line
+            return
+
+        indexing_start_match = INDEXING_START_RE.match(line)
+        if indexing_start_match:
+            if replay:
+                self._last_event = line
+                return
+            label = indexing_start_match.group("label")
+            if self._current_scan is not None and self._current_scan.get("label") == label:
+                self._current_scan.update(
+                    {
+                        "stage": "indexing",
+                        "stage_started_at": utc_now_iso(),
+                        "status_message": "Capturing each file's identity and size before worker scanning begins.",
+                    }
+                )
+            self._phase = "indexing"
+            self._last_event = line
+            return
+
+        indexing_complete_match = INDEXING_COMPLETE_RE.match(line)
+        if indexing_complete_match:
+            if replay:
+                self._last_event = line
+                return
+            label = indexing_complete_match.group("label")
+            if self._current_scan is not None and self._current_scan.get("label") == label:
+                self._current_scan.update(
+                    {
+                        "stage": "indexing",
+                        "total_files": int(indexing_complete_match.group("files")),
+                        "total_bytes": indexing_complete_match.group("bytes"),
+                        "indexing_elapsed": indexing_complete_match.group("elapsed"),
+                        "status_message": "File identities captured. Starting persistent ClamD workers.",
+                    }
+                )
+            self._phase = "indexing"
+            self._last_event = line
             return
 
         if line.startswith("=== Scan cycle paused due to unavailable scan path ==="):
@@ -1568,6 +1705,8 @@ class SchedulerManager:
         if line.startswith("[WARN]"):
             self._last_warning = line
             self._last_event = line
+            if self._current_scan is not None:
+                self._current_scan["status_message"] = line
 
         scan_start_match = SCAN_START_RE.match(line)
         if scan_start_match:
@@ -1584,8 +1723,30 @@ class SchedulerManager:
                     "started_at": self._current_cycle_started_at or utc_now_iso(),
                     "progress_trace": [],
                 }
+            self._phase = "scanning"
+            self._current_scan["stage"] = "scanning"
+            self._current_scan["status_message"] = "Persistent ClamD workers are actively scanning files."
+            self._current_scan.setdefault("processed_files", 0)
             self._current_scan["total_files"] = int(scan_start_match.group("total"))
             self._current_scan["workers"] = int(scan_start_match.group("workers"))
+            self._last_event = line
+            return
+
+        no_files_match = NO_FILES_RE.match(line)
+        if no_files_match:
+            if replay:
+                self._last_event = line
+                return
+            if self._current_scan is not None and self._current_scan.get("label") == no_files_match.group("label"):
+                self._current_scan.update(
+                    {
+                        "stage": "complete",
+                        "total_files": 0,
+                        "processed_files": 0,
+                        "status_message": "No eligible files were found for this scan.",
+                    }
+                )
+            self._phase = "cycle_complete"
             self._last_event = line
             return
 
@@ -1615,6 +1776,7 @@ class SchedulerManager:
                     "progress_trace": [],
                 }
             self._phase = "scanning"
+            self._current_scan["stage"] = "scanning"
             self._current_scan_trace.append(build_progress_trace_point(progress_match))
             self._current_scan.update(
                 {
@@ -1701,6 +1863,11 @@ class SchedulerManager:
             self._current_scan_trace = []
             self._last_event = line
             return
+
+        if line.startswith("[ERROR]"):
+            self._last_warning = line
+            if self._current_scan is not None:
+                self._current_scan["status_message"] = line
 
         if line.startswith("[FORCE]") or line.startswith("[MANUAL]") or line.startswith("[CHANGED]") or line.startswith("[ERROR]"):
             self._last_event = line
@@ -1796,7 +1963,7 @@ class UIRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             status_payload = MANAGER.get_status()
-            ready_phases = {"idle", "scanning", "cycle_complete", "waiting_lock"}
+            ready_phases = {"idle", "enumerating", "indexing", "scanning", "cycle_complete", "waiting_lock"}
             configured = bool(status_payload["configured"])
             scheduler_running = bool(status_payload["scheduler_running"])
             phase = str(status_payload["phase"])

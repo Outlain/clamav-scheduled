@@ -41,7 +41,7 @@ umask 077
 : "${SCANLOG_MAX_BYTES:=104857600}"
 : "${SCANLOG_ROTATIONS:=5}"
 : "${PATH_CHECK_TIMEOUT:=10}"
-: "${PATH_ENUMERATION_TIMEOUT:=300}"
+: "${PATH_ENUMERATION_TIMEOUT:=1800}"
 : "${PATH_UNAVAILABLE_RETRY_INTERVAL:=300}"
 : "${SCAN_PATH_MARKER:=}"
 : "${EVENT_DIR:=/events}"
@@ -1125,49 +1125,71 @@ append_filtered_scan_list() {
   python3 /usr/local/bin/scan_list_filter.py --input "$RAW_LIST_FILE" --output "$LIST_FILE" --exclude-paths "$EXCLUDE_PATHS" --ignore-paths "$EXTRA_IGNORE_PATHS" --quarantine-path "$QUARANTINE_DIR"
 }
 
-append_scan_path_list() {
+append_path_scan_list() {
   LABEL="$1"
-  SCAN_PATH="$2"
+  SOURCE_PATH="$2"
   LIST_FILE="$3"
   REFERENCE_EPOCH="$4"
   EXTRA_IGNORE_PATHS="$5"
-  RAW_LIST_FILE="$TMP_DIR/${LABEL}_raw_list.nul"
-  REFERENCE_FILE="$TMP_DIR/${LABEL}_reference.timestamp"
+  LIST_KIND="$6"
+  RAW_LIST_FILE="$TMP_DIR/${LABEL}_${LIST_KIND}_raw_list.nul"
+  REFERENCE_FILE="$TMP_DIR/${LABEL}_${LIST_KIND}_reference.timestamp"
+  APPENDED_FILE_COUNT=0
+  ENUMERATION_STARTED_EPOCH=$(date +%s)
 
   : > "$RAW_LIST_FILE"
+  echo "[$LABEL] Enumeration started for $SOURCE_PATH (timeout=${PATH_ENUMERATION_TIMEOUT}s)." | tee -a "$SCANLOG"
 
   if [ "$LABEL" = "CHANGED" ]; then
-    touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      if ! append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"; then
-        rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
-        return 1
-      fi
-      rm -f "$RAW_LIST_FILE"
-      rm -f "$REFERENCE_FILE"
-      return 0
+    if ! touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"; then
+      echo "[WARN] [$LABEL] Could not create the changed-file reference timestamp." | tee -a "$SCANLOG"
+      rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
+      return 1
+    fi
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SOURCE_PATH" -type f \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      RC=0
+    else
+      RC=$?
     fi
   else
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SCAN_PATH" -type f -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      if ! append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"; then
-        rm -f -- "$RAW_LIST_FILE"
-        return 1
-      fi
-      rm -f "$RAW_LIST_FILE"
-      return 0
+    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SOURCE_PATH" -type f -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+      RC=0
+    else
+      RC=$?
     fi
   fi
 
-  RC=$?
-  rm -f "$RAW_LIST_FILE"
-  rm -f "$REFERENCE_FILE"
+  if [ "$RC" -eq 0 ]; then
+    if APPENDED_FILE_COUNT=$(append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS" 2>>"$SCANLOG"); then
+      case "$APPENDED_FILE_COUNT" in
+        ''|*[!0-9]*)
+          echo "[WARN] [$LABEL] Scan-list filter returned an invalid file count for $SOURCE_PATH." | tee -a "$SCANLOG"
+          rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
+          return 1
+          ;;
+      esac
+      ENUMERATION_ELAPSED=$(( $(date +%s) - ENUMERATION_STARTED_EPOCH ))
+      echo "[$LABEL] Enumeration completed for $SOURCE_PATH: eligible_files=${APPENDED_FILE_COUNT} elapsed=${ENUMERATION_ELAPSED}s." | tee -a "$SCANLOG"
+      rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
+      return 0
+    fi
+    echo "[WARN] [$LABEL] Failed filtering enumerated files under $SOURCE_PATH." | tee -a "$SCANLOG"
+    rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
+    return 1
+  fi
+
+  rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
   if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
-    echo "[WARN] [$LABEL] Timed out while enumerating files under $SCAN_PATH. The mount may be unavailable." | tee -a "$SCANLOG"
+    echo "[WARN] [$LABEL] Timed out after ${PATH_ENUMERATION_TIMEOUT}s while enumerating files under $SOURCE_PATH. The mount may be unavailable or the configured timeout may be too short." | tee -a "$SCANLOG"
     return 2
   fi
 
-  echo "[WARN] [$LABEL] Failed enumerating files under $SCAN_PATH (exit=${RC})." | tee -a "$SCANLOG"
+  echo "[WARN] [$LABEL] Failed enumerating files under $SOURCE_PATH (exit=${RC})." | tee -a "$SCANLOG"
   return 1
+}
+
+append_scan_path_list() {
+  append_path_scan_list "$1" "$2" "$3" "$4" "$5" "root"
 }
 
 build_scan_list() {
@@ -1176,6 +1198,7 @@ build_scan_list() {
   REFERENCE_EPOCH="$3"
   EXTRA_IGNORE_PATHS="${4:-}"
   PATH_COUNT=0
+  TOTAL_LIST_FILES=0
   OLD_IFS="$IFS"
 
   capture_scan_root_guard "$LABEL" || return 2
@@ -1195,7 +1218,7 @@ build_scan_list() {
     fi
 
     if append_scan_path_list "$LABEL" "$SCAN_PATH" "$LIST_FILE" "$REFERENCE_EPOCH" "$EXTRA_IGNORE_PATHS"; then
-      :
+      TOTAL_LIST_FILES=$((TOTAL_LIST_FILES + APPENDED_FILE_COUNT))
     else
       RC=$?
       [ "$RC" -eq 2 ] && return 2
@@ -1203,55 +1226,20 @@ build_scan_list() {
     fi
   done
 
-  echo "[$LABEL] Built file list from ${PATH_COUNT} scan path(s)." | tee -a "$SCANLOG"
+  echo "[$LABEL] File-list build completed: eligible_files=${TOTAL_LIST_FILES} sources=${PATH_COUNT}." | tee -a "$SCANLOG"
 }
 
 append_target_scan_path_list() {
   LABEL="$1"
   TARGET_PATH="$2"
-  LIST_FILE="$3"
-  REFERENCE_EPOCH="$4"
-  EXTRA_IGNORE_PATHS="$5"
-  RAW_LIST_FILE="$TMP_DIR/${LABEL}_target_raw_list.nul"
-  REFERENCE_FILE="$TMP_DIR/${LABEL}_target_reference.timestamp"
+  APPENDED_FILE_COUNT=0
 
   if [ ! -e "$TARGET_PATH" ]; then
     echo "[WARN] [$LABEL] Requested target no longer exists: $TARGET_PATH" | tee -a "$SCANLOG"
     return 0
   fi
 
-  : > "$RAW_LIST_FILE"
-
-  if [ "$LABEL" = "CHANGED" ]; then
-    touch -d "@${REFERENCE_EPOCH}" "$REFERENCE_FILE"
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      if ! append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"; then
-        rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
-        return 1
-      fi
-      rm -f "$RAW_LIST_FILE" "$REFERENCE_FILE"
-      return 0
-    fi
-  else
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$TARGET_PATH" -type f -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
-      if ! append_filtered_scan_list "$RAW_LIST_FILE" "$LIST_FILE" "$EXTRA_IGNORE_PATHS"; then
-        rm -f -- "$RAW_LIST_FILE"
-        return 1
-      fi
-      rm -f "$RAW_LIST_FILE"
-      return 0
-    fi
-  fi
-
-  RC=$?
-  rm -f "$RAW_LIST_FILE" "$REFERENCE_FILE"
-  if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
-    echo "[WARN] [$LABEL] Timed out while enumerating requested target $TARGET_PATH. The mount may be unavailable." | tee -a "$SCANLOG"
-    return 2
-  fi
-
-  echo "[WARN] [$LABEL] Failed enumerating requested target $TARGET_PATH (exit=${RC})." | tee -a "$SCANLOG"
-  return 1
+  append_path_scan_list "$LABEL" "$TARGET_PATH" "$3" "$4" "$5" "target"
 }
 
 build_targeted_scan_list() {
@@ -1261,6 +1249,7 @@ build_targeted_scan_list() {
   TARGET_PATHS="$4"
   EXTRA_IGNORE_PATHS="${5:-}"
   TARGET_COUNT=0
+  TOTAL_LIST_FILES=0
   OLD_IFS="$IFS"
 
   capture_scan_root_guard "$LABEL" || return 2
@@ -1287,6 +1276,7 @@ build_targeted_scan_list() {
 
     if append_target_scan_path_list "$LABEL" "$TARGET_PATH" "$LIST_FILE" "$REFERENCE_EPOCH" "$EXTRA_IGNORE_PATHS"; then
       TARGET_COUNT=$((TARGET_COUNT + 1))
+      TOTAL_LIST_FILES=$((TOTAL_LIST_FILES + APPENDED_FILE_COUNT))
     else
       RC=$?
       [ "$RC" -eq 2 ] && return 2
@@ -1294,7 +1284,7 @@ build_targeted_scan_list() {
     fi
   done
 
-  echo "[$LABEL] Built file list from ${TARGET_COUNT} requested target path(s)." | tee -a "$SCANLOG"
+  echo "[$LABEL] File-list build completed: eligible_files=${TOTAL_LIST_FILES} sources=${TARGET_COUNT}." | tee -a "$SCANLOG"
 }
 
 run_scan_list() {

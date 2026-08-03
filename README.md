@@ -96,7 +96,7 @@ These variables apply directly only in `APP_MODE=headless`. In `APP_MODE=ui`, th
 - `SCAN_FAILURE_RETRY_INTERVAL` - seconds to wait before retrying a scheduled scan after a non-path-related failure
 - `FORCE_FULL_POLL_INTERVAL` - seconds between force-full flag checks while the scheduler is otherwise idle; lower values make forced full scans start sooner
 - `PATH_CHECK_TIMEOUT` - seconds allowed for each scan-root health check before treating the path as unavailable
-- `PATH_ENUMERATION_TIMEOUT` - seconds allowed for each per-root `find` pass before treating the path as unavailable
+- `PATH_ENUMERATION_TIMEOUT` - seconds allowed for each per-root `find` pass before treating the path as unavailable (default `1800`; large NAS trees may need more)
 - `PATH_UNAVAILABLE_RETRY_INTERVAL` - seconds to wait before retrying when a configured scan root is unavailable
 - `SCAN_PATH_MARKER` - optional file or directory name expected inside every scan root; use this to detect missing NFS mounts that fall back to an empty local directory
 - `QUARANTINE_DIR` - infected file destination

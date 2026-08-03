@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        append_filtered_paths(
+        written = append_filtered_paths(
             args.input_path,
             args.output_path,
             split_path_list(args.exclude_paths),
@@ -84,6 +84,7 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         print(f"[ERROR] Could not filter scan list: {exc}", file=sys.stderr)
         return 1
+    print(written)
     return 0
 
 
