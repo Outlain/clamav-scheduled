@@ -2,6 +2,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,6 +24,7 @@ clamav_healthcheck = load_script_module("clamav_healthcheck")
 scan_root_guard = load_script_module("scan_root_guard")
 checkpoint_state = load_script_module("checkpoint_state")
 event_writer = load_script_module("event_writer")
+enumerate_scan_files = load_script_module("enumerate_scan_files")
 
 
 class ScanListFilterTests(unittest.TestCase):
@@ -85,6 +87,149 @@ class ScanListFilterTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             print_mock.assert_called_once_with(2)
+
+
+class EnumerationProgressTests(unittest.TestCase):
+    def test_progress_counter_handles_split_nul_delimited_paths(self):
+        progress = enumerate_scan_files.TraversalProgress()
+
+        progress.feed(b"/downloads\0/downloads/first")
+        progress.feed(b" file.bin\0/downloads/final.bin\0")
+
+        self.assertEqual(progress.visited_entries, 3)
+        self.assertEqual(progress.latest_path, b"/downloads/final.bin")
+        self.assertEqual(progress.pending, b"")
+
+    def test_find_command_reports_all_entries_but_lists_only_regular_files(self):
+        command = enumerate_scan_files.build_find_command(
+            "find",
+            "/downloads",
+            "/tmp/files.nul",
+            "/tmp/reference",
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "find",
+                "--",
+                "/downloads",
+                "-print0",
+                "-type",
+                "f",
+                "(",
+                "-newer",
+                "/tmp/reference",
+                "-o",
+                "-cnewer",
+                "/tmp/reference",
+                ")",
+                "-fprint0",
+                "/tmp/files.nul",
+            ],
+        )
+
+    def test_enumerator_preserves_nul_safe_regular_file_list(self):
+        class CaptureLogger:
+            def __init__(self):
+                self.lines = []
+
+            def emit(self, line):
+                self.lines.append(line)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "root"
+            root.mkdir()
+            regular = root / "line\nbreak.bin"
+            regular.write_bytes(b"content")
+            (root / "directory").mkdir()
+            (root / "link").symlink_to(regular)
+            output = Path(temp_dir) / "files.nul"
+            logger = CaptureLogger()
+
+            result = enumerate_scan_files.run_enumeration(
+                label="FULL",
+                source_path=str(root),
+                output_path=output,
+                reference_file=None,
+                timeout_seconds=10,
+                heartbeat_seconds=1,
+                find_binary="find",
+                logger=logger,
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.read_bytes(), os.fsencode(regular) + b"\0")
+
+    def test_changed_enumerator_uses_mtime_or_ctime_checkpoint(self):
+        class CaptureLogger:
+            def emit(self, _line):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "root"
+            root.mkdir()
+            old_file = root / "old.bin"
+            old_file.write_bytes(b"old")
+            time.sleep(0.02)
+            reference = Path(temp_dir) / "reference"
+            reference.touch()
+            time.sleep(0.02)
+            new_file = root / "new.bin"
+            new_file.write_bytes(b"new")
+            output = Path(temp_dir) / "changed.nul"
+
+            result = enumerate_scan_files.run_enumeration(
+                label="CHANGED",
+                source_path=str(root),
+                output_path=output,
+                reference_file=str(reference),
+                timeout_seconds=10,
+                heartbeat_seconds=1,
+                find_binary="find",
+                logger=CaptureLogger(),
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.read_bytes(), os.fsencode(new_file) + b"\0")
+
+    def test_long_enumeration_emits_bounded_progress_heartbeat(self):
+        class CaptureLogger:
+            def __init__(self):
+                self.lines = []
+
+            def emit(self, line):
+                self.lines.append(line)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_find = Path(temp_dir) / "fake-find"
+            fake_find.write_text(
+                "#!/bin/sh\nprintf '/downloads\\0'\nsleep 2\n",
+                encoding="utf-8",
+            )
+            fake_find.chmod(0o700)
+            output = Path(temp_dir) / "files.nul"
+            logger = CaptureLogger()
+
+            result = enumerate_scan_files.run_enumeration(
+                label="FULL",
+                source_path="/downloads",
+                output_path=output,
+                reference_file=None,
+                timeout_seconds=10,
+                heartbeat_seconds=1,
+                find_binary=str(fake_find),
+                logger=logger,
+            )
+
+            self.assertEqual(result, 0)
+            self.assertTrue(
+                any(
+                    "Enumeration progress: visited_entries=1" in line
+                    and 'latest_path="/downloads"' in line
+                    for line in logger.lines
+                )
+            )
 
 
 class DefinitionHealthTests(unittest.TestCase):

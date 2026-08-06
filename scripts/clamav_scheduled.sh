@@ -56,6 +56,7 @@ umask 077
 : "${LARGE_MEDIA_SCAN_TIMEOUT_SECONDS:=21600}"
 : "${MAX_LARGE_MEDIA_WORKERS:=1}"
 : "${FFPROBE_BINARY:=/usr/bin/ffprobe}"
+: "${ENUMERATION_HELPER:=/usr/local/bin/enumerate_scan_files.py}"
 
 reject_deprecated_env() {
   VAR_NAME="$1"
@@ -1146,13 +1147,24 @@ append_path_scan_list() {
       rm -f -- "$RAW_LIST_FILE" "$REFERENCE_FILE"
       return 1
     fi
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SOURCE_PATH" -type f \( -newer "$REFERENCE_FILE" -o -cnewer "$REFERENCE_FILE" \) -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+    if python3 "$ENUMERATION_HELPER" \
+      --label "$LABEL" \
+      --source-path "$SOURCE_PATH" \
+      --output "$RAW_LIST_FILE" \
+      --reference-file "$REFERENCE_FILE" \
+      --timeout-seconds "$PATH_ENUMERATION_TIMEOUT" \
+      --scanlog "$SCANLOG"; then
       RC=0
     else
       RC=$?
     fi
   else
-    if timeout "${PATH_ENUMERATION_TIMEOUT}" find "$SOURCE_PATH" -type f -print0 > "$RAW_LIST_FILE" 2>>"$SCANLOG"; then
+    if python3 "$ENUMERATION_HELPER" \
+      --label "$LABEL" \
+      --source-path "$SOURCE_PATH" \
+      --output "$RAW_LIST_FILE" \
+      --timeout-seconds "$PATH_ENUMERATION_TIMEOUT" \
+      --scanlog "$SCANLOG"; then
       RC=0
     else
       RC=$?

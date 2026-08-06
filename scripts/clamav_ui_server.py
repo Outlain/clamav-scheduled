@@ -85,6 +85,12 @@ ENUMERATION_START_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Enumeration started for (?P<path>.+) "
     r"\(timeout=(?P<timeout>\d+)s\)\.$"
 )
+ENUMERATION_PROGRESS_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Enumeration progress: "
+    r"visited_entries=(?P<visited>\d+) new_entries=(?P<new>\d+) "
+    r"window_seconds=(?P<window>\d+) raw_list_bytes=(?P<list_bytes>\d+) "
+    r"elapsed=(?P<elapsed>\d+)s latest_path=(?P<latest>.+)$"
+)
 ENUMERATION_COMPLETE_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Enumeration completed for (?P<path>.+): "
     r"eligible_files=(?P<files>\d+) elapsed=(?P<elapsed>\d+)s\.$"
@@ -681,6 +687,16 @@ def sanitize_line(line: str) -> str:
 
 def format_scan_label(label: str) -> str:
     return "Full Scan" if label == "FULL" else "Changed-Files Scan"
+
+
+def parse_enumeration_path(value: str) -> str | None:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return value[:1024]
+    if decoded is None:
+        return None
+    return str(decoded)[:1024]
 
 
 HISTORY_DEDUPE_WINDOW_SECONDS = 7200
@@ -1604,6 +1620,11 @@ class SchedulerManager:
                     "stage": "enumerating",
                     "current_path": enumeration_start_match.group("path"),
                     "enumeration_timeout_seconds": int(enumeration_start_match.group("timeout")),
+                    "enumeration_visited_entries": 0,
+                    "enumeration_new_entries": 0,
+                    "enumeration_window_seconds": 0,
+                    "enumeration_raw_list_bytes": 0,
+                    "latest_discovered_path": None,
                     "stage_started_at": utc_now_iso(),
                     "status_message": (
                         f"Walking {enumeration_start_match.group('path')} and building the NUL-safe file list. "
@@ -1611,6 +1632,51 @@ class SchedulerManager:
                     ),
                 }
             )
+            self._last_event = line
+            return
+
+        enumeration_progress_match = ENUMERATION_PROGRESS_RE.match(line)
+        if enumeration_progress_match:
+            if replay:
+                self._last_event = line
+                return
+            label = enumeration_progress_match.group("label")
+            if self._current_scan is not None and self._current_scan.get("label") == label:
+                visited = int(enumeration_progress_match.group("visited"))
+                new_entries = int(enumeration_progress_match.group("new"))
+                window_seconds = int(enumeration_progress_match.group("window"))
+                latest_path = parse_enumeration_path(
+                    enumeration_progress_match.group("latest")
+                )
+                if new_entries > 0:
+                    status_message = (
+                        f"Visited {visited} filesystem entries in the current path "
+                        f"(+{new_entries} in the last {window_seconds}s). "
+                        f"Latest successfully visited path: {latest_path or '<none>'}. "
+                        "The final eligible-file total is not known yet."
+                    )
+                else:
+                    status_message = (
+                        f"Visited {visited} filesystem entries in the current path. "
+                        f"No new entries were reported in the last {window_seconds}s; "
+                        f"the traversal is still running. Latest successfully visited path: "
+                        f"{latest_path or '<none>'}."
+                    )
+                self._current_scan.update(
+                    {
+                        "stage": "enumerating",
+                        "enumeration_visited_entries": visited,
+                        "enumeration_new_entries": new_entries,
+                        "enumeration_window_seconds": window_seconds,
+                        "enumeration_raw_list_bytes": int(
+                            enumeration_progress_match.group("list_bytes")
+                        ),
+                        "enumeration_elapsed": f"{enumeration_progress_match.group('elapsed')}s",
+                        "latest_discovered_path": latest_path,
+                        "status_message": status_message,
+                    }
+                )
+            self._phase = "enumerating"
             self._last_event = line
             return
 

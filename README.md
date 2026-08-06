@@ -20,6 +20,7 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Separate full-scan and changed-scan concurrency controls
 - Richer scan metrics including bytes, infected/error counts, per-root summaries, and slowest files
 - Live progress logs report the first completed file, regular throughput checkpoints, and 30-second worker/queue heartbeats
+- File-list discovery emits a low-overhead heartbeat every 30 seconds with entries visited, entries added during the last window, temporary-list size, elapsed time, and the latest successfully visited path
 - Reports isolated files that vanish after list-building and fails the run when the configured count/percentage is suspicious
 - Pauses and retries if any configured scan root becomes unavailable
 - Captures scan-root and optional marker identities before enumeration and verifies them again after all workers finish
@@ -96,7 +97,7 @@ These variables apply directly only in `APP_MODE=headless`. In `APP_MODE=ui`, th
 - `SCAN_FAILURE_RETRY_INTERVAL` - seconds to wait before retrying a scheduled scan after a non-path-related failure
 - `FORCE_FULL_POLL_INTERVAL` - seconds between force-full flag checks while the scheduler is otherwise idle; lower values make forced full scans start sooner
 - `PATH_CHECK_TIMEOUT` - seconds allowed for each scan-root health check before treating the path as unavailable
-- `PATH_ENUMERATION_TIMEOUT` - seconds allowed for each per-root `find` pass before treating the path as unavailable (default `1800`; large NAS trees may need more)
+- `PATH_ENUMERATION_TIMEOUT` - seconds allowed for each per-root `find` pass before treating the path as unavailable (default `1800`; large NAS trees may need more). While it runs, fixed 30-second heartbeats show traversal progress without reading file contents.
 - `PATH_UNAVAILABLE_RETRY_INTERVAL` - seconds to wait before retrying when a configured scan root is unavailable
 - `SCAN_PATH_MARKER` - optional file or directory name expected inside every scan root; use this to detect missing NFS mounts that fall back to an empty local directory
 - `QUARANTINE_DIR` - infected file destination
@@ -182,6 +183,7 @@ The UI currently includes:
 - initial setup and settings editing
 - live scheduler state
 - current scan progress
+- live file-list discovery counts and the latest successfully visited path; this is intentionally an indeterminate traversal because the final total is unknown until `find` finishes
 - running-average and since-last-update throughput/data rates
 - recent scan history
 - recent log tail
@@ -190,6 +192,8 @@ The UI currently includes:
 - on-demand changed-file scans using either "since last successful checkpoint" or a custom recent lookback window
 - optional target paths and optional one-off ignore paths for on-demand changed-file scans
 - restart-scanner action for restarting only the scanner process inside the container
+
+Enumeration errors from `find` are escaped and written to both the scan log and the UI/container log as they occur. To prevent a damaged mount from flooding logs indefinitely, the first 100 diagnostic lines are shown and any additional count is summarized. A blocked NFS operation may produce no filesystem error of its own; in that case, a heartbeat with zero new entries shows that the process is still alive but has made no observable path progress during that window.
 
 Recommended UI-mode mounts:
 

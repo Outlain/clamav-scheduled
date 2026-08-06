@@ -29,15 +29,16 @@ TMP_DIR="$TEST_ROOT/work"
 EXCLUDE_PATHS=""
 QUARANTINE_DIR="$TEST_ROOT/quarantine"
 PATH_ENUMERATION_TIMEOUT=5
+ENUMERATION_HELPER="$REPOSITORY_DIR/scripts/enumerate_scan_files.py"
 
 : > "$TEST_ROOT/list.nul"
 append_scan_path_list FULL "$TEST_ROOT/root" "$TEST_ROOT/list.nul" 0 ""
 test "$APPENDED_FILE_COUNT" -eq 2
 grep -q 'eligible_files=2' "$SCANLOG"
 
-timeout() {
-  return 124
-}
+TIMEOUT_HELPER="$TEST_ROOT/timeout-helper.py"
+printf '%s\n' 'raise SystemExit(124)' > "$TIMEOUT_HELPER"
+ENUMERATION_HELPER="$TIMEOUT_HELPER"
 
 : > "$TEST_ROOT/timeout-list.nul"
 if append_scan_path_list FULL "$TEST_ROOT/root" "$TEST_ROOT/timeout-list.nul" 0 ""; then

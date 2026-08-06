@@ -42,6 +42,17 @@ function setVisible(id, visible) {
   $(id).classList.toggle("hidden", !visible);
 }
 
+function formatByteCount(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KiB", "MiB", "GiB"];
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const amount = bytes / (1024 ** unitIndex);
+  return `${amount.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -272,10 +283,12 @@ function updateCurrentScan(scan) {
     progressBar.style.width = "38%";
     setText("progress-percent", "Preparing");
     if (stage === "enumerating") {
-      const discovered = Number(scan.enumerated_files || 0);
+      const visited = Number(scan.enumeration_visited_entries || 0);
       setText(
         "progress-numbers",
-        discovered > 0 ? `${discovered} eligible files discovered` : "Discovering files; total not known yet",
+        visited > 0
+          ? `${visited.toLocaleString()} filesystem entries visited in current path`
+          : "Discovering files; total not known yet",
       );
     } else {
       const discovered = Number(scan.enumerated_files || scan.total_files || 0);
@@ -284,7 +297,14 @@ function updateCurrentScan(scan) {
         discovered > 0 ? `${discovered} files awaiting identity indexing` : "Indexing the completed file list",
       );
     }
-    setText("bytes-progress", scan.total_bytes ? `Total ${scan.total_bytes}` : "Calculated during indexing");
+    if (stage === "enumerating") {
+      setText(
+        "bytes-progress",
+        `Temporary candidate list ${formatByteCount(scan.enumeration_raw_list_bytes)}`,
+      );
+    } else {
+      setText("bytes-progress", scan.total_bytes ? `Total ${scan.total_bytes}` : "Calculated during indexing");
+    }
   } else {
     progressBar.style.width = `${scan.percent || 0}%`;
     setText("progress-percent", `${scan.percent || 0}%`);

@@ -547,6 +547,21 @@ class UISchedulerManagerTests(unittest.TestCase):
                 self.assertEqual(manager._current_scan["enumeration_timeout_seconds"], 1800)
 
                 manager._handle_log_line(
+                    '[FULL] Enumeration progress: visited_entries=1234 new_entries=234 '
+                    'window_seconds=30 raw_list_bytes=45678 elapsed=60s '
+                    'latest_path="/downloads/media/example.mkv"'
+                )
+
+                self.assertEqual(manager._current_scan["enumeration_visited_entries"], 1234)
+                self.assertEqual(manager._current_scan["enumeration_new_entries"], 234)
+                self.assertEqual(manager._current_scan["enumeration_raw_list_bytes"], 45678)
+                self.assertEqual(
+                    manager._current_scan["latest_discovered_path"],
+                    "/downloads/media/example.mkv",
+                )
+                self.assertIn("Latest successfully visited path", manager._current_scan["status_message"])
+
+                manager._handle_log_line(
                     "[FULL] Enumeration completed for /downloads: eligible_files=42 elapsed=17s."
                 )
                 manager._handle_log_line(
