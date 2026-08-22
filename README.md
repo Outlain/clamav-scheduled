@@ -10,8 +10,8 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Validates oversized video containers with `ffprobe` and reads every byte through bounded overlapping ClamD windows
 - Verifies device, inode, size, modification time, and change time before scanning and again before quarantine
 - Uses NUL-delimited enumeration, so filenames containing newlines, tabs, colons, or non-UTF-8 bytes remain intact
-- Time-based full-scan schedule using `FULL_SCAN_DAYS` and `FULL_SCAN_TIMES`
-- Time-based changed-files schedule using `CHANGED_SCAN_DAYS` and `CHANGED_SCAN_TIMES`
+- Calendar-based full-scan schedules supporting weekly, monthly, yearly, quarterly, and last-day rules
+- The same calendar flexibility for changed-files scans, with old weekday/time configurations preserved
 - Incremental changed-files scans between full scans
 - Supports multiple scan roots with `SCAN_PATHS`
 - Quarantines infected files
@@ -91,8 +91,12 @@ These variables apply directly only in `APP_MODE=headless`. In `APP_MODE=ui`, th
 - `FULL_CHUNK_SIZE` - optional fixed full-scan progress interval override; `0` keeps dynamic sizing
 - `CHANGED_CHUNK_SIZE` - optional fixed changed-scan progress interval override; `0` keeps dynamic sizing
 - `FULL_SCAN_DAYS` - comma-separated days for scheduled full scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`; defaults to `sun`
+- `FULL_SCAN_MONTHS` - comma-separated month numbers `1`-`12`, or `*` for every month; defaults to `*`
+- `FULL_SCAN_MONTH_DAYS` - comma-separated dates `1`-`31`, `last`, or `*` for every valid date; defaults to `*`
 - `FULL_SCAN_TIMES` - required comma-separated `HH:MM` times for scheduled full scans in the container timezone
 - `CHANGED_SCAN_DAYS` - comma-separated days for scheduled changed-file scans; accepts `mon`-`sun`, full day names, `1`-`7`, or `*`; defaults to `*`
+- `CHANGED_SCAN_MONTHS` - comma-separated month numbers `1`-`12`, or `*` for every month; defaults to `*`
+- `CHANGED_SCAN_MONTH_DAYS` - comma-separated dates `1`-`31`, `last`, or `*` for every valid date; defaults to `*`
 - `CHANGED_SCAN_TIMES` - required comma-separated `HH:MM` times for scheduled changed-file scans in the container timezone
 - `SCAN_FAILURE_RETRY_INTERVAL` - seconds to wait before retrying a scheduled scan after a non-path-related failure
 - `FORCE_FULL_POLL_INTERVAL` - seconds between force-full flag checks while the scheduler is otherwise idle; lower values make forced full scans start sooner
@@ -266,14 +270,48 @@ Do not place `STATE_DIR`, `RUNTIME_DIR`, `TMP_DIR`, definitions, or `SCANLOG` in
 
 ## Scan schedules
 
-Use `*_SCAN_DAYS` plus `*_SCAN_TIMES` to define when scans should run. `CHANGED_SCAN_TIMES` and `FULL_SCAN_TIMES` are required.
+Each schedule combines four filters: weekdays, months, days of the month, and
+times. All selected filters must match. `*` means unrestricted for that filter,
+and `last` selects the final valid date of a month. This keeps the original
+weekday/time format while permitting calendar intervals without another daemon
+or dependency.
+
+`CHANGED_SCAN_TIMES` and `FULL_SCAN_TIMES` remain required. The UI exposes the
+same fields; select all seven weekdays when weekday should not restrict a
+monthly or yearly rule.
+
 
 Examples:
+
+Existing weekly behavior remains valid without adding the new variables:
 
 - `CHANGED_SCAN_DAYS=mon,tue,wed,thu,fri`
 - `CHANGED_SCAN_TIMES=09:00,13:00,17:00`
 - `FULL_SCAN_DAYS=sun`
 - `FULL_SCAN_TIMES=03:30`
+
+Monthly on the first day at the configured full-scan time:
+
+- `FULL_SCAN_DAYS=*`
+- `FULL_SCAN_MONTHS=*`
+- `FULL_SCAN_MONTH_DAYS=1`
+
+Yearly on January 1:
+
+- `FULL_SCAN_DAYS=*`
+- `FULL_SCAN_MONTHS=1`
+- `FULL_SCAN_MONTH_DAYS=1`
+
+Quarterly on the first day of January, April, July, and October:
+
+- `FULL_SCAN_DAYS=*`
+- `FULL_SCAN_MONTHS=1,4,7,10`
+- `FULL_SCAN_MONTH_DAYS=1`
+
+For the final day of every month, use `FULL_SCAN_DAYS=*`,
+`FULL_SCAN_MONTHS=*`, and `FULL_SCAN_MONTH_DAYS=last`. A numeric date that does
+not exist in a selected month is skipped; a combination that can never occur,
+such as February 30, is rejected during configuration validation.
 
 Schedules are evaluated in the container timezone from `TZ`.
 
@@ -331,7 +369,7 @@ internal `UI_BIND` setting.
 
 ## Image and update policy
 
-The image uses Alpine `3.24.1` pinned by its multi-architecture OCI digest and ClamAV `1.4.5-r0` pinned as a build argument. Alpine is used because it provides a small, supported runtime with maintained `amd64` and `arm64` packages; the `v3.24` branch is supported through June 2028. Each build applies patched packages from that same stable branch but never jumps to a new Alpine branch. ClamAV `1.4` is the current long-term-support line, and `1.4.5` includes the July 2026 security fixes. See the [Alpine release branches](https://www.alpinelinux.org/releases/), [Alpine 3.24.1 release](https://www.alpinelinux.org/posts/Alpine-3.24.1-released.html), and [ClamAV end-of-life table](https://docs.clamav.net/faq/faq-eol.html).
+The image uses Alpine `3.24.1` pinned by its multi-architecture OCI digest and ClamAV `1.4.6-r0` pinned as a build argument. Alpine is used because it provides a small, supported runtime with maintained `amd64` and `arm64` packages; the `v3.24` branch is supported through June 2028. Each build applies patched packages from that same stable branch but never jumps to a new Alpine branch. ClamAV `1.4` is the current long-term-support line, and `1.4.6` is the reviewed package revision. See the [Alpine release branches](https://www.alpinelinux.org/releases/), [Alpine 3.24.1 release](https://www.alpinelinux.org/posts/Alpine-3.24.1-released.html), and [ClamAV end-of-life table](https://docs.clamav.net/faq/faq-eol.html).
 
 `latest` is a discovery signal, not a reproducible deployment input. General OS patch revisions are updated only while building and are captured in that image's SBOM and digest; the engine is held for explicit compatibility review. Automatically replacing packages inside a running security scanner would:
 

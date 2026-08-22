@@ -70,6 +70,17 @@ function joinCsv(values) {
   return (values || []).join(",");
 }
 
+function joinCalendarFilter(values, maximum) {
+  const normalized = (values || []).map((value) => String(value));
+  const numeric = new Set(normalized.filter((value) => /^\d+$/.test(value)).map(Number));
+  const coversEveryValue = numeric.size === maximum
+    && Array.from({ length: maximum }, (_, index) => index + 1).every((value) => numeric.has(value));
+  if (coversEveryValue) {
+    return "*";
+  }
+  return normalized.join(",");
+}
+
 function formatPhase(phase) {
   const labels = {
     unconfigured: "Waiting For Setup",
@@ -122,7 +133,11 @@ function populateForm(config) {
     scan_paths: joinLines(config.scan_paths),
     exclude_paths: joinLines(config.exclude_paths),
     changed_scan_times: joinCsv(config.changed_scan_times),
+    changed_scan_months: joinCalendarFilter(config.changed_scan_months, 12),
+    changed_scan_month_days: joinCalendarFilter(config.changed_scan_month_days, 31),
     full_scan_times: joinCsv(config.full_scan_times),
+    full_scan_months: joinCalendarFilter(config.full_scan_months, 12),
+    full_scan_month_days: joinCalendarFilter(config.full_scan_month_days, 31),
     full_scan_parallel_jobs: config.full_scan_parallel_jobs,
     changed_scan_parallel_jobs: config.changed_scan_parallel_jobs,
     full_progress_steps: config.full_progress_steps,
@@ -180,8 +195,12 @@ function collectFormPayload() {
     scan_paths: splitMultiline(form.scan_paths.value),
     exclude_paths: splitMultiline(form.exclude_paths.value),
     changed_scan_days: collectCheckboxValues("changed_scan_days"),
+    changed_scan_months: splitCsv(form.changed_scan_months.value),
+    changed_scan_month_days: splitCsv(form.changed_scan_month_days.value),
     changed_scan_times: splitCsv(form.changed_scan_times.value),
     full_scan_days: collectCheckboxValues("full_scan_days"),
+    full_scan_months: splitCsv(form.full_scan_months.value),
+    full_scan_month_days: splitCsv(form.full_scan_month_days.value),
     full_scan_times: splitCsv(form.full_scan_times.value),
     full_scan_parallel_jobs: Number(form.full_scan_parallel_jobs.value),
     changed_scan_parallel_jobs: Number(form.changed_scan_parallel_jobs.value),

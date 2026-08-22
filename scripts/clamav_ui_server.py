@@ -22,6 +22,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from calendar_schedule import normalize_schedule
+
 
 DAY_LABELS = {
     1: "Mon",
@@ -33,35 +39,6 @@ DAY_LABELS = {
     7: "Sun",
 }
 
-DAY_NAME_TO_NUMBER = {
-    "1": 1,
-    "mon": 1,
-    "monday": 1,
-    "2": 2,
-    "tue": 2,
-    "tues": 2,
-    "tuesday": 2,
-    "3": 3,
-    "wed": 3,
-    "weds": 3,
-    "wednesday": 3,
-    "4": 4,
-    "thu": 4,
-    "thur": 4,
-    "thurs": 4,
-    "thursday": 4,
-    "5": 5,
-    "fri": 5,
-    "friday": 5,
-    "6": 6,
-    "sat": 6,
-    "saturday": 6,
-    "7": 7,
-    "sun": 7,
-    "sunday": 7,
-}
-
-TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 MAX_JSON_BODY_BYTES = 64 * 1024
 MAX_CLAMD_THREADS = 64
 MAX_SCAN_WORKERS = 64
@@ -194,8 +171,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "full_chunk_size": 0,
     "changed_chunk_size": 0,
     "changed_scan_days": [1, 2, 3, 4, 5, 6, 7],
+    "changed_scan_months": list(range(1, 13)),
+    "changed_scan_month_days": list(range(1, 32)),
     "changed_scan_times": ["01:00", "13:00"],
     "full_scan_days": [7],
+    "full_scan_months": list(range(1, 13)),
+    "full_scan_month_days": list(range(1, 32)),
     "full_scan_times": ["03:30"],
     "scan_failure_retry_interval": 300,
     "force_full_poll_interval": 60,
@@ -212,8 +193,12 @@ REPAIR_LIST_FIELDS = {
     "scan_paths": ":",
     "exclude_paths": ":",
     "changed_scan_days": ",",
+    "changed_scan_months": ",",
+    "changed_scan_month_days": ",",
     "changed_scan_times": ",",
     "full_scan_days": ",",
+    "full_scan_months": ",",
+    "full_scan_month_days": ",",
     "full_scan_times": ",",
 }
 
@@ -411,65 +396,6 @@ def normalize_scan_path_marker(value: Any) -> str:
     return marker
 
 
-def normalize_days(value: Any, field_name: str) -> list[int]:
-    if value is None or value == "":
-        raise ValueError(f"{field_name} must include at least one day.")
-
-    if isinstance(value, str):
-        tokens = [part.strip().lower() for part in value.split(",")]
-    elif isinstance(value, list):
-        tokens = [str(part).strip().lower() for part in value]
-    else:
-        raise ValueError(f"{field_name} must be a list of day values.")
-
-    normalized: list[int] = []
-    seen: set[int] = set()
-    for token in tokens:
-        if not token:
-            continue
-        if token == "*":
-            return [1, 2, 3, 4, 5, 6, 7]
-        if token not in DAY_NAME_TO_NUMBER:
-            raise ValueError(f"Invalid day value in {field_name}: {token}")
-        day_number = DAY_NAME_TO_NUMBER[token]
-        if day_number not in seen:
-            seen.add(day_number)
-            normalized.append(day_number)
-
-    if not normalized:
-        raise ValueError(f"{field_name} must include at least one day.")
-
-    return sorted(normalized)
-
-
-def normalize_times(value: Any, field_name: str) -> list[str]:
-    if value is None or value == "":
-        raise ValueError(f"{field_name} must include at least one time.")
-
-    if isinstance(value, str):
-        tokens = [part.strip() for part in value.split(",")]
-    elif isinstance(value, list):
-        tokens = [str(part).strip() for part in value]
-    else:
-        raise ValueError(f"{field_name} must be a list of HH:MM values.")
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for token in tokens:
-        if not token:
-            continue
-        if not TIME_RE.match(token):
-            raise ValueError(f"Invalid time value in {field_name}: {token}")
-        if token not in seen:
-            seen.add(token)
-            normalized.append(token)
-
-    if not normalized:
-        raise ValueError(f"{field_name} must include at least one time.")
-
-    return sorted(normalized)
-
-
 def normalize_optional_string(value: Any) -> str:
     if value is None:
         return ""
@@ -546,6 +472,21 @@ def validate_and_normalize_config(
     if preserve_updated_at:
         updated_at = normalize_optional_string(normalized.get("updated_at")) or updated_at
 
+    changed_schedule = normalize_schedule(
+        normalized.get("changed_scan_days"),
+        normalized.get("changed_scan_months"),
+        normalized.get("changed_scan_month_days"),
+        normalized.get("changed_scan_times"),
+        prefix="changed_scan",
+    )
+    full_schedule = normalize_schedule(
+        normalized.get("full_scan_days"),
+        normalized.get("full_scan_months"),
+        normalized.get("full_scan_month_days"),
+        normalized.get("full_scan_times"),
+        prefix="full_scan",
+    )
+
     result = {
         "version": 1,
         "tz": tz_value,
@@ -590,10 +531,14 @@ def validate_and_normalize_config(
             minimum=0,
             maximum=MAX_PROGRESS_INTERVAL,
         ),
-        "changed_scan_days": normalize_days(normalized.get("changed_scan_days"), "changed_scan_days"),
-        "changed_scan_times": normalize_times(normalized.get("changed_scan_times"), "changed_scan_times"),
-        "full_scan_days": normalize_days(normalized.get("full_scan_days"), "full_scan_days"),
-        "full_scan_times": normalize_times(normalized.get("full_scan_times"), "full_scan_times"),
+        "changed_scan_days": list(changed_schedule.weekdays),
+        "changed_scan_months": list(changed_schedule.months),
+        "changed_scan_month_days": list(changed_schedule.month_days),
+        "changed_scan_times": list(changed_schedule.times),
+        "full_scan_days": list(full_schedule.weekdays),
+        "full_scan_months": list(full_schedule.months),
+        "full_scan_month_days": list(full_schedule.month_days),
+        "full_scan_times": list(full_schedule.times),
         "scan_failure_retry_interval": normalize_int(
             normalized.get("scan_failure_retry_interval"),
             "scan_failure_retry_interval",
@@ -659,8 +604,14 @@ def serialize_config_for_scheduler(config: dict[str, Any]) -> dict[str, str]:
         "FULL_CHUNK_SIZE": str(config["full_chunk_size"]),
         "CHANGED_CHUNK_SIZE": str(config["changed_chunk_size"]),
         "CHANGED_SCAN_DAYS": ",".join(str(day) for day in config["changed_scan_days"]),
+        "CHANGED_SCAN_MONTHS": ",".join(str(month) for month in config["changed_scan_months"]),
+        "CHANGED_SCAN_MONTH_DAYS": ",".join(
+            str(day) for day in config["changed_scan_month_days"]
+        ),
         "CHANGED_SCAN_TIMES": ",".join(config["changed_scan_times"]),
         "FULL_SCAN_DAYS": ",".join(str(day) for day in config["full_scan_days"]),
+        "FULL_SCAN_MONTHS": ",".join(str(month) for month in config["full_scan_months"]),
+        "FULL_SCAN_MONTH_DAYS": ",".join(str(day) for day in config["full_scan_month_days"]),
         "FULL_SCAN_TIMES": ",".join(config["full_scan_times"]),
         "SCAN_FAILURE_RETRY_INTERVAL": str(config["scan_failure_retry_interval"]),
         "FORCE_FULL_POLL_INTERVAL": str(config["force_full_poll_interval"]),

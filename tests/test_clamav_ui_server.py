@@ -40,6 +40,36 @@ class UIConfigValidationTests(unittest.TestCase):
             self.assertEqual(normalized["changed_scan_times"], ["07:00", "14:00"])
             self.assertEqual(normalized["full_scan_days"], [7])
 
+    def test_old_weekly_config_receives_unrestricted_calendar_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            normalized = clamav_ui_server.validate_and_normalize_config(
+                {
+                    "scan_paths": [temp_dir],
+                    "full_scan_days": [7],
+                    "full_scan_times": ["03:30"],
+                }
+            )
+
+            self.assertEqual(normalized["full_scan_days"], [7])
+            self.assertEqual(normalized["full_scan_months"], list(range(1, 13)))
+            self.assertEqual(normalized["full_scan_month_days"], list(range(1, 32)))
+
+    def test_validate_and_normalize_config_accepts_yearly_schedule(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            normalized = clamav_ui_server.validate_and_normalize_config(
+                {
+                    "scan_paths": [temp_dir],
+                    "full_scan_days": "*",
+                    "full_scan_months": [1],
+                    "full_scan_month_days": [1],
+                    "full_scan_times": ["03:30"],
+                }
+            )
+
+            self.assertEqual(normalized["full_scan_days"], list(range(1, 8)))
+            self.assertEqual(normalized["full_scan_months"], [1])
+            self.assertEqual(normalized["full_scan_month_days"], [1])
+
     def test_health_configuration_error_is_safe_for_one_line_output(self):
         self.assertEqual(
             clamav_ui_server.health_detail("bad value\r\nnext line"),
@@ -173,6 +203,8 @@ class UIConfigValidationTests(unittest.TestCase):
         serialized = clamav_ui_server.serialize_config_for_scheduler(config)
 
         self.assertEqual(serialized["FORCE_FULL_FLAG"], "/state/force_full_scan.flag")
+        self.assertEqual(serialized["FULL_SCAN_MONTHS"], "1,2,3,4,5,6,7,8,9,10,11,12")
+        self.assertEqual(serialized["FULL_SCAN_MONTH_DAYS"], ",".join(str(day) for day in range(1, 32)))
 
     def test_validate_manual_request_paths_rejects_paths_outside_scan_roots(self):
         with tempfile.TemporaryDirectory() as temp_dir:

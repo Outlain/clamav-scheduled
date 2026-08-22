@@ -224,20 +224,54 @@
 
           <section class="form-section">
             <h3>Changed-File Schedule</h3>
+            <p class="section-copy">
+              Every selected calendar filter must match. Use * for every month or every day of the month.
+            </p>
+            <p class="section-copy"><strong>Weekdays</strong> — select all seven when weekday should not restrict the schedule.</p>
             <div class="day-picker" data-field="changed_scan_days"></div>
-            <label class="full-width">
-              <span>Changed Scan Times</span>
-              <input name="changed_scan_times" type="text" required placeholder="07:00,14:00,20:00">
-            </label>
+            <div class="field-grid">
+              <label>
+                <span>Months</span>
+                <input name="changed_scan_months" type="text" required placeholder="* or 1,4,7,10">
+                <small>* means every month; otherwise use month numbers 1-12.</small>
+              </label>
+              <label>
+                <span>Days Of Month</span>
+                <input name="changed_scan_month_days" type="text" required placeholder="* or 1,15,last">
+                <small>* means every valid date; `last` means the final day of each selected month.</small>
+              </label>
+              <label>
+                <span>Changed Scan Times</span>
+                <input name="changed_scan_times" type="text" required placeholder="07:00,14:00,20:00">
+                <small>Comma-separated 24-hour times in the configured timezone.</small>
+              </label>
+            </div>
           </section>
 
           <section class="form-section">
             <h3>Full Scan Schedule</h3>
+            <p class="section-copy">
+              Every selected calendar filter must match. Use * for every month or every day of the month.
+            </p>
+            <p class="section-copy"><strong>Weekdays</strong> — select all seven when weekday should not restrict the schedule.</p>
             <div class="day-picker" data-field="full_scan_days"></div>
-            <label class="full-width">
-              <span>Full Scan Times</span>
-              <input name="full_scan_times" type="text" required placeholder="03:30">
-            </label>
+            <div class="field-grid">
+              <label>
+                <span>Months</span>
+                <input name="full_scan_months" type="text" required placeholder="* or 1,4,7,10">
+                <small>* means every month; otherwise use month numbers 1-12.</small>
+              </label>
+              <label>
+                <span>Days Of Month</span>
+                <input name="full_scan_month_days" type="text" required placeholder="* or 1,15,last">
+                <small>* means every valid date; `last` means the final day of each selected month.</small>
+              </label>
+              <label>
+                <span>Full Scan Times</span>
+                <input name="full_scan_times" type="text" required placeholder="03:30">
+                <small>Comma-separated 24-hour times in the configured timezone.</small>
+              </label>
+            </div>
           </section>
 
           <section class="form-section">
