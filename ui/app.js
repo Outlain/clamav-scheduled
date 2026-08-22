@@ -5,14 +5,31 @@ const state = {
 };
 
 const dayOptions = [
-  { value: 1, label: "Mon" },
-  { value: 2, label: "Tue" },
-  { value: 3, label: "Wed" },
-  { value: 4, label: "Thu" },
-  { value: 5, label: "Fri" },
-  { value: 6, label: "Sat" },
-  { value: 7, label: "Sun" },
+  { value: 1, label: "Mon", longLabel: "Monday" },
+  { value: 2, label: "Tue", longLabel: "Tuesday" },
+  { value: 3, label: "Wed", longLabel: "Wednesday" },
+  { value: 4, label: "Thu", longLabel: "Thursday" },
+  { value: 5, label: "Fri", longLabel: "Friday" },
+  { value: 6, label: "Sat", longLabel: "Saturday" },
+  { value: 7, label: "Sun", longLabel: "Sunday" },
 ];
+
+const monthOptions = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+].map((label, index) => ({ value: index + 1, label }));
+
+const allWeekdays = dayOptions.map((day) => day.value);
 
 function $(id) {
   return document.getElementById(id);
@@ -70,8 +87,18 @@ function joinCsv(values) {
   return (values || []).join(",");
 }
 
+function calendarValues(values) {
+  if (Array.isArray(values)) {
+    return values;
+  }
+  if (typeof values === "string") {
+    return values.split(",").map((value) => value.trim()).filter(Boolean);
+  }
+  return [];
+}
+
 function joinCalendarFilter(values, maximum) {
-  const normalized = (values || []).map((value) => String(value));
+  const normalized = calendarValues(values).map((value) => String(value));
   const numeric = new Set(normalized.filter((value) => /^\d+$/.test(value)).map(Number));
   const coversEveryValue = numeric.size === maximum
     && Array.from({ length: maximum }, (_, index) => index + 1).every((value) => numeric.has(value));
@@ -79,6 +106,208 @@ function joinCalendarFilter(values, maximum) {
     return "*";
   }
   return normalized.join(",");
+}
+
+function coversNumericRange(values, maximum) {
+  const entries = calendarValues(values);
+  if (entries.length === 1 && entries[0] === "*") {
+    return true;
+  }
+  const normalized = new Set(entries.map(Number).filter(Number.isInteger));
+  return normalized.size === maximum
+    && Array.from({ length: maximum }, (_, index) => index + 1).every((value) => normalized.has(value));
+}
+
+function inferScheduleFrequency(config, prefix) {
+  const weekdays = calendarValues(config[`${prefix}_scan_days`]);
+  const months = calendarValues(config[`${prefix}_scan_months`]);
+  const monthDays = calendarValues(config[`${prefix}_scan_month_days`]);
+  const everyWeekday = coversNumericRange(weekdays, 7);
+  const everyMonth = coversNumericRange(months, 12);
+  const everyMonthDay = coversNumericRange(monthDays, 31);
+
+  if (everyWeekday && everyMonth && everyMonthDay) {
+    return "daily";
+  }
+  if (weekdays.length === 1 && everyMonth && everyMonthDay) {
+    return "weekly";
+  }
+  if (everyWeekday && everyMonth && monthDays.length === 1) {
+    return "monthly";
+  }
+  if (everyWeekday && months.length === 1 && monthDays.length === 1) {
+    return "yearly";
+  }
+  return "advanced";
+}
+
+function filtersForScheduleFrequency(frequency, values = {}) {
+  switch (frequency) {
+    case "daily":
+      return { weekdays: [...allWeekdays], months: ["*"], monthDays: ["*"] };
+    case "weekly":
+      return { weekdays: [Number(values.weekday || 7)], months: ["*"], monthDays: ["*"] };
+    case "monthly":
+      return { weekdays: [...allWeekdays], months: ["*"], monthDays: [String(values.monthDay || 1)] };
+    case "yearly":
+      return {
+        weekdays: [...allWeekdays],
+        months: [Number(values.month || 1)],
+        monthDays: [String(values.monthDay || 1)],
+      };
+    default:
+      throw new Error(`Unsupported simple schedule frequency: ${frequency}`);
+  }
+}
+
+function formatOrdinal(value) {
+  if (String(value) === "last") {
+    return "last day";
+  }
+  const number = Number(value);
+  const remainder100 = number % 100;
+  const suffix = remainder100 >= 11 && remainder100 <= 13
+    ? "th"
+    : ({ 1: "st", 2: "nd", 3: "rd" }[number % 10] || "th");
+  return `${number}${suffix}`;
+}
+
+function joinNatural(values) {
+  if (values.length <= 1) {
+    return values[0] || "an unspecified time";
+  }
+  if (values.length === 2) {
+    return `${values[0]} and ${values[1]}`;
+  }
+  return `${values.slice(0, -1).join(", ")}, and ${values[values.length - 1]}`;
+}
+
+function describeScheduleFrequency(frequency, values, times, timezone) {
+  const timeDescription = joinNatural(times);
+  const timezoneDescription = timezone ? ` (${timezone})` : "";
+  if (frequency === "daily") {
+    return `Every day at ${timeDescription}${timezoneDescription}.`;
+  }
+  if (frequency === "weekly") {
+    const weekday = dayOptions.find((day) => day.value === Number(values.weekday))?.longLabel || "selected day";
+    return `Every ${weekday} at ${timeDescription}${timezoneDescription}.`;
+  }
+  if (frequency === "monthly") {
+    const date = formatOrdinal(values.monthDay);
+    return `Every month on the ${date} at ${timeDescription}${timezoneDescription}.`;
+  }
+  if (frequency === "yearly") {
+    const month = monthOptions.find((entry) => entry.value === Number(values.month))?.label || "selected month";
+    const date = formatOrdinal(values.monthDay);
+    return `Every year on ${month} ${date} at ${timeDescription}${timezoneDescription}.`;
+  }
+  return `Custom calendar filters run at ${timeDescription}${timezoneDescription}; every selected filter must match.`;
+}
+
+function appendOptions(select, options) {
+  select.replaceChildren();
+  options.forEach((option) => {
+    const element = document.createElement("option");
+    element.value = String(option.value);
+    element.textContent = option.label;
+    select.appendChild(element);
+  });
+}
+
+function initializeScheduleEditors() {
+  document.querySelectorAll("[data-schedule-editor]").forEach((editor) => {
+    appendOptions(editor.querySelector("[data-weekday-select]"), dayOptions.map((day) => ({
+      value: day.value,
+      label: day.longLabel,
+    })));
+    appendOptions(editor.querySelector("[data-month-select]"), monthOptions);
+    appendOptions(
+      editor.querySelector("[data-month-day-select]"),
+      [
+        ...Array.from({ length: 31 }, (_, index) => ({
+          value: index + 1,
+          label: formatOrdinal(index + 1),
+        })),
+        { value: "last", label: "Last day" },
+      ],
+    );
+  });
+}
+
+function scheduleControlValues(prefix) {
+  const form = $("config-form");
+  return {
+    weekday: form.elements.namedItem(`${prefix}_scan_weekday`)?.value || "7",
+    month: form.elements.namedItem(`${prefix}_scan_simple_month`)?.value || "1",
+    monthDay: form.elements.namedItem(`${prefix}_scan_simple_month_day`)?.value || "1",
+  };
+}
+
+function updateScheduleSummary(prefix) {
+  const form = $("config-form");
+  const frequency = form.elements.namedItem(`${prefix}_scan_frequency`).value;
+  const times = splitCsv(form.elements.namedItem(`${prefix}_scan_times`).value);
+  const summary = document.querySelector(`[data-schedule-summary="${prefix}"]`);
+  summary.textContent = describeScheduleFrequency(
+    frequency,
+    scheduleControlValues(prefix),
+    times,
+    form.tz.value.trim(),
+  );
+}
+
+function syncSimpleScheduleToAdvanced(prefix, frequency) {
+  if (!["daily", "weekly", "monthly", "yearly"].includes(frequency)) {
+    return;
+  }
+  const form = $("config-form");
+  const filters = filtersForScheduleFrequency(frequency, scheduleControlValues(prefix));
+  document.querySelectorAll(`input[name="${prefix}_scan_days"]`).forEach((input) => {
+    input.checked = filters.weekdays.includes(Number(input.value));
+  });
+  form.elements.namedItem(`${prefix}_scan_months`).value = joinCalendarFilter(filters.months, 12);
+  form.elements.namedItem(`${prefix}_scan_month_days`).value = joinCalendarFilter(filters.monthDays, 31);
+}
+
+function updateScheduleEditor(prefix) {
+  const form = $("config-form");
+  const editor = document.querySelector(`[data-schedule-editor="${prefix}"]`);
+  const frequency = form.elements.namedItem(`${prefix}_scan_frequency`).value;
+  const previousFrequency = editor.dataset.activeFrequency;
+  if (frequency === "advanced" && previousFrequency && previousFrequency !== "advanced") {
+    syncSimpleScheduleToAdvanced(prefix, previousFrequency);
+  }
+
+  editor.querySelectorAll("[data-schedule-modes]").forEach((field) => {
+    const visible = field.dataset.scheduleModes.split(",").includes(frequency);
+    field.classList.toggle("hidden", !visible);
+    field.querySelectorAll("input, select").forEach((control) => {
+      control.disabled = !visible;
+    });
+  });
+
+  const advanced = editor.querySelector("[data-advanced-schedule]");
+  const advancedVisible = frequency === "advanced";
+  advanced.classList.toggle("hidden", !advancedVisible);
+  advanced.querySelectorAll("input, select").forEach((control) => {
+    control.disabled = !advancedVisible;
+  });
+  editor.dataset.activeFrequency = frequency;
+  updateScheduleSummary(prefix);
+}
+
+function populateScheduleEditor(prefix, config) {
+  const form = $("config-form");
+  const frequency = inferScheduleFrequency(config, prefix);
+  form.elements.namedItem(`${prefix}_scan_frequency`).value = frequency;
+
+  const weekdays = calendarValues(config[`${prefix}_scan_days`]);
+  const months = calendarValues(config[`${prefix}_scan_months`]);
+  const monthDays = calendarValues(config[`${prefix}_scan_month_days`]);
+  form.elements.namedItem(`${prefix}_scan_weekday`).value = String(weekdays[0] || 7);
+  form.elements.namedItem(`${prefix}_scan_simple_month`).value = String(months[0] || 1);
+  form.elements.namedItem(`${prefix}_scan_simple_month_day`).value = String(monthDays[0] || 1);
+  updateScheduleEditor(prefix);
 }
 
 function formatPhase(phase) {
@@ -161,6 +390,9 @@ function populateForm(config) {
   document.querySelectorAll(".day-picker").forEach((picker) => {
     renderDayPicker(picker, config[picker.dataset.field] || []);
   });
+
+  populateScheduleEditor("changed", config);
+  populateScheduleEditor("full", config);
 }
 
 function collectCheckboxValues(fieldName) {
@@ -183,6 +415,27 @@ function splitCsv(value) {
     .filter(Boolean);
 }
 
+function collectScheduleFields(prefix) {
+  const form = $("config-form");
+  const frequency = form.elements.namedItem(`${prefix}_scan_frequency`).value;
+  let filters;
+  if (frequency === "advanced") {
+    filters = {
+      weekdays: collectCheckboxValues(`${prefix}_scan_days`),
+      months: splitCsv(form.elements.namedItem(`${prefix}_scan_months`).value),
+      monthDays: splitCsv(form.elements.namedItem(`${prefix}_scan_month_days`).value),
+    };
+  } else {
+    filters = filtersForScheduleFrequency(frequency, scheduleControlValues(prefix));
+  }
+  return {
+    [`${prefix}_scan_days`]: filters.weekdays,
+    [`${prefix}_scan_months`]: filters.months,
+    [`${prefix}_scan_month_days`]: filters.monthDays,
+    [`${prefix}_scan_times`]: splitCsv(form.elements.namedItem(`${prefix}_scan_times`).value),
+  };
+}
+
 function collectFormPayload() {
   const form = $("config-form");
   return {
@@ -194,14 +447,8 @@ function collectFormPayload() {
     scan_path_marker: form.scan_path_marker.value.trim(),
     scan_paths: splitMultiline(form.scan_paths.value),
     exclude_paths: splitMultiline(form.exclude_paths.value),
-    changed_scan_days: collectCheckboxValues("changed_scan_days"),
-    changed_scan_months: splitCsv(form.changed_scan_months.value),
-    changed_scan_month_days: splitCsv(form.changed_scan_month_days.value),
-    changed_scan_times: splitCsv(form.changed_scan_times.value),
-    full_scan_days: collectCheckboxValues("full_scan_days"),
-    full_scan_months: splitCsv(form.full_scan_months.value),
-    full_scan_month_days: splitCsv(form.full_scan_month_days.value),
-    full_scan_times: splitCsv(form.full_scan_times.value),
+    ...collectScheduleFields("changed"),
+    ...collectScheduleFields("full"),
     full_scan_parallel_jobs: Number(form.full_scan_parallel_jobs.value),
     changed_scan_parallel_jobs: Number(form.changed_scan_parallel_jobs.value),
     full_progress_steps: Number(form.full_progress_steps.value),
@@ -752,9 +999,19 @@ function bindEvents() {
   document.querySelectorAll('input[name="manual_mode"]').forEach((input) => {
     input.addEventListener("change", updateManualModeVisibility);
   });
+  document.querySelectorAll("[data-schedule-editor]").forEach((editor) => {
+    const prefix = editor.dataset.scheduleEditor;
+    editor.addEventListener("change", () => updateScheduleEditor(prefix));
+    editor.addEventListener("input", () => updateScheduleSummary(prefix));
+  });
+  $("config-form").tz.addEventListener("input", () => {
+    updateScheduleSummary("changed");
+    updateScheduleSummary("full");
+  });
 }
 
 async function start() {
+  initializeScheduleEditors();
   bindEvents();
   try {
     await bootstrap();
@@ -768,4 +1025,15 @@ async function start() {
   state.pollTimer = window.setInterval(refreshStatus, 5000);
 }
 
-start();
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    describeScheduleFrequency,
+    filtersForScheduleFrequency,
+    formatOrdinal,
+    inferScheduleFrequency,
+  };
+}
+
+if (typeof document !== "undefined") {
+  start();
+}

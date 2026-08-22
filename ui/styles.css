@@ -598,6 +598,47 @@ body {
   line-height: 1.55;
 }
 
+.schedule-editor {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.schedule-editor select[data-schedule-frequency] {
+  border-color: rgba(15, 118, 110, 0.3);
+  background: rgba(238, 249, 246, 0.92);
+  font-weight: 700;
+}
+
+.advanced-schedule {
+  padding: 0.9rem;
+  border-radius: 16px;
+  border: 1px dashed rgba(72, 48, 29, 0.2);
+  background: rgba(44, 32, 22, 0.035);
+}
+
+.advanced-heading {
+  margin: 0 0 0.4rem;
+  font-weight: 700;
+}
+
+.advanced-filter-grid {
+  margin-top: 0.9rem;
+}
+
+.schedule-summary {
+  margin: 0;
+  padding: 0.8rem 0.9rem;
+  border-radius: 14px;
+  border: 1px solid rgba(15, 118, 110, 0.14);
+  background: var(--accent-soft);
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.schedule-summary strong {
+  color: var(--text);
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

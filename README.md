@@ -276,9 +276,17 @@ and `last` selects the final valid date of a month. This keeps the original
 weekday/time format while permitting calendar intervals without another daemon
 or dependency.
 
-`CHANGED_SCAN_TIMES` and `FULL_SCAN_TIMES` remain required. The UI exposes the
-same fields; select all seven weekdays when weekday should not restrict a
-monthly or yearly rule.
+`CHANGED_SCAN_TIMES` and `FULL_SCAN_TIMES` remain required. In UI mode, a
+human-friendly **How Often** selector provides Every day, Every week, Every
+month, and Every year choices. It shows only the applicable weekday, date, or
+month control and previews the rule in plain language. **Advanced / custom**
+exposes the underlying filters for quarterly, multi-weekday, or other combined
+rules. Existing saved schedules are recognized automatically; the UI-only
+frequency choice does not change the persisted scheduler format.
+
+For example, to run a full scan on the third day of every month at 03:30 in UI
+mode, choose **Every month**, choose **3rd** under **Day Of Month**, enter
+`03:30`, and confirm the plain-language schedule preview before saving.
 
 
 Examples:

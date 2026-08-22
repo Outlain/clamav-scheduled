@@ -224,53 +224,123 @@
 
           <section class="form-section">
             <h3>Changed-File Schedule</h3>
-            <p class="section-copy">
-              Every selected calendar filter must match. Use * for every month or every day of the month.
-            </p>
-            <p class="section-copy"><strong>Weekdays</strong> — select all seven when weekday should not restrict the schedule.</p>
-            <div class="day-picker" data-field="changed_scan_days"></div>
-            <div class="field-grid">
-              <label>
-                <span>Months</span>
-                <input name="changed_scan_months" type="text" required placeholder="* or 1,4,7,10">
-                <small>* means every month; otherwise use month numbers 1-12.</small>
-              </label>
-              <label>
-                <span>Days Of Month</span>
-                <input name="changed_scan_month_days" type="text" required placeholder="* or 1,15,last">
-                <small>* means every valid date; `last` means the final day of each selected month.</small>
-              </label>
-              <label>
-                <span>Changed Scan Times</span>
-                <input name="changed_scan_times" type="text" required placeholder="07:00,14:00,20:00">
-                <small>Comma-separated 24-hour times in the configured timezone.</small>
-              </label>
+            <p class="section-copy">Choose a familiar frequency. Advanced mode remains available for schedules such as weekdays-only or quarterly scans.</p>
+            <div class="schedule-editor" data-schedule-editor="changed">
+              <div class="field-grid">
+                <label>
+                  <span>How Often</span>
+                  <select name="changed_scan_frequency" data-schedule-frequency="changed">
+                    <option value="daily">Every day</option>
+                    <option value="weekly">Every week</option>
+                    <option value="monthly">Every month</option>
+                    <option value="yearly">Every year</option>
+                    <option value="advanced">Advanced / custom</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Run Time(s)</span>
+                  <input name="changed_scan_times" type="text" required placeholder="07:00,14:00,20:00">
+                  <small>24-hour time. Separate multiple times with commas.</small>
+                </label>
+                <label class="schedule-mode-field hidden" data-schedule-modes="weekly">
+                  <span>Day Of Week</span>
+                  <select name="changed_scan_weekday" data-weekday-select></select>
+                </label>
+                <label class="schedule-mode-field hidden" data-schedule-modes="yearly">
+                  <span>Month</span>
+                  <select name="changed_scan_simple_month" data-month-select></select>
+                </label>
+                <label class="schedule-mode-field hidden" data-schedule-modes="monthly,yearly">
+                  <span>Day Of Month</span>
+                  <select name="changed_scan_simple_month_day" data-month-day-select></select>
+                  <small>Choose <strong>Last day</strong> to run reliably at each month end.</small>
+                </label>
+              </div>
+
+              <div class="advanced-schedule hidden" data-advanced-schedule>
+                <p class="advanced-heading">Advanced calendar filters</p>
+                <p class="section-copy">All three filters must match. Use this only when the simple frequencies do not describe your schedule.</p>
+                <p class="section-copy"><strong>Weekdays</strong></p>
+                <div class="day-picker" data-field="changed_scan_days"></div>
+                <div class="field-grid advanced-filter-grid">
+                  <label>
+                    <span>Months</span>
+                    <input name="changed_scan_months" type="text" required placeholder="* or 1,4,7,10">
+                    <small>* means every month; otherwise use month numbers 1-12.</small>
+                  </label>
+                  <label>
+                    <span>Days Of Month</span>
+                    <input name="changed_scan_month_days" type="text" required placeholder="* or 1,15,last">
+                    <small>* means every valid date; `last` means the final day of each selected month.</small>
+                  </label>
+                </div>
+              </div>
+
+              <p class="schedule-summary" aria-live="polite">
+                <strong>Schedule:</strong>
+                <span data-schedule-summary="changed">Loading saved schedule…</span>
+              </p>
             </div>
           </section>
 
           <section class="form-section">
             <h3>Full Scan Schedule</h3>
-            <p class="section-copy">
-              Every selected calendar filter must match. Use * for every month or every day of the month.
-            </p>
-            <p class="section-copy"><strong>Weekdays</strong> — select all seven when weekday should not restrict the schedule.</p>
-            <div class="day-picker" data-field="full_scan_days"></div>
-            <div class="field-grid">
-              <label>
-                <span>Months</span>
-                <input name="full_scan_months" type="text" required placeholder="* or 1,4,7,10">
-                <small>* means every month; otherwise use month numbers 1-12.</small>
-              </label>
-              <label>
-                <span>Days Of Month</span>
-                <input name="full_scan_month_days" type="text" required placeholder="* or 1,15,last">
-                <small>* means every valid date; `last` means the final day of each selected month.</small>
-              </label>
-              <label>
-                <span>Full Scan Times</span>
-                <input name="full_scan_times" type="text" required placeholder="03:30">
-                <small>Comma-separated 24-hour times in the configured timezone.</small>
-              </label>
+            <p class="section-copy">Choose how often the complete scan should run. For example, select Every month and day 3 to scan on the third of every month.</p>
+            <div class="schedule-editor" data-schedule-editor="full">
+              <div class="field-grid">
+                <label>
+                  <span>How Often</span>
+                  <select name="full_scan_frequency" data-schedule-frequency="full">
+                    <option value="daily">Every day</option>
+                    <option value="weekly">Every week</option>
+                    <option value="monthly">Every month</option>
+                    <option value="yearly">Every year</option>
+                    <option value="advanced">Advanced / custom</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Run Time(s)</span>
+                  <input name="full_scan_times" type="text" required placeholder="03:30">
+                  <small>24-hour time. Separate multiple times with commas.</small>
+                </label>
+                <label class="schedule-mode-field hidden" data-schedule-modes="weekly">
+                  <span>Day Of Week</span>
+                  <select name="full_scan_weekday" data-weekday-select></select>
+                </label>
+                <label class="schedule-mode-field hidden" data-schedule-modes="yearly">
+                  <span>Month</span>
+                  <select name="full_scan_simple_month" data-month-select></select>
+                </label>
+                <label class="schedule-mode-field hidden" data-schedule-modes="monthly,yearly">
+                  <span>Day Of Month</span>
+                  <select name="full_scan_simple_month_day" data-month-day-select></select>
+                  <small>Months without the selected date are skipped. <strong>Last day</strong> always selects the month end.</small>
+                </label>
+              </div>
+
+              <div class="advanced-schedule hidden" data-advanced-schedule>
+                <p class="advanced-heading">Advanced calendar filters</p>
+                <p class="section-copy">All three filters must match. Use this for schedules such as quarterly scans or several selected weekdays.</p>
+                <p class="section-copy"><strong>Weekdays</strong></p>
+                <div class="day-picker" data-field="full_scan_days"></div>
+                <div class="field-grid advanced-filter-grid">
+                  <label>
+                    <span>Months</span>
+                    <input name="full_scan_months" type="text" required placeholder="* or 1,4,7,10">
+                    <small>* means every month; otherwise use month numbers 1-12.</small>
+                  </label>
+                  <label>
+                    <span>Days Of Month</span>
+                    <input name="full_scan_month_days" type="text" required placeholder="* or 1,15,last">
+                    <small>* means every valid date; `last` means the final day of each selected month.</small>
+                  </label>
+                </div>
+              </div>
+
+              <p class="schedule-summary" aria-live="polite">
+                <strong>Schedule:</strong>
+                <span data-schedule-summary="full">Loading saved schedule…</span>
+              </p>
             </div>
           </section>
 

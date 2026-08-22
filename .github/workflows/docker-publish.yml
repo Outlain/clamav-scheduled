@@ -30,7 +30,9 @@ jobs:
         run: sh tests/test_enumeration.sh
 
       - name: Check browser JavaScript
-        run: node --check ui/app.js
+        run: |
+          node --check ui/app.js
+          node tests/test_ui_schedule.js
 
       - name: Validate Compose example
         run: docker compose -f docker-compose.example.yml config --quiet
