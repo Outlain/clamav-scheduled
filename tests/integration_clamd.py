@@ -32,6 +32,16 @@ def load_scanner():
 scanner_module = load_scanner()
 
 
+def expected_clamav_version() -> str:
+    package_version = os.environ.get("CLAMAV_PACKAGE_VERSION", "")
+    version, separator, release = package_version.rpartition("-r")
+    if not separator or not version or not release.isdigit():
+        raise RuntimeError(
+            "CLAMAV_PACKAGE_VERSION must contain the image package pin, for example 1.4.6-r0"
+        )
+    return version
+
+
 def clamd_command(socket_path: str, command: bytes) -> str:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(5)
@@ -141,7 +151,10 @@ def main() -> int:
             try:
                 wait_for_socket(socket_path, process)
                 version = clamd_command(socket_path, b"VERSION")
-                if version != "ClamAV 1.4.5" and not version.startswith("ClamAV 1.4.5/"):
+                expected_version = f"ClamAV {expected_clamav_version()}"
+                if version != expected_version and not version.startswith(
+                    f"{expected_version}/"
+                ):
                     raise AssertionError(f"unexpected ClamAV version: {version}")
 
                 clean_path = scan_root / "before-reload.bin"
