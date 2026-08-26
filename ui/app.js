@@ -319,12 +319,53 @@ function formatPhase(phase) {
     enumerating: "Building File List",
     indexing: "Indexing Files",
     scanning: "Scanning",
+    pausing: "Pausing Scan",
+    operator_paused: "Paused By Operator",
     cycle_complete: "Cycle Complete",
     waiting_lock: "Waiting For Lock",
     paused: "Paused",
     stopped: "Stopped",
   };
   return labels[phase] || phase || "Unknown";
+}
+
+function pauseControlState(status = {}) {
+  if (status.pause_requested) {
+    return {
+      action: "resume",
+      disabled: false,
+      label: "Resume Scan",
+      title: "Resume the paused scan.",
+    };
+  }
+
+  const activePhases = new Set(["enumerating", "indexing", "scanning", "pausing", "operator_paused"]);
+  const canPause = Boolean(status.current_scan) && activePhases.has(status.phase);
+  return {
+    action: "pause",
+    disabled: !canPause,
+    label: "Pause Scan",
+    title: canPause
+      ? "Pause after currently active file scans finish."
+      : "Pause becomes available while a scan is active.",
+  };
+}
+
+function updatePauseResumeControl(status) {
+  const button = $("pause-resume-button");
+  const control = pauseControlState(status);
+  button.dataset.action = control.action;
+  button.disabled = control.disabled;
+  button.textContent = control.label;
+  button.title = control.title;
+}
+
+function scanActivityStage(scan = {}) {
+  const stage = scan.stage || "scanning";
+  if (["pausing", "operator_paused"].includes(stage)) {
+    return scan.resume_stage || "scanning";
+  }
+  return stage;
 }
 
 function renderDayPicker(container, selectedDays) {
@@ -503,6 +544,7 @@ function applyPhaseVisuals(status) {
   setText("scheduler-meta", status.scheduler_running ? `Scanner: running (PID ${status.scheduler_pid})` : "Scanner: stopped");
   setText("next-wake-meta", status.next_wake ? `Next wake: ${status.next_wake}` : "Next wake: pending");
   setText("flag-meta", `Force flag: ${status.effective_force_full_flag}`);
+  updatePauseResumeControl(status);
 }
 
 function updateCurrentScan(scan) {
@@ -531,11 +573,14 @@ function updateCurrentScan(scan) {
   }
 
   const stage = scan.stage || "scanning";
-  const preparing = stage === "enumerating" || stage === "indexing";
+  const activityStage = scanActivityStage(scan);
+  const preparing = activityStage === "enumerating" || activityStage === "indexing";
   const stageLabels = {
     enumerating: "Building File List",
     indexing: "Indexing Files",
     scanning: "Scanning",
+    pausing: "Pausing",
+    operator_paused: "Paused",
     complete: "Complete",
   };
   const titleSuffix = stageLabels[stage] || "In Progress";
@@ -543,12 +588,12 @@ function updateCurrentScan(scan) {
   setText("scan-stage-message", scan.status_message || "Scan activity is in progress.");
   $("scan-kind-badge").textContent = scan.label || "SCAN";
   setVisible("scan-kind-badge", true);
-  progressBar.classList.toggle("indeterminate", preparing);
+  progressBar.classList.toggle("indeterminate", preparing && stage !== "operator_paused");
 
   if (preparing) {
     progressBar.style.width = "38%";
     setText("progress-percent", "Preparing");
-    if (stage === "enumerating") {
+    if (activityStage === "enumerating") {
       const visited = Number(scan.enumeration_visited_entries || 0);
       setText(
         "progress-numbers",
@@ -563,7 +608,7 @@ function updateCurrentScan(scan) {
         discovered > 0 ? `${discovered} files awaiting identity indexing` : "Indexing the completed file list",
       );
     }
-    if (stage === "enumerating") {
+    if (activityStage === "enumerating") {
       setText(
         "bytes-progress",
         `Temporary candidate list ${formatByteCount(scan.enumeration_raw_list_bytes)}`,
@@ -919,7 +964,7 @@ async function handleRestart() {
   try {
     if (state.currentStatus?.current_scan) {
       const confirmed = window.confirm(
-        "This restarts only the scanner process inside the container, not the whole container. The current scan will stop and be retried later because scan checkpoints are only advanced after successful completion. Continue?",
+        "This restarts only the scanner process inside the container, not the whole container. The successful checkpoint will not advance; compatible durable per-file progress will be revalidated and reused when the scan restarts. Continue?",
       );
       if (!confirmed) {
         return;
@@ -930,6 +975,29 @@ async function handleRestart() {
     await refreshStatus();
   } catch (error) {
     setText("last-event-value", error.message);
+  }
+}
+
+async function handlePauseResume() {
+  const button = $("pause-resume-button");
+  const action = button.dataset.action || (state.currentStatus?.pause_requested ? "resume" : "pause");
+  button.disabled = true;
+
+  try {
+    const payload = await apiFetch(`/api/actions/${action}-scan`, {
+      method: "POST",
+      body: "{}",
+    });
+    if (payload.status) {
+      state.currentStatus = payload.status;
+      applyPhaseVisuals(payload.status);
+      updateCurrentScan(payload.status.current_scan);
+      updateRuntimePanel(payload.status);
+    }
+    await refreshStatus();
+  } catch (error) {
+    setText("last-event-value", error.message);
+    updatePauseResumeControl(state.currentStatus || {});
   }
 }
 
@@ -991,6 +1059,7 @@ function bindEvents() {
   $("manual-scan-form").addEventListener("submit", handleManualScanSubmit);
   $("manual-full-button").addEventListener("click", openManualFullDrawer);
   $("manual-changed-button").addEventListener("click", openManualScanDrawer);
+  $("pause-resume-button").addEventListener("click", handlePauseResume);
   $("restart-button").addEventListener("click", handleRestart);
   $("toggle-settings-button").addEventListener("click", openSettings);
   $("close-settings-button").addEventListener("click", closeSettings);
@@ -1031,6 +1100,8 @@ if (typeof module !== "undefined" && module.exports) {
     filtersForScheduleFrequency,
     formatOrdinal,
     inferScheduleFrequency,
+    pauseControlState,
+    scanActivityStage,
   };
 }
 

@@ -125,6 +125,13 @@ body {
   transform: translateY(-1px);
 }
 
+.action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+  transform: none;
+  box-shadow: none;
+}
+
 .action-button.accent {
   background: linear-gradient(135deg, #0f766e, #14532d);
   color: #f8fafc;
@@ -178,7 +185,8 @@ body {
 
 .status-dot.phase-enumerating,
 .status-dot.phase-indexing,
-.status-dot.phase-scanning {
+.status-dot.phase-scanning,
+.status-dot.phase-pausing {
   background: var(--accent);
   box-shadow: 0 0 0 0.35rem rgba(15, 118, 110, 0.16);
 }
@@ -190,6 +198,7 @@ body {
 }
 
 .status-dot.phase-paused,
+.status-dot.phase-operator_paused,
 .status-dot.phase-waiting_lock {
   background: var(--warning);
   box-shadow: 0 0 0 0.35rem rgba(180, 83, 9, 0.14);

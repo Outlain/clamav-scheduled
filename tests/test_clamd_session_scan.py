@@ -3,6 +3,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -264,6 +266,53 @@ class LargeMediaPolicyTests(unittest.TestCase):
             self.assertEqual(method, "large_media_full_byte_windows")
             self.assertEqual(scanned, [b"0123456789", b"89abcdefgh", b"ghijklmnop"])
 
+    def test_operator_pause_time_does_not_consume_large_media_deadline(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "movie.mkv"
+            source.write_bytes(b"0123456789")
+            info = source.stat()
+            entry = clamd_session_scan.FileEntry(
+                path=str(source),
+                size_bytes=info.st_size,
+                root=temp_dir,
+                device=info.st_dev,
+                inode=info.st_ino,
+                modified_ns=info.st_mtime_ns,
+                changed_ns=info.st_ctime_ns,
+            )
+            policy = clamd_session_scan.LargeMediaPolicy(
+                enabled=True,
+                native_max_bytes=10,
+                maximum_bytes=100,
+                window_bytes=10,
+                overlap_bytes=1,
+                probe_timeout_seconds=5,
+                scan_timeout_seconds=60,
+                ffprobe_binary="/unused/ffprobe",
+            )
+            clock = [100.0]
+            pause = mock.Mock()
+            pause.wait_until_resumed.side_effect = lambda: clock.__setitem__(0, clock[0] + 30.0)
+            observed_deadlines: list[float] = []
+
+            def fake_scan(_socket, _descriptor, current, _offset, _length, deadline):
+                self.assertEqual(current, entry)
+                observed_deadlines.append(deadline)
+                return "CLEAN", current.path, ""
+
+            with (
+                mock.patch.object(clamd_session_scan.time, "monotonic", side_effect=lambda: clock[0]),
+                mock.patch.object(clamd_session_scan, "probe_large_media", return_value="matroska"),
+                mock.patch.object(clamd_session_scan, "scan_instream_range", side_effect=fake_scan),
+            ):
+                clamd_session_scan.scan_large_media_entry(
+                    "/tmp/clamd.sock", entry, policy, pause
+                )
+
+            # Two safe-boundary pauses of 30 seconds each extend the original
+            # 60-second deadline instead of making a paused scan time out.
+            self.assertEqual(observed_deadlines, [220.0])
+
 
 class ScanListTests(unittest.TestCase):
     def test_nul_list_preserves_newlines_tabs_colons_and_non_utf8_names(self):
@@ -467,7 +516,7 @@ class ResultsWriterTests(unittest.TestCase):
     def test_writer_persists_structured_threat_details(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             results_path = Path(temp_dir) / "results.jsonl"
-            writer = clamd_session_scan.ResultsWriter(str(results_path))
+            writer = clamd_session_scan.ResultsWriter(str(results_path), "a" * 32)
             writer.write(
                 "INFECTED",
                 10,
@@ -485,6 +534,33 @@ class ResultsWriterTests(unittest.TestCase):
             self.assertEqual(payload["threat"], "Win.Trojan.Agent")
             self.assertEqual(payload["source"], "/downloads/name\nwith-newline.exe")
             self.assertTrue(payload["quarantine_success"])
+
+    def test_writer_appends_scan_identity_and_exact_source_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "sample.bin"
+            source.write_bytes(b"clean")
+            info = source.stat()
+            entry = clamd_session_scan.FileEntry(
+                path=str(source),
+                size_bytes=info.st_size,
+                root=temp_dir,
+                device=info.st_dev,
+                inode=info.st_ino,
+                modified_ns=info.st_mtime_ns,
+                changed_ns=info.st_ctime_ns,
+            )
+            results_path = Path(temp_dir) / "completed.jsonl"
+            scan_id = "a" * 32
+            writer = clamd_session_scan.ResultsWriter(str(results_path), scan_id)
+            writer.write("CLEAN", info.st_size, 5, str(source), entry=entry)
+            writer.close()
+
+            payload = json.loads(results_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["scan_id"], scan_id)
+            self.assertEqual(payload["source_identity"]["inode"], info.st_ino)
+            self.assertEqual(payload["source_identity"]["changed_ns"], info.st_ctime_ns)
+            self.assertEqual(results_path.stat().st_mode & 0o777, 0o600)
 
     def test_logger_rotates_before_exceeding_configured_size(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -534,11 +610,14 @@ class WorkerTests(unittest.TestCase):
             results = mock.Mock()
             fake_scanner = mock.Mock()
             fake_scanner.scan_entry.return_value = ("INFECTED", str(source), "Win.Trojan.Agent")
+            quarantine_destination = Path(temp_dir) / "quarantine" / "sample.exe"
+            quarantine_destination.parent.mkdir()
+            quarantine_destination.write_bytes(b"infected")
 
             with mock.patch.object(clamd_session_scan, "SessionScanner", return_value=fake_scanner), mock.patch.object(
                 clamd_session_scan,
                 "move_to_quarantine",
-                return_value="/quarantine/sample.exe",
+                return_value=str(quarantine_destination),
             ):
                 clamd_session_scan.worker_loop(
                     work_queue,
@@ -560,7 +639,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(len(threat_payloads), 1)
             self.assertEqual(threat_payloads[0]["threat"], "Win.Trojan.Agent")
             self.assertEqual(threat_payloads[0]["source"], str(source))
-            self.assertEqual(threat_payloads[0]["quarantine"], "/quarantine/sample.exe")
+            self.assertEqual(threat_payloads[0]["quarantine"], str(quarantine_destination))
             self.assertTrue(threat_payloads[0]["quarantine_success"])
             self.assertEqual(results.write.call_args.kwargs["threat_name"], "Win.Trojan.Agent")
             self.assertEqual(results.write.call_args.kwargs["scan_label"], "FULL")
@@ -782,7 +861,373 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(metrics.large_media_files, 1)
 
 
+class ResumeJournalTests(unittest.TestCase):
+    def _index(self, root: Path, paths: list[Path]):
+        list_file = root.parent / "files.nul"
+        list_file.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in paths))
+        entries, root_stats, total_bytes = clamd_session_scan.build_entries(
+            str(list_file), [str(root)]
+        )
+        return entries, root_stats, total_bytes
+
+    def test_unchanged_clean_file_is_reused_but_replacement_is_rescanned(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "downloads"
+            quarantine = Path(temp_dir) / "quarantine"
+            root.mkdir()
+            quarantine.mkdir()
+            first = root / "first.bin"
+            second = root / "second.bin"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            entries, root_stats, total_bytes = self._index(root, [first, second])
+            results_path = Path(temp_dir) / "completed.jsonl"
+            writer = clamd_session_scan.ResultsWriter(str(results_path), "b" * 32)
+            writer.write("CLEAN", entries[0].size_bytes, 10, entries[0].path, entry=entries[0])
+            writer.close()
+
+            pending, reusable, adjusted = clamd_session_scan.prepare_resumable_results(
+                str(results_path),
+                entries,
+                root_stats,
+                total_bytes,
+                str(quarantine),
+                mock.Mock(),
+                scan_id="b" * 32,
+            )
+
+            self.assertEqual([entry.path for entry in pending], [str(second)])
+            self.assertEqual([result.entry.path for result in reusable], [str(first)])
+            self.assertEqual(adjusted, total_bytes)
+
+            first.unlink()
+            first.write_bytes(b"replacement")
+            entries, root_stats, total_bytes = self._index(root, [first, second])
+            pending, reusable, _adjusted = clamd_session_scan.prepare_resumable_results(
+                str(results_path),
+                entries,
+                root_stats,
+                total_bytes,
+                str(quarantine),
+                mock.Mock(),
+                scan_id="b" * 32,
+            )
+            self.assertCountEqual([entry.path for entry in pending], [str(first), str(second)])
+            self.assertEqual(reusable, [])
+            self.assertEqual(results_path.read_bytes(), b"")
+
+    def test_successfully_quarantined_infection_is_recovered_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "downloads"
+            quarantine = Path(temp_dir) / "quarantine"
+            root.mkdir()
+            quarantine.mkdir()
+            source = root / "threat.exe"
+            source.write_bytes(b"infected")
+            entries, _root_stats, _total_bytes = self._index(root, [source])
+            original = entries[0]
+            destination = clamd_session_scan.move_to_quarantine(
+                str(source), str(quarantine), [str(root)], expected_entry=original
+            )
+            destination_info = os.lstat(destination)
+            quarantine_identity = {
+                "device": destination_info.st_dev,
+                "inode": destination_info.st_ino,
+                "size_bytes": destination_info.st_size,
+                "modified_ns": destination_info.st_mtime_ns,
+                "changed_ns": destination_info.st_ctime_ns,
+            }
+            results_path = Path(temp_dir) / "completed.jsonl"
+            writer = clamd_session_scan.ResultsWriter(str(results_path), "c" * 32)
+            writer.write(
+                "INFECTED",
+                original.size_bytes,
+                20,
+                original.path,
+                entry=original,
+                threat_name="Test.Signature",
+                quarantine_path=destination,
+                quarantine_success=True,
+                quarantine_identity=quarantine_identity,
+                durable=True,
+            )
+            writer.close()
+
+            entries, root_stats, total_bytes = self._index(root, [source])
+            pending, reusable, adjusted = clamd_session_scan.prepare_resumable_results(
+                str(results_path),
+                entries,
+                root_stats,
+                total_bytes,
+                str(quarantine),
+                mock.Mock(),
+                scan_id="c" * 32,
+            )
+
+            self.assertEqual(pending, [])
+            self.assertEqual(len(reusable), 1)
+            self.assertEqual(reusable[0].status, "INFECTED")
+            self.assertEqual(reusable[0].entry.size_bytes, len(b"infected"))
+            self.assertEqual(adjusted, len(b"infected"))
+
+    def test_error_and_truncated_tail_are_never_treated_as_completed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "downloads"
+            quarantine = Path(temp_dir) / "quarantine"
+            root.mkdir()
+            quarantine.mkdir()
+            source = root / "sample.bin"
+            source.write_bytes(b"clean")
+            entries, root_stats, total_bytes = self._index(root, [source])
+            results_path = Path(temp_dir) / "completed.jsonl"
+            writer = clamd_session_scan.ResultsWriter(str(results_path), "d" * 32)
+            writer.write("ERROR", entries[0].size_bytes, 1, entries[0].path, entry=entries[0])
+            writer.close()
+            with results_path.open("ab") as handle:
+                handle.write(b'{"schema_version":2,"status":"CLEAN"')
+
+            pending, reusable, _adjusted = clamd_session_scan.prepare_resumable_results(
+                str(results_path),
+                entries,
+                root_stats,
+                total_bytes,
+                str(quarantine),
+                mock.Mock(),
+                scan_id="d" * 32,
+            )
+            self.assertEqual(pending, entries)
+            self.assertEqual(reusable, [])
+            self.assertEqual(results_path.read_bytes(), b"")
+
+    def test_records_from_another_scan_id_are_never_reused(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "downloads"
+            quarantine = Path(temp_dir) / "quarantine"
+            root.mkdir()
+            quarantine.mkdir()
+            source = root / "sample.bin"
+            source.write_bytes(b"clean")
+            entries, root_stats, total_bytes = self._index(root, [source])
+            results_path = Path(temp_dir) / "completed.jsonl"
+            writer = clamd_session_scan.ResultsWriter(str(results_path), "e" * 32)
+            writer.write("CLEAN", entries[0].size_bytes, 1, entries[0].path, entry=entries[0])
+            writer.close()
+            logger = mock.Mock()
+
+            pending, reusable, _adjusted = clamd_session_scan.prepare_resumable_results(
+                str(results_path),
+                entries,
+                root_stats,
+                total_bytes,
+                str(quarantine),
+                logger,
+                scan_id="f" * 32,
+            )
+
+            self.assertEqual(pending, entries)
+            self.assertEqual(reusable, [])
+            self.assertEqual(results_path.read_bytes(), b"")
+            self.assertIn("different scan", logger.log.call_args.args[0])
+
+    def test_symlinked_or_hardlinked_journal_is_rejected_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            outside = base / "outside.jsonl"
+            original = b'{"private":"preserve"}\n'
+            outside.write_bytes(original)
+
+            symlink = base / "symlink.jsonl"
+            symlink.symlink_to(outside)
+            with self.assertRaises(clamd_session_scan.ResumeJournalError):
+                clamd_session_scan.ResultsWriter(str(symlink), "a" * 32)
+            self.assertEqual(outside.read_bytes(), original)
+
+            hardlink = base / "hardlink.jsonl"
+            os.link(outside, hardlink)
+            with self.assertRaises(clamd_session_scan.ResumeJournalError):
+                clamd_session_scan.ResultsWriter(str(hardlink), "a" * 32)
+            self.assertEqual(outside.read_bytes(), original)
+
+            fifo = base / "fifo.jsonl"
+            os.mkfifo(fifo)
+            with self.assertRaises(clamd_session_scan.ResumeJournalError):
+                clamd_session_scan.ResultsWriter(str(fifo), "a" * 32)
+
+    def test_quarantine_resume_rejects_symlinked_intermediate_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "downloads"
+            quarantine = base / "quarantine"
+            outside = base / "outside"
+            root.mkdir()
+            quarantine.mkdir()
+            outside.mkdir()
+            source = root / "threat.exe"
+            source.write_bytes(b"infected")
+            entries, _root_stats, _total_bytes = self._index(root, [source])
+            original = entries[0]
+            escaped = outside / "threat.exe"
+            escaped.write_bytes(source.read_bytes())
+            source.unlink()
+            (quarantine / "nested").symlink_to(outside, target_is_directory=True)
+            escaped_info = escaped.stat()
+            quarantine_identity = {
+                "device": escaped_info.st_dev,
+                "inode": escaped_info.st_ino,
+                "size_bytes": escaped_info.st_size,
+                "modified_ns": escaped_info.st_mtime_ns,
+                "changed_ns": escaped_info.st_ctime_ns,
+            }
+            results_path = base / "completed.jsonl"
+            writer = clamd_session_scan.ResultsWriter(str(results_path), "a" * 32)
+            writer.write(
+                "INFECTED",
+                original.size_bytes,
+                1,
+                original.path,
+                entry=original,
+                quarantine_path=str(quarantine / "nested" / "threat.exe"),
+                quarantine_success=True,
+                quarantine_identity=quarantine_identity,
+                durable=True,
+            )
+            writer.close()
+            entries, root_stats, total_bytes = self._index(root, [source])
+
+            pending, reusable, _adjusted = clamd_session_scan.prepare_resumable_results(
+                str(results_path),
+                entries,
+                root_stats,
+                total_bytes,
+                str(quarantine),
+                mock.Mock(),
+                scan_id="a" * 32,
+            )
+
+            self.assertEqual(pending, entries)
+            self.assertEqual(reusable, [])
+            self.assertEqual(results_path.read_bytes(), b"")
+            self.assertEqual(escaped.read_bytes(), b"infected")
+
+    def test_quarantine_resume_rejects_hardlinked_destination(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "downloads"
+            quarantine = base / "quarantine"
+            root.mkdir()
+            quarantine.mkdir()
+            source = root / "threat.exe"
+            source.write_bytes(b"infected")
+            entries, _root_stats, _total_bytes = self._index(root, [source])
+            original = entries[0]
+            destination = Path(
+                clamd_session_scan.move_to_quarantine(
+                    str(source), str(quarantine), [str(root)], expected_entry=original
+                )
+            )
+            os.link(destination, base / "unexpected-hardlink.exe")
+            destination_info = destination.stat()
+            identity = {
+                "device": destination_info.st_dev,
+                "inode": destination_info.st_ino,
+                "size_bytes": destination_info.st_size,
+                "modified_ns": destination_info.st_mtime_ns,
+                "changed_ns": destination_info.st_ctime_ns,
+            }
+            results_path = base / "completed.jsonl"
+            writer = clamd_session_scan.ResultsWriter(str(results_path), "a" * 32)
+            writer.write(
+                "INFECTED",
+                original.size_bytes,
+                1,
+                original.path,
+                entry=original,
+                quarantine_path=str(destination),
+                quarantine_success=True,
+                quarantine_identity=identity,
+                durable=True,
+            )
+            writer.close()
+            entries, root_stats, total_bytes = self._index(root, [source])
+
+            pending, reusable, _adjusted = clamd_session_scan.prepare_resumable_results(
+                str(results_path),
+                entries,
+                root_stats,
+                total_bytes,
+                str(quarantine),
+                mock.Mock(),
+                scan_id="a" * 32,
+            )
+
+            self.assertEqual(pending, entries)
+            self.assertEqual(reusable, [])
+
+
+class PauseControllerTests(unittest.TestCase):
+    def test_worker_wait_closes_session_and_resumes_after_flag_removal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pause_file = Path(temp_dir) / "scan.pause"
+            pause_file.write_text("pause\n", encoding="ascii")
+            controller = clamd_session_scan.PauseController(str(pause_file))
+            scanner = mock.Mock()
+            finished = threading.Event()
+
+            thread = threading.Thread(
+                target=lambda: (controller.wait_until_resumed(scanner), finished.set()),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.monotonic() + 2
+            while controller.waiting_workers() != 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(controller.waiting_workers(), 1)
+            self.assertFalse(finished.is_set())
+            scanner.close.assert_called_once_with()
+
+            pause_file.unlink()
+            thread.join(timeout=2)
+            self.assertTrue(finished.is_set())
+            self.assertEqual(controller.waiting_workers(), 0)
+
+    def test_pause_control_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            target = base / "target"
+            target.touch()
+            pause_file = base / "scan.pause"
+            pause_file.symlink_to(target)
+            controller = clamd_session_scan.PauseController(str(pause_file))
+            with self.assertRaises(clamd_session_scan.PauseControlError):
+                controller.requested()
+
+
 class MetricsTests(unittest.TestCase):
+    def test_resumed_work_is_counted_for_completion_but_separated_from_current_run_rate(self):
+        root_stats = {
+            "/downloads": {
+                "files": 1,
+                "bytes": 100,
+                "processed_files": 0,
+                "processed_bytes": 0,
+                "infected": 0,
+                "vanished": 0,
+                "errors": 0,
+            }
+        }
+        entry = clamd_session_scan.FileEntry("/downloads/one", 100, "/downloads")
+        result = clamd_session_scan.ReusableResult(entry, "CLEAN", 5, "clamd_fildes", {})
+        metrics = clamd_session_scan.Metrics(1, 100, root_stats, 1)
+
+        metrics.preload([result])
+        snapshot = metrics.snapshot()
+
+        self.assertEqual(snapshot["processed_files"], 1)
+        self.assertEqual(snapshot["processed_bytes"], 100)
+        self.assertEqual(snapshot["resumed_files"], 1)
+        self.assertEqual(snapshot["resumed_bytes"], 100)
+        self.assertTrue(clamd_session_scan.scan_completed_successfully(metrics))
+
     def test_first_completion_is_logged_even_when_file_interval_is_large(self):
         root_stats = {
             "/downloads": {

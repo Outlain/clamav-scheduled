@@ -2,6 +2,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -90,6 +91,19 @@ class ScanListFilterTests(unittest.TestCase):
 
 
 class EnumerationProgressTests(unittest.TestCase):
+    class CaptureLogger:
+        def __init__(self):
+            self.lines = []
+            self.lock = threading.Lock()
+
+        def emit(self, line):
+            with self.lock:
+                self.lines.append(line)
+
+        def contains(self, expected):
+            with self.lock:
+                return expected in self.lines
+
     def test_progress_counter_handles_split_nul_delimited_paths(self):
         progress = enumerate_scan_files.TraversalProgress()
 
@@ -130,13 +144,6 @@ class EnumerationProgressTests(unittest.TestCase):
         )
 
     def test_enumerator_preserves_nul_safe_regular_file_list(self):
-        class CaptureLogger:
-            def __init__(self):
-                self.lines = []
-
-            def emit(self, line):
-                self.lines.append(line)
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "root"
             root.mkdir()
@@ -145,7 +152,8 @@ class EnumerationProgressTests(unittest.TestCase):
             (root / "directory").mkdir()
             (root / "link").symlink_to(regular)
             output = Path(temp_dir) / "files.nul"
-            logger = CaptureLogger()
+            logger = self.CaptureLogger()
+            pause_file = Path(temp_dir) / "pause.flag"
 
             result = enumerate_scan_files.run_enumeration(
                 label="FULL",
@@ -155,6 +163,7 @@ class EnumerationProgressTests(unittest.TestCase):
                 timeout_seconds=10,
                 heartbeat_seconds=1,
                 find_binary="find",
+                pause_file=pause_file,
                 logger=logger,
             )
 
@@ -178,6 +187,7 @@ class EnumerationProgressTests(unittest.TestCase):
             new_file = root / "new.bin"
             new_file.write_bytes(b"new")
             output = Path(temp_dir) / "changed.nul"
+            pause_file = Path(temp_dir) / "pause.flag"
 
             result = enumerate_scan_files.run_enumeration(
                 label="CHANGED",
@@ -187,6 +197,7 @@ class EnumerationProgressTests(unittest.TestCase):
                 timeout_seconds=10,
                 heartbeat_seconds=1,
                 find_binary="find",
+                pause_file=pause_file,
                 logger=CaptureLogger(),
             )
 
@@ -194,13 +205,6 @@ class EnumerationProgressTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), os.fsencode(new_file) + b"\0")
 
     def test_long_enumeration_emits_bounded_progress_heartbeat(self):
-        class CaptureLogger:
-            def __init__(self):
-                self.lines = []
-
-            def emit(self, line):
-                self.lines.append(line)
-
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_find = Path(temp_dir) / "fake-find"
             fake_find.write_text(
@@ -209,7 +213,8 @@ class EnumerationProgressTests(unittest.TestCase):
             )
             fake_find.chmod(0o700)
             output = Path(temp_dir) / "files.nul"
-            logger = CaptureLogger()
+            logger = self.CaptureLogger()
+            pause_file = Path(temp_dir) / "pause.flag"
 
             result = enumerate_scan_files.run_enumeration(
                 label="FULL",
@@ -219,6 +224,7 @@ class EnumerationProgressTests(unittest.TestCase):
                 timeout_seconds=10,
                 heartbeat_seconds=1,
                 find_binary=str(fake_find),
+                pause_file=pause_file,
                 logger=logger,
             )
 
@@ -230,6 +236,142 @@ class EnumerationProgressTests(unittest.TestCase):
                     for line in logger.lines
                 )
             )
+
+    def test_pause_file_accepts_only_a_real_regular_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            pause_file = base / "pause.flag"
+
+            self.assertFalse(enumerate_scan_files.pause_file_exists(pause_file))
+            pause_file.touch()
+            self.assertTrue(enumerate_scan_files.pause_file_exists(pause_file))
+
+            pause_file.unlink()
+            target = base / "target"
+            target.touch()
+            pause_file.symlink_to(target)
+            with self.assertRaises(RuntimeError):
+                enumerate_scan_files.pause_file_exists(pause_file)
+
+            pause_file.unlink()
+            pause_file.mkdir()
+            with self.assertRaises(RuntimeError):
+                enumerate_scan_files.pause_file_exists(pause_file)
+
+    def test_preexisting_pause_waits_before_starting_find(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            pause_file = base / "pause.flag"
+            pause_file.touch()
+            started_file = base / "find-started"
+            fake_find = base / "fake-find"
+            fake_find.write_text(
+                f"#!/bin/sh\n: > {str(started_file)!r}\nprintf '/downloads\\0'\n",
+                encoding="utf-8",
+            )
+            fake_find.chmod(0o700)
+            output = base / "files.nul"
+            logger = self.CaptureLogger()
+            result = []
+
+            thread = threading.Thread(
+                target=lambda: result.append(
+                    enumerate_scan_files.run_enumeration(
+                        label="FULL",
+                        source_path="/downloads",
+                        output_path=output,
+                        reference_file=None,
+                        timeout_seconds=1,
+                        heartbeat_seconds=1,
+                        find_binary=str(fake_find),
+                        pause_file=pause_file,
+                        logger=logger,
+                    )
+                )
+            )
+            thread.start()
+            deadline = time.monotonic() + 2
+            while not logger.contains("[FULL] Enumeration paused by operator."):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            self.assertFalse(started_file.exists())
+
+            pause_file.unlink()
+            thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [0])
+            self.assertTrue(started_file.exists())
+            self.assertTrue(logger.contains("[FULL] Enumeration resumed by operator."))
+
+    def test_pause_during_find_does_not_consume_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            fake_find = base / "fake-find"
+            fake_find.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, time\n"
+                "for index in range(12):\n"
+                "    os.write(1, f'/downloads/{index}\\0'.encode())\n"
+                "    time.sleep(0.05)\n",
+                encoding="utf-8",
+            )
+            fake_find.chmod(0o700)
+            output = base / "files.nul"
+            pause_file = base / "pause.flag"
+            logger = self.CaptureLogger()
+            result = []
+
+            started = time.monotonic()
+            thread = threading.Thread(
+                target=lambda: result.append(
+                    enumerate_scan_files.run_enumeration(
+                        label="CHANGED",
+                        source_path="/downloads",
+                        output_path=output,
+                        reference_file=None,
+                        timeout_seconds=1,
+                        heartbeat_seconds=1,
+                        find_binary=str(fake_find),
+                        pause_file=pause_file,
+                        logger=logger,
+                    )
+                )
+            )
+            thread.start()
+            time.sleep(0.1)
+            pause_file.touch()
+            deadline = time.monotonic() + 2
+            while not logger.contains("[CHANGED] Enumeration paused by operator."):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            time.sleep(1.1)
+            pause_file.unlink()
+            thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [0])
+            self.assertGreater(time.monotonic() - started, 1)
+            self.assertTrue(logger.contains("[CHANGED] Enumeration resumed by operator."))
+            self.assertTrue(any("Enumeration pause heartbeat:" in line for line in logger.lines))
+
+    def test_stopped_process_is_continued_before_termination(self):
+        process = mock.Mock()
+        process.pid = 4321
+        with mock.patch.object(enumerate_scan_files.os, "killpg") as killpg:
+            enumerate_scan_files.terminate_process_group_safely(
+                process,
+                enumerate_scan_files.signal.SIGTERM,
+                stopped=True,
+            )
+
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(4321, enumerate_scan_files.signal.SIGCONT),
+                mock.call(4321, enumerate_scan_files.signal.SIGTERM),
+            ],
+        )
 
 
 class DefinitionHealthTests(unittest.TestCase):

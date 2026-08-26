@@ -21,6 +21,8 @@ A lightweight scheduled ClamAV scanner container for scanning a downloads folder
 - Richer scan metrics including bytes, infected/error counts, per-root summaries, and slowest files
 - Live progress logs report the first completed file, regular throughput checkpoints, and 30-second worker/queue heartbeats
 - File-list discovery emits a low-overhead heartbeat every 30 seconds with entries visited, entries added during the last window, temporary-list size, elapsed time, and the latest successfully visited path
+- Operator pause/resume for full and changed scans without stopping ClamD or the UI
+- Restart-safe full and changed scans that reuse only exact, revalidated per-file results from a completed durable manifest
 - Reports isolated files that vanish after list-building and fails the run when the configured count/percentage is suspicious
 - Pauses and retries if any configured scan root becomes unavailable
 - Captures scan-root and optional marker identities before enumeration and verifies them again after all workers finish
@@ -52,6 +54,9 @@ In UI mode, scheduler configuration environment variables are intentionally igno
 - `UI_PORT` - UI port in UI mode; defaults to `8080`
 - `CONFIG_DIR` - persistent UI configuration directory in UI mode; defaults to `/config`
 - `STATE_DIR` - persistent runtime state directory; defaults to `/state`
+- `SCAN_PROGRESS_DIR` - durable active-scan manifest and per-file result journal; defaults to `/state/scan-progress`
+- `SCAN_PAUSE_FILE` - durable cooperative pause flag; defaults to `/state/scan.pause`
+- `SCAN_RESUME_MAX_AGE_SECONDS` - maximum age of compatible interrupted work; defaults to `2592000` (30 days), maximum one year; `0` disables age expiry while retaining all identity checks
 - `EVENT_DIR` - durable event spool for `clamav-notifier`; defaults to `/events`
 - `RUNTIME_DIR` - private ephemeral clamd configuration/socket directory; defaults to `/tmp/clamav-runtime`
 - `UI_MAX_REQUEST_THREADS` - maximum simultaneous UI request threads; defaults to `32`, hard maximum `128`
@@ -195,6 +200,7 @@ The UI currently includes:
 - the separate exact `FORCE_FULL_FLAG` file path for simple NAS-side full-scan triggering
 - on-demand changed-file scans using either "since last successful checkpoint" or a custom recent lookback window
 - optional target paths and optional one-off ignore paths for on-demand changed-file scans
+- pause and resume for an active full or changed scan
 - restart-scanner action for restarting only the scanner process inside the container
 
 Enumeration errors from `find` are escaped and written to both the scan log and the UI/container log as they occur. To prevent a damaged mount from flooding logs indefinitely, the first 100 diagnostic lines are shown and any additional count is summarized. A blocked NFS operation may produce no filesystem error of its own; in that case, a heartbeat with zero new entries shows that the process is still alive but has made no observable path progress during that window.
@@ -205,12 +211,17 @@ Recommended UI-mode mounts:
 volumes:
   - /mnt/media:/downloads:rw
   - /opt/docker/clamav-scheduled/config:/config:rw
-  - /opt/docker/clamav-shared/state/clamav-scheduled:/state:rw
+  - ${SCHEDULED_STATE_HOST_PATH:-/opt/docker/clamav-shared/state/clamav-scheduled}:/state:rw
   - /opt/docker/clamav-shared/events/clamav-scheduled:/events:rw
   - /opt/docker/clamav-shared/logs/clamav-scheduled:/var/log/clamav:rw
   - /opt/docker/clamav-shared/quarantine/clamav-scheduled:/quarantine:rw
   - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
 ```
+
+`/opt/docker/clamav-shared/state/clamav-scheduled` is private to this container
+despite the parent directory name. It does not need to match another service's
+mount. The host filesystem backing `/opt` must be local storage; see
+[Local state storage](#local-state-storage).
 
 ### ClamAV definitions updater and volume permissions
 
@@ -238,7 +249,7 @@ The image runs as UID/GID `10001:10001`. At startup it performs an actual create
 | scan roots | read/write/search | clamd reads content; successful quarantine must unlink the infected source |
 | quarantine | read/write/search | creates no-overwrite mode-`0600` quarantine files |
 | `/config` (UI mode) | read/write | atomic UI config and history replacement |
-| `/state` | read/write | locks, checkpoints, and manual requests |
+| `/state` | read/write | locks, checkpoints, manual requests, pause flag, durable file manifest, and restart journal |
 | `/events` | read/write | atomic structured events for the central notifier |
 | log directory | read/write | append-only operational log |
 | definitions | read-only | the external updater is the only writer |
@@ -267,6 +278,95 @@ a missing bind source automatically, it is commonly created as `root:root`, so
 prepare every writable source directory before the first deployment.
 
 Do not place `STATE_DIR`, `RUNTIME_DIR`, `TMP_DIR`, definitions, or `SCANLOG` inside a scan root. The scanner rejects that layout because its own writes would change files while they are being scanned. Nested directories can still have stricter permissions; a later per-file permission failure is recorded as a scan error and prevents checkpoint advancement.
+
+## Pause and restart recovery
+
+Both full scans and changed-file scans can be paused from the UI. Pause is
+cooperative and fail-safe:
+
+- during discovery, the scanner suspends only the active filesystem-walk process
+  and paused time does not count against `PATH_ENUMERATION_TIMEOUT`
+- during indexing, it stops at a bounded path-check boundary
+- during ordinary scanning, each worker finishes its current ClamD request and
+  stops before taking another file
+- during oversized-video scanning, it stops between bounded byte windows
+- ClamD, the scheduler, the health check, and the UI remain running
+
+The pause request is the regular file `/state/scan.pause`. It survives a
+container or host restart, so a deliberately paused scan stays paused until an
+operator resumes it. In headless mode the equivalent controls are:
+
+```sh
+# Pause the active scan (or make the next scan wait).
+touch /opt/docker/clamav-shared/state/clamav-scheduled/scan.pause
+
+# Resume it.
+rm /opt/docker/clamav-shared/state/clamav-scheduled/scan.pause
+```
+
+Run those commands as a user that can write the state directory, and do not
+replace the flag with a directory or symlink.
+
+For restart recovery, the scanner does not install SQLite or another database.
+It maintains one simple, inspectable active-session directory under
+`/state/scan-progress/active` containing:
+
+- `session.json` for the scan identity, original cutoff, and configuration fingerprint
+- `roots.json` for the original scan-root and marker identities
+- `files.nul` for the NUL-delimited path manifest
+- `completed.jsonl` for durable per-file outcomes and exact file identities
+
+If interruption occurs while discovery is still building `files.nul`, discovery
+starts over. A half-finished filesystem walk cannot safely prove that it saw the
+whole tree. Once the manifest is marked ready, a restart reuses a clean result
+only when device, inode, size, modification time, and change time still match.
+A successfully quarantined detection is reused only when the source is still
+absent and the exact quarantine file still exists. Changed, replaced, vanished,
+failed, limit-blocked, and not-yet-durable files are scanned again.
+
+The original full-scan cutoff or changed-scan reference is retained. Checkpoints
+advance only after every remaining file, mount/marker recheck, worker, and
+quarantine gate succeeds. The manifest is then removed. This may repeat a small
+amount of recent work after sudden power loss, but it never treats an unrecorded
+file as scanned. A changed scan already in progress is resumed before a newly
+due full scan so its saved work is not discarded.
+
+Changing a scan-affecting setting, changing the request, exceeding
+`SCAN_RESUME_MAX_AGE_SECONDS`, or finding incompatible/corrupt progress causes a
+safe rebuild. If a root is unavailable or its configured marker is missing, the
+saved session is retained and cannot resume until the mount is healthy again.
+When `SCAN_PATH_MARKER` is configured, every current root is healthy, and every
+marker is present but a saved root/marker identity changed across a host reboot
+or remount, the old per-file results are discarded and the scanner immediately
+builds a fresh manifest. Without a marker, an identity change remains blocked;
+the scanner cannot safely distinguish the intended remount from a fallback or
+wrong filesystem mounted at the same path.
+
+Routine signature reloads do not invalidate an active manifest. ClamD can also
+reload definitions during an uninterrupted multi-day scan, so a completed scan
+is a sequence of per-file checks rather than one frozen database snapshot.
+Pending or repeated files always use the definitions loaded by ClamD at that
+time; an engine or scan-policy change does invalidate saved progress.
+
+### Local state storage
+
+Bind `/state` to a directory on the Docker host's local SSD or NVMe. Do not put
+it on `/mnt/media`, NFS, SMB, or another network filesystem, and do not share one
+state directory between scanner instances. The recommended Compose setting is:
+
+```dotenv
+SCHEDULED_STATE_HOST_PATH=/opt/docker/clamav-shared/state/clamav-scheduled
+```
+
+That path is suitable only if `/opt` is actually backed by the Docker host's
+local disk. The scanner never copies media content into `/state`; it stores path
+names, identities, and compact JSON results. A normal hundred-thousand-file tree
+usually needs tens to hundreds of MiB, while multi-million-file manifests can
+grow into GiB depending on path lengths. Keep free space available and include
+this directory in state backups. Batched journal syncs limit write overhead,
+but local SSD/NVMe prevents those durability writes from adding NAS latency.
+Media discovery and scanning still read the source data from its original
+mount, so local state cannot remove the source NAS's own I/O limit.
 
 ## Scan schedules
 
@@ -374,6 +474,23 @@ moving definitions, logs, events, state, and quarantine to dedicated paths below
 `127.0.0.1` by default because it has no authentication. Change the Docker-host
 publish address with `UI_PUBLISH_IP` rather than changing the application's
 internal `UI_BIND` setting.
+
+When upgrading an existing deployment, keep the existing `/state` contents and
+point `SCHEDULED_STATE_HOST_PATH` at that same local directory. No database
+migration is required: the existing atomic checkpoints remain authoritative and
+the new `scan-progress` directory is created automatically. Before redeploying,
+ensure the state directory is owned by the configured `SCANNER_UID` and
+`SCANNER_GID` and is on local storage. If the old state path was on NAS storage,
+stop the scanner, copy it to the local path, preserve ownership/modes, and then
+change the bind mount.
+
+Rollback is also simple: stop the new container and redeploy the previous image
+with the same config, definitions, logs, quarantine, and state mounts. Older
+images continue from the last successful checkpoint and ignore the new
+`scan-progress` directory. Remove a remaining `scan.pause` flag before rollback
+if the old image has no pause control. Keep the progress directory until the
+rollback window ends; deleting it discards only interrupted per-file progress,
+not successful checkpoints or quarantined content.
 
 ## Image and update policy
 

@@ -16,6 +16,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -27,6 +28,7 @@ from event_writer import emit_event
 
 
 SESSION_PREFIX_RE = re.compile(r"^\d+:\s+")
+SCAN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 QUARANTINE_MOVE_LOCK = threading.Lock()
 MAX_SCAN_WORKERS = 64
 MAX_PROGRESS_STEPS = 10_000
@@ -35,6 +37,10 @@ MAX_SCHEDULED_FILE_CAP = 5_000_000
 MAX_VANISHED_FILE_CAP = 1_000_000
 SCAN_HEARTBEAT_SECONDS = 30
 LARGE_MEDIA_SLOT_RETRY_SECONDS = 1.0
+PAUSE_POLL_SECONDS = 0.25
+RESULT_SYNC_RECORDS = 64
+RESULT_SYNC_SECONDS = 1.0
+MAX_RESULT_RECORD_BYTES = 1024 * 1024
 CLAMD_POLICY_LIMIT_MARKERS = (
     "heuristics.limits.exceeded",
     "size limit exceeded",
@@ -82,6 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--socket", required=True, dest="socket_path")
     parser.add_argument("--list-file", required=True)
     parser.add_argument("--results-file", required=True)
+    parser.add_argument("--scan-id", required=True)
     parser.add_argument("--quarantine-dir", required=True)
     parser.add_argument("--configured-workers", required=True, type=int)
     parser.add_argument("--requested-progress-interval", required=True, type=int)
@@ -105,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--large-media-scan-timeout", required=True, type=int)
     parser.add_argument("--large-media-workers", required=True, type=int)
     parser.add_argument("--ffprobe-binary", required=True)
+    parser.add_argument("--pause-file", required=True)
     return parser.parse_args()
 
 
@@ -239,9 +247,29 @@ class Logger:
 
 
 class ResultsWriter:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, scan_id: str) -> None:
+        if not SCAN_ID_RE.fullmatch(scan_id):
+            raise ValueError("scan_id must be 32 lowercase hexadecimal characters")
         self._lock = threading.Lock()
-        self._handle = open(path, "w", encoding="utf-8", errors="backslashreplace", buffering=1)
+        descriptor = _open_private_result_file(
+            Path(path),
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            self._handle = os.fdopen(
+                descriptor,
+                "a",
+                encoding="utf-8",
+                buffering=1,
+            )
+            descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        self._scan_id = scan_id
+        self._unsynced_records = 0
+        self._last_sync = time.monotonic()
 
     def write(
         self,
@@ -255,8 +283,13 @@ class ResultsWriter:
         quarantine_path: str | None = None,
         quarantine_success: bool | None = None,
         scan_method: str = "clamd_fildes",
+        entry: "FileEntry | None" = None,
+        quarantine_identity: dict[str, int] | None = None,
+        durable: bool = False,
     ) -> None:
         payload = {
+            "schema_version": 2,
+            "scan_id": self._scan_id,
             "scan": scan_label or None,
             "status": status,
             "size_bytes": size_bytes,
@@ -266,12 +299,29 @@ class ResultsWriter:
             "quarantine": quarantine_path,
             "quarantine_success": quarantine_success,
             "scan_method": scan_method,
+            "source_identity": file_entry_identity(entry) if entry is not None else None,
+            "quarantine_identity": quarantine_identity,
         }
         with self._lock:
             self._handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+            self._unsynced_records += 1
+            now = time.monotonic()
+            if (
+                durable
+                or self._unsynced_records >= RESULT_SYNC_RECORDS
+                or now - self._last_sync >= RESULT_SYNC_SECONDS
+            ):
+                self._sync_locked(now)
+
+    def _sync_locked(self, now: float | None = None) -> None:
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._unsynced_records = 0
+        self._last_sync = time.monotonic() if now is None else now
 
     def close(self) -> None:
         with self._lock:
+            self._sync_locked()
             self._handle.close()
 
 
@@ -284,6 +334,374 @@ class FileEntry:
     inode: int | None = None
     modified_ns: int | None = None
     changed_ns: int | None = None
+
+
+@dataclass(frozen=True)
+class ReusableResult:
+    entry: FileEntry
+    status: str
+    duration_ms: int
+    scan_method: str
+    payload: dict[str, object]
+
+
+def file_entry_identity(entry: FileEntry) -> dict[str, int] | None:
+    values = (
+        entry.device,
+        entry.inode,
+        entry.size_bytes,
+        entry.modified_ns,
+        entry.changed_ns,
+    )
+    if any(value is None for value in values):
+        return None
+    return {
+        "device": int(entry.device),
+        "inode": int(entry.inode),
+        "size_bytes": int(entry.size_bytes),
+        "modified_ns": int(entry.modified_ns),
+        "changed_ns": int(entry.changed_ns),
+    }
+
+
+def identity_from_payload(value: object) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    keys = ("device", "inode", "size_bytes", "modified_ns", "changed_ns")
+    identity: dict[str, int] = {}
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return None
+        identity[key] = item
+    return identity
+
+
+def entry_from_identity(path: str, root: str, identity: dict[str, int]) -> FileEntry:
+    return FileEntry(
+        path=path,
+        size_bytes=identity["size_bytes"],
+        root=root,
+        device=identity["device"],
+        inode=identity["inode"],
+        modified_ns=identity["modified_ns"],
+        changed_ns=identity["changed_ns"],
+    )
+
+
+def identity_matches_stat(identity: dict[str, int], info: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_dev == identity["device"]
+        and info.st_ino == identity["inode"]
+        and info.st_size == identity["size_bytes"]
+        and info.st_mtime_ns == identity["modified_ns"]
+        and info.st_ctime_ns == identity["changed_ns"]
+    )
+
+
+class ResumeJournalError(RuntimeError):
+    pass
+
+
+def _require_real_directory(path: Path, description: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise ResumeJournalError(f"{description} is missing: {path}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ResumeJournalError(
+            f"{description} must be a real directory, not a symlink: {path}"
+        )
+
+
+def _open_private_result_file(path: Path, flags: int) -> int:
+    """Open the journal without following links and require exclusive ownership."""
+
+    _require_real_directory(path.parent, "completion journal directory")
+    _validate_existing_result_path(path)
+    try:
+        descriptor = os.open(
+            path,
+            flags
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise ResumeJournalError(f"could not safely open completion journal {path}: {exc}") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ResumeJournalError(
+                f"completion journal must be a private regular file: {path}"
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _validate_existing_result_path(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ResumeJournalError(
+            f"completion journal must be a private regular file: {path}"
+        )
+
+
+def _read_result_journal(path: Path) -> tuple[list[dict[str, object]], bool]:
+    """Read complete records; report corruption without trusting partial data."""
+
+    try:
+        descriptor = _open_private_result_file(path, os.O_RDONLY)
+    except ResumeJournalError:
+        # A genuinely absent journal is a valid empty starting point.  Unsafe
+        # paths (including dangling symlinks) remain fatal rather than being
+        # silently replaced.
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return [], False
+        raise
+
+    records: list[dict[str, object]] = []
+    with os.fdopen(descriptor, "rb") as handle:
+        descriptor = -1
+        while True:
+            raw_line = handle.readline(MAX_RESULT_RECORD_BYTES + 1)
+            if not raw_line:
+                break
+            if len(raw_line) > MAX_RESULT_RECORD_BYTES:
+                return [], True
+            if not raw_line.endswith(b"\n"):
+                # A crash may leave only the final JSON row incomplete.  It is
+                # deliberately ignored and removed by journal compaction.
+                break
+            try:
+                payload = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return [], True
+            if not isinstance(payload, dict):
+                return [], True
+            records.append(payload)
+    return records, False
+
+
+def _rewrite_result_journal(path: Path, payloads: list[dict[str, object]]) -> None:
+    path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    _require_real_directory(path.parent, "completion journal directory")
+    _validate_existing_result_path(path)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            for payload in payloads:
+                handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Recheck immediately before replacement so a journal swapped for a
+        # symlink or hard link is never accepted or opened by this process.
+        _validate_existing_result_path(path)
+        os.replace(temporary, path)
+        directory_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _safe_quarantine_stat(path: str, root: str) -> os.stat_result | None:
+    """lstat a quarantine file while refusing symlinked path components."""
+
+    normalized_path = os.path.normpath(path)
+    normalized_root = os.path.normpath(root)
+    if (
+        not _path_is_beneath(normalized_path, normalized_root)
+        or normalized_path == normalized_root
+    ):
+        return None
+    relative = os.path.relpath(normalized_path, normalized_root)
+    parts = Path(relative).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    descriptors: list[int] = []
+    try:
+        current = os.open(normalized_root, directory_flags)
+        descriptors.append(current)
+        root_info = os.fstat(current)
+        if not stat.S_ISDIR(root_info.st_mode):
+            return None
+        for component in parts[:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            descriptors.append(current)
+        file_descriptor = os.open(parts[-1], flags, dir_fd=current)
+        descriptors.append(file_descriptor)
+        return os.fstat(file_descriptor)
+    except OSError:
+        return None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _path_is_beneath(path: str, root: str) -> bool:
+    normalized_path = os.path.normpath(path)
+    normalized_root = os.path.normpath(root)
+    if not os.path.isabs(normalized_path) or not os.path.isabs(normalized_root):
+        return False
+    try:
+        return os.path.commonpath((normalized_path, normalized_root)) == normalized_root
+    except ValueError:
+        return False
+
+
+def _reusable_clean_result(
+    payload: dict[str, object],
+    entry: FileEntry,
+) -> ReusableResult | None:
+    identity = identity_from_payload(payload.get("source_identity"))
+    if identity is None or file_entry_identity(entry) != identity:
+        return None
+    try:
+        current = os.stat(entry.path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not identity_matches_stat(identity, current):
+        return None
+    duration = payload.get("duration_ms", 0)
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+        duration = 0
+    method = payload.get("scan_method")
+    return ReusableResult(
+        entry=entry,
+        status="CLEAN",
+        duration_ms=duration,
+        scan_method=method if isinstance(method, str) else "clamd_fildes",
+        payload=payload,
+    )
+
+
+def _reusable_quarantined_result(
+    payload: dict[str, object],
+    entry: FileEntry,
+    quarantine_dir: str,
+) -> ReusableResult | None:
+    source_identity = identity_from_payload(payload.get("source_identity"))
+    quarantine_identity = identity_from_payload(payload.get("quarantine_identity"))
+    quarantine_path = payload.get("quarantine")
+    if (
+        source_identity is None
+        or quarantine_identity is None
+        or payload.get("quarantine_success") is not True
+        or not isinstance(quarantine_path, str)
+        or not _path_is_beneath(quarantine_path, quarantine_dir)
+        or os.path.normpath(quarantine_path) == os.path.normpath(quarantine_dir)
+        or os.path.lexists(entry.path)
+    ):
+        return None
+    current = _safe_quarantine_stat(quarantine_path, quarantine_dir)
+    if current is None:
+        return None
+    if current.st_nlink != 1 or not identity_matches_stat(quarantine_identity, current):
+        return None
+    duration = payload.get("duration_ms", 0)
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+        duration = 0
+    method = payload.get("scan_method")
+    recovered_entry = entry_from_identity(entry.path, entry.root, source_identity)
+    return ReusableResult(
+        entry=recovered_entry,
+        status="INFECTED",
+        duration_ms=duration,
+        scan_method=method if isinstance(method, str) else "clamd_fildes",
+        payload=payload,
+    )
+
+
+def prepare_resumable_results(
+    results_path: str,
+    entries: list[FileEntry],
+    root_stats: dict[str, dict[str, int]],
+    total_bytes: int,
+    quarantine_dir: str,
+    logger: "Logger",
+    *,
+    scan_id: str,
+) -> tuple[list[FileEntry], list[ReusableResult], int]:
+    """Validate durable completions, compact the journal, and return pending work."""
+
+    if not SCAN_ID_RE.fullmatch(scan_id):
+        raise ValueError("scan_id must be 32 lowercase hexadecimal characters")
+    path = Path(results_path)
+    records, corrupt = _read_result_journal(path)
+    if corrupt:
+        logger.log(
+            "[WARN] Resume completion journal was corrupt; discarding only saved per-file "
+            "progress and safely rescanning the manifest."
+        )
+        records = []
+
+    if any(
+        payload.get("schema_version") == 2 and payload.get("scan_id") != scan_id
+        for payload in records
+    ):
+        logger.log(
+            "[WARN] Resume completion journal contained records for a different scan; "
+            "discarding only saved per-file progress and safely rescanning the manifest."
+        )
+        records = []
+
+    latest_by_path: dict[str, dict[str, object]] = {}
+    for payload in records:
+        if payload.get("schema_version") != 2:
+            continue
+        source = payload.get("source")
+        status = payload.get("status")
+        if isinstance(source, str) and status in {"CLEAN", "INFECTED"}:
+            latest_by_path[source] = payload
+
+    pending: list[FileEntry] = []
+    reusable: list[ReusableResult] = []
+    compacted: list[dict[str, object]] = []
+    adjusted_total_bytes = total_bytes
+    for entry in entries:
+        payload = latest_by_path.get(entry.path)
+        result: ReusableResult | None = None
+        if payload is not None and payload.get("status") == "CLEAN":
+            result = _reusable_clean_result(payload, entry)
+        elif payload is not None and payload.get("status") == "INFECTED":
+            result = _reusable_quarantined_result(payload, entry, quarantine_dir)
+
+        if result is None:
+            pending.append(entry)
+            continue
+
+        if result.entry.size_bytes != entry.size_bytes:
+            difference = result.entry.size_bytes - entry.size_bytes
+            adjusted_total_bytes += difference
+            root_stats[entry.root]["bytes"] += difference
+        reusable.append(result)
+        compacted.append(payload)
+
+    _rewrite_result_journal(path, compacted)
+    return pending, reusable, adjusted_total_bytes
 
 
 class FileChangedError(RuntimeError):
@@ -302,6 +720,52 @@ class QuarantineError(RuntimeError):
 
 class LargeMediaPolicyError(RuntimeError):
     pass
+
+
+class PauseControlError(RuntimeError):
+    pass
+
+
+class PauseController:
+    """Cooperatively stop workers at safe boundaries while keeping the process alive."""
+
+    def __init__(self, pause_file: str) -> None:
+        if not os.path.isabs(pause_file):
+            raise ValueError("pause control file must be an absolute path")
+        self.pause_file = pause_file
+        self._lock = threading.Lock()
+        self._waiting_workers = 0
+
+    def requested(self) -> bool:
+        try:
+            info = os.lstat(self.pause_file)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise PauseControlError(f"cannot inspect pause control file: {exc}") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise PauseControlError(
+                f"pause control path must be a regular file, not a symlink or special file: {self.pause_file}"
+            )
+        return True
+
+    def wait_until_resumed(self, scanner: "SessionScanner | None" = None) -> None:
+        if not self.requested():
+            return
+        if scanner is not None:
+            scanner.close()
+        with self._lock:
+            self._waiting_workers += 1
+        try:
+            while self.requested():
+                time.sleep(PAUSE_POLL_SECONDS)
+        finally:
+            with self._lock:
+                self._waiting_workers -= 1
+
+    def waiting_workers(self) -> int:
+        with self._lock:
+            return self._waiting_workers
 
 
 @dataclass(frozen=True)
@@ -358,6 +822,8 @@ class Metrics:
         self.error_files = 0
         self.quarantine_failures = 0
         self.large_media_files = 0
+        self.resumed_files = 0
+        self.resumed_bytes = 0
         self.slowest_files: list[tuple[int, str, str, int]] = []
         self.last_log_processed_files = 0
         self.last_log_processed_bytes = 0
@@ -405,6 +871,21 @@ class Metrics:
             )
             return self.processed_files, should_log
 
+    def preload(self, results: list[ReusableResult]) -> None:
+        for result in results:
+            self.record(
+                result.entry,
+                result.status,
+                result.duration_ms,
+                False,
+                result.scan_method,
+            )
+        with self._lock:
+            self.resumed_files = len(results)
+            self.resumed_bytes = sum(result.entry.size_bytes for result in results)
+            self.last_log_processed_files = self.processed_files
+            self.last_log_processed_bytes = self.processed_bytes
+
     def snapshot(self) -> dict[str, int]:
         with self._lock:
             return {
@@ -415,6 +896,8 @@ class Metrics:
                 "error_files": self.error_files,
                 "quarantine_failures": self.quarantine_failures,
                 "large_media_files": self.large_media_files,
+                "resumed_files": self.resumed_files,
+                "resumed_bytes": self.resumed_bytes,
             }
 
     def progress_snapshot(self, elapsed_ms: int) -> dict[str, int]:
@@ -431,6 +914,8 @@ class Metrics:
                 "error_files": self.error_files,
                 "quarantine_failures": self.quarantine_failures,
                 "large_media_files": self.large_media_files,
+                "resumed_files": self.resumed_files,
+                "resumed_bytes": self.resumed_bytes,
                 "window_files": self.processed_files - self.last_log_processed_files,
                 "window_bytes": self.processed_bytes - self.last_log_processed_bytes,
                 "window_elapsed_ms": window_elapsed_ms,
@@ -688,6 +1173,7 @@ def scan_large_media_entry(
     socket_path: str,
     entry: FileEntry,
     policy: LargeMediaPolicy,
+    pause_controller: PauseController | None = None,
 ) -> tuple[str, str, str, str]:
     if not policy.enabled:
         raise LargeMediaPolicyError("large-media scanning is disabled")
@@ -705,9 +1191,19 @@ def scan_large_media_entry(
     descriptor = open_scannable_descriptor(entry)
     try:
         deadline = time.monotonic() + policy.scan_timeout_seconds
+        if pause_controller is not None:
+            paused_at = time.monotonic()
+            pause_controller.wait_until_resumed()
+            deadline += time.monotonic() - paused_at
         probe_large_media(descriptor, entry, policy, deadline=deadline)
         ensure_file_unchanged(entry)
         for offset, length in ranges:
+            if pause_controller is not None:
+                paused_at = time.monotonic()
+                pause_controller.wait_until_resumed()
+                # Deliberate operator pauses are not scan work and therefore do
+                # not consume the oversized-media safety timeout.
+                deadline += time.monotonic() - paused_at
             status, scanned_path, detail = scan_instream_range(
                 socket_path,
                 descriptor,
@@ -1008,20 +1504,27 @@ def worker_loop(
     event_dir: Path | None = None,
     large_media_policy: LargeMediaPolicy | None = None,
     large_media_slots: threading.Semaphore | None = None,
+    pause_controller: PauseController | None = None,
 ) -> None:
     scanner = SessionScanner(socket_path)
     try:
         while True:
+            if pause_controller is not None:
+                pause_controller.wait_until_resumed(scanner)
             try:
                 entry = work_queue.get_nowait()
             except queue.Empty:
                 return
+
+            if pause_controller is not None:
+                pause_controller.wait_until_resumed(scanner)
 
             status = "ERROR"
             scanned_path = entry.path
             threat_name = ""
             quarantine_destination: str | None = None
             quarantine_success: bool | None = None
+            quarantine_identity: dict[str, int] | None = None
             quarantine_failed = False
             scan_method = "clamd_fildes"
             scan_start_ns = time.monotonic_ns()
@@ -1040,11 +1543,19 @@ def worker_loop(
                         continue
                     try:
                         try:
-                            status, scanned_path, threat_name, scan_method = scan_large_media_entry(
-                                socket_path,
-                                entry,
-                                large_media_policy,
-                            )
+                            if pause_controller is None:
+                                status, scanned_path, threat_name, scan_method = scan_large_media_entry(
+                                    socket_path,
+                                    entry,
+                                    large_media_policy,
+                                )
+                            else:
+                                status, scanned_path, threat_name, scan_method = scan_large_media_entry(
+                                    socket_path,
+                                    entry,
+                                    large_media_policy,
+                                    pause_controller,
+                                )
                         except LargeMediaPolicyError as exc:
                             status = "POLICY_LIMIT"
                             scanned_path = entry.path
@@ -1063,6 +1574,10 @@ def worker_loop(
                                 raise
                     else:
                         raise RuntimeError("scanner retry loop exhausted")
+
+                # A result is reusable only when the same file identity still
+                # exists after ClamD finishes reading it.
+                ensure_file_unchanged(entry)
 
                 if status == "INFECTED":
                     if event_dir is not None:
@@ -1089,6 +1604,19 @@ def worker_loop(
                             expected_entry=entry,
                         )
                         quarantine_success = True
+                        destination_info = os.lstat(quarantine_destination)
+                        if not stat.S_ISREG(destination_info.st_mode):
+                            raise QuarantineError(
+                                "Quarantine destination is no longer a regular file",
+                                quarantine_destination,
+                            )
+                        quarantine_identity = {
+                            "device": destination_info.st_dev,
+                            "inode": destination_info.st_ino,
+                            "size_bytes": destination_info.st_size,
+                            "modified_ns": destination_info.st_mtime_ns,
+                            "changed_ns": destination_info.st_ctime_ns,
+                        }
                     except QuarantineError as exc:  # pragma: no cover - operational path
                         quarantine_destination = exc.destination
                         quarantine_success = False
@@ -1197,6 +1725,9 @@ def worker_loop(
                 quarantine_path=quarantine_destination,
                 quarantine_success=quarantine_success,
                 scan_method=scan_method,
+                entry=entry,
+                quarantine_identity=quarantine_identity,
+                durable=status == "INFECTED",
             )
 
             processed_files, should_log = metrics.record(
@@ -1223,9 +1754,9 @@ def worker_loop(
                     f"bytes={format_bytes(snapshot['processed_bytes'])}/{format_bytes(metrics.total_bytes)} "
                     f"clean={clean_files} infected={snapshot['infected_files']} vanished={snapshot['vanished_files']} errors={snapshot['error_files']} "
                     f"elapsed={format_duration_ms(elapsed_ms)} "
-                    f"avg_throughput={format_files_per_second(processed_files, elapsed_ms)} "
+                    f"avg_throughput={format_files_per_second(max(0, processed_files - snapshot['resumed_files']), elapsed_ms)} "
                     f"window_throughput={format_files_per_second(snapshot['window_files'], snapshot['window_elapsed_ms'])} "
-                    f"avg_data_rate={format_bytes_per_second(snapshot['processed_bytes'], elapsed_ms)} "
+                    f"avg_data_rate={format_bytes_per_second(max(0, snapshot['processed_bytes'] - snapshot['resumed_bytes']), elapsed_ms)} "
                     f"window_data_rate={format_bytes_per_second(snapshot['window_bytes'], snapshot['window_elapsed_ms'])}"
                 )
 
@@ -1259,6 +1790,9 @@ def build_entries(
     list_file: str,
     roots: list[str],
     max_files: int | None = None,
+    pause_controller: PauseController | None = None,
+    logger: Logger | None = None,
+    label: str = "",
 ) -> tuple[list[FileEntry], dict[str, dict[str, int]], int]:
     entries: list[FileEntry] = []
     root_stats = {
@@ -1283,6 +1817,13 @@ def build_entries(
         seen_paths.add(encoded_path)
         if max_files is not None and len(entries) >= max_files:
             raise ValueError(f"scan list exceeds the configured maximum of {max_files} unique files")
+
+        if pause_controller is not None and len(entries) % 512 == 0 and pause_controller.requested():
+            if logger is not None:
+                logger.log(f"[{label}] Scan paused by operator.")
+            pause_controller.wait_until_resumed()
+            if logger is not None:
+                logger.log(f"[{label}] Scan resumed by operator.")
 
         try:
             stat_result = os.stat(path, follow_symlinks=False)
@@ -1405,9 +1946,20 @@ def main() -> int:
         return 2
 
     logger = Logger(args.scanlog, args.scanlog_max_bytes, args.scanlog_rotations)
-    results = ResultsWriter(args.results_file)
+    results: ResultsWriter | None = None
 
     try:
+        try:
+            pause_controller = PauseController(args.pause_file)
+            pause_controller.requested()
+        except (OSError, ValueError, PauseControlError) as exc:
+            logger.log(f"[ERROR] [{args.label}] Invalid pause control: {format_log_value(exc)}")
+            return 2
+        if not SCAN_ID_RE.fullmatch(args.scan_id):
+            logger.log(
+                f"[ERROR] [{args.label}] --scan-id must be 32 lowercase hexadecimal characters"
+            )
+            return 2
         if not 1 <= args.max_files <= MAX_SCHEDULED_FILE_CAP:
             logger.log(
                 f"[ERROR] [{args.label}] max files must be between 1 and {MAX_SCHEDULED_FILE_CAP}"
@@ -1418,18 +1970,49 @@ def main() -> int:
             f"[{args.label}] Indexing enumerated file list and capturing file identities before scanning."
         )
         try:
-            entries, root_stats, total_bytes = build_entries(args.list_file, roots, args.max_files)
-        except (OSError, ValueError) as exc:
+            entries, root_stats, total_bytes = build_entries(
+                args.list_file,
+                roots,
+                args.max_files,
+                pause_controller,
+                logger,
+                args.label,
+            )
+        except (OSError, ValueError, PauseControlError) as exc:
             logger.log(f"[ERROR] [{args.label}] Could not index scan list: {format_log_value(exc)}")
             return 2
         total_files = len(entries)
+        try:
+            pending_entries, reusable_results, total_bytes = prepare_resumable_results(
+                args.results_file,
+                entries,
+                root_stats,
+                total_bytes,
+                args.quarantine_dir,
+                logger,
+                scan_id=args.scan_id,
+            )
+        except (OSError, ResumeJournalError, ValueError) as exc:
+            logger.log(
+                f"[ERROR] [{args.label}] Could not prepare durable scan progress: "
+                f"{format_log_value(exc)}"
+            )
+            return 2
+        try:
+            results = ResultsWriter(args.results_file, args.scan_id)
+        except (OSError, ResumeJournalError, ValueError) as exc:
+            logger.log(
+                f"[ERROR] [{args.label}] Could not safely open durable scan progress: "
+                f"{format_log_value(exc)}"
+            )
+            return 2
         indexing_elapsed_ms = max(0, (time.monotonic_ns() - indexing_started_ns) // 1_000_000)
         logger.log(
             f"[{args.label}] Indexing completed: files={total_files} bytes={format_bytes(total_bytes)} "
             f"elapsed={format_duration_ms(indexing_elapsed_ms)}."
         )
         try:
-            effective_workers, progress_interval, progress_mode, progress_detail = calculate_scan_runtime(
+            calculated_workers, progress_interval, progress_mode, progress_detail = calculate_scan_runtime(
                 max(1, total_files),
                 args.configured_workers,
                 args.requested_progress_interval,
@@ -1439,10 +2022,16 @@ def main() -> int:
             logger.log(f"[ERROR] [{args.label}] Invalid scan runtime settings: {format_log_value(exc)}")
             return 2
 
+        effective_workers = min(calculated_workers, len(pending_entries))
+
         if total_files == 0:
             logger.log(f"[{args.label}] No files found to scan.")
             return 0
 
+        logger.log(
+            f"[{args.label}] Resume journal validated: reusable_files={len(reusable_results)} "
+            f"pending_files={len(pending_entries)}."
+        )
         logger.log(
             f"[{args.label}] Scanning {total_files} files with persistent_session_workers={effective_workers}"
         )
@@ -1453,10 +2042,11 @@ def main() -> int:
         )
 
         work_queue: "queue.Queue[FileEntry]" = queue.Queue()
-        for entry in entries:
+        for entry in pending_entries:
             work_queue.put(entry)
 
         metrics = Metrics(total_files, total_bytes, root_stats, progress_interval)
+        metrics.preload(reusable_results)
         start_ns = time.monotonic_ns()
         worker_errors: "queue.SimpleQueue[BaseException]" = queue.SimpleQueue()
         large_media_policy = LargeMediaPolicy(
@@ -1488,6 +2078,7 @@ def main() -> int:
                     Path(args.event_dir),
                     large_media_policy,
                     large_media_slots,
+                    pause_controller,
                 ),
                 daemon=True,
             )
@@ -1498,11 +2089,34 @@ def main() -> int:
             thread.start()
 
         next_heartbeat = time.monotonic() + SCAN_HEARTBEAT_SECONDS
+        pause_log_state = "running"
         while True:
             active_workers = sum(1 for thread in threads if thread.is_alive())
             if active_workers == 0:
                 break
             current_monotonic = time.monotonic()
+            try:
+                pause_requested = pause_controller.requested()
+            except PauseControlError as exc:
+                logger.log(
+                    f"[ERROR] [{args.label}] Pause control became unsafe: {format_log_value(exc)}"
+                )
+                pause_requested = False
+            if pause_requested:
+                if pause_log_state == "running":
+                    logger.log(
+                        f"[{args.label}] Pause requested; waiting for active files to finish."
+                    )
+                    pause_log_state = "pausing"
+                if (
+                    pause_log_state == "pausing"
+                    and pause_controller.waiting_workers() >= active_workers
+                ):
+                    logger.log(f"[{args.label}] Scan paused by operator.")
+                    pause_log_state = "paused"
+            elif pause_log_state != "running":
+                logger.log(f"[{args.label}] Scan resumed by operator.")
+                pause_log_state = "running"
             if current_monotonic >= next_heartbeat:
                 log_scan_heartbeat(
                     logger,
@@ -1537,10 +2151,12 @@ def main() -> int:
             f"processed_files={metrics.processed_files} clean={clean_files} infected={metrics.infected_files} vanished={metrics.vanished_files} "
             f"errors={metrics.error_files} quarantine_failures={metrics.quarantine_failures} "
             f"large_media_files={metrics.large_media_files} "
+            f"resumed_files={metrics.resumed_files} "
+            f"resumed_bytes={format_bytes(metrics.resumed_bytes)} "
             f"bytes={format_bytes(metrics.total_bytes)} "
             f"elapsed={format_duration_ms(elapsed_ms)} "
-            f"avg_throughput={format_files_per_second(metrics.processed_files, elapsed_ms)} "
-            f"avg_data_rate={format_bytes_per_second(metrics.processed_bytes, elapsed_ms)}"
+            f"avg_throughput={format_files_per_second(max(0, metrics.processed_files - metrics.resumed_files), elapsed_ms)} "
+            f"avg_data_rate={format_bytes_per_second(max(0, metrics.processed_bytes - metrics.resumed_bytes), elapsed_ms)}"
         )
 
         for root in roots:
@@ -1586,7 +2202,8 @@ def main() -> int:
             )
         return 0 if completed else 1
     finally:
-        results.close()
+        if results is not None:
+            results.close()
         logger.close()
 
 

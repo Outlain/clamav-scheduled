@@ -6,6 +6,8 @@ const {
   filtersForScheduleFrequency,
   formatOrdinal,
   inferScheduleFrequency,
+  pauseControlState,
+  scanActivityStage,
 } = require("../ui/app.js");
 
 const everyWeekday = [1, 2, 3, 4, 5, 6, 7];
@@ -95,5 +97,20 @@ assert.equal(
   describeScheduleFrequency("weekly", { weekday: "7" }, ["03:30"], "UTC"),
   "Every Sunday at 03:30 (UTC).",
 );
+
+assert.deepEqual(pauseControlState({ pause_requested: true }), {
+  action: "resume",
+  disabled: false,
+  label: "Resume Scan",
+  title: "Resume the paused scan.",
+});
+assert.equal(
+  pauseControlState({ phase: "scanning", current_scan: { label: "FULL" } }).disabled,
+  false,
+);
+assert.equal(pauseControlState({ phase: "idle", current_scan: null }).disabled, true);
+assert.equal(scanActivityStage({ stage: "operator_paused", resume_stage: "enumerating" }), "enumerating");
+assert.equal(scanActivityStage({ stage: "pausing", resume_stage: "indexing" }), "indexing");
+assert.equal(scanActivityStage({ stage: "scanning" }), "scanning");
 
 console.log("UI schedule mapping tests passed");

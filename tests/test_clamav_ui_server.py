@@ -701,6 +701,7 @@ class UISchedulerManagerTests(unittest.TestCase):
                 manager.shutdown()
 
             request_text = (state_dir / "manual_full_scan_request.env").read_text(encoding="utf-8")
+            self.assertRegex(request_text, r"(?m)^REQUEST_ID=[0-9a-f]{32}$")
             self.assertIn(f"REQUEST_TARGET_PATHS={target_dir}", request_text)
             self.assertIn(f"REQUEST_IGNORE_PATHS={ignore_dir}", request_text)
             self.assertEqual(status["pending_manual_full_request"]["target_paths"], [str(target_dir)])
@@ -743,6 +744,7 @@ class UISchedulerManagerTests(unittest.TestCase):
                 manager.shutdown()
 
             request_text = (state_dir / "manual_changed_scan_request.env").read_text(encoding="utf-8")
+            self.assertRegex(request_text, r"(?m)^REQUEST_ID=[0-9a-f]{32}$")
             self.assertIn("REQUEST_MODE=relative", request_text)
             self.assertIn("REQUEST_REFERENCE_EPOCH=1699992800", request_text)
             self.assertIn(f"REQUEST_TARGET_PATHS={target_dir}", request_text)
@@ -837,6 +839,204 @@ class UISchedulerManagerTests(unittest.TestCase):
             finally:
                 manager.shutdown()
 
+    def test_pause_and_resume_actions_are_idempotent_and_use_mode_0600(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            state_dir = base / "state"
+            config_dir = base / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            manager._config = {**clamav_ui_server.DEFAULT_CONFIG, "scan_paths": [str(base)]}
+            manager._config_error = ""
+
+            try:
+                first = manager.pause_scan()
+                second = manager.pause_scan()
+                pause_path = state_dir / "scan.pause"
+                self.assertTrue(first["pause_requested"])
+                self.assertTrue(second["pause_requested"])
+                self.assertTrue(pause_path.is_file())
+                self.assertEqual(pause_path.stat().st_mode & 0o777, 0o600)
+
+                resumed = manager.resume_scan()
+                resumed_again = manager.resume_scan()
+                self.assertFalse(resumed["pause_requested"])
+                self.assertFalse(resumed_again["pause_requested"])
+                self.assertFalse(pause_path.exists())
+            finally:
+                manager.shutdown()
+
+    def test_pause_actions_reject_symlink_or_non_regular_control_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            state_dir = base / "state"
+            config_dir = base / "config"
+            state_dir.mkdir()
+            config_dir.mkdir()
+            target = state_dir / "target"
+            target.write_text("unsafe", encoding="utf-8")
+            pause_path = state_dir / "scan.pause"
+            pause_path.symlink_to(target)
+            manager = clamav_ui_server.SchedulerManager(config_dir=config_dir, state_dir=state_dir)
+            manager._config = {**clamav_ui_server.DEFAULT_CONFIG, "scan_paths": [str(base)]}
+            manager._config_error = ""
+
+            try:
+                with self.assertRaisesRegex(ValueError, "unsafe scan pause file"):
+                    manager.pause_scan()
+                with self.assertRaisesRegex(ValueError, "unsafe scan pause file"):
+                    manager.resume_scan()
+
+                pause_path.unlink()
+                pause_path.mkdir()
+                with self.assertRaisesRegex(ValueError, "unsafe scan pause file"):
+                    manager.pause_scan()
+                with self.assertRaisesRegex(ValueError, "unsafe scan pause file"):
+                    manager.resume_scan()
+            finally:
+                manager.shutdown()
+
+    def test_pause_log_lines_preserve_current_scan_and_restore_stage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            manager = clamav_ui_server.SchedulerManager(
+                config_dir=base / "config",
+                state_dir=base / "state",
+            )
+            try:
+                manager._handle_log_line("=== FULL SCAN starting ===")
+                manager._handle_log_line(
+                    "[FULL] Scanning 100 files with persistent_session_workers=8"
+                )
+                current_scan = manager._current_scan
+
+                manager._handle_log_line(
+                    "[FULL] Pause requested; waiting for active files to finish."
+                )
+                self.assertEqual(manager._phase, "pausing")
+                self.assertIs(manager._current_scan, current_scan)
+                self.assertEqual(manager._current_scan["stage"], "pausing")
+
+                manager._handle_log_line("[FULL] Scan paused by operator.")
+                self.assertEqual(manager._phase, "operator_paused")
+                self.assertIs(manager._current_scan, current_scan)
+                self.assertEqual(manager._current_scan["stage"], "operator_paused")
+
+                manager._handle_log_line(
+                    "[FULL] Scan heartbeat: processed=25/100 queued=75 active_workers=8 "
+                    "clean=25 infected=0 vanished=0 errors=0 elapsed=2m."
+                )
+                self.assertEqual(manager._phase, "operator_paused")
+                self.assertEqual(manager._current_scan["stage"], "operator_paused")
+                self.assertEqual(manager._current_scan["processed_files"], 25)
+
+                manager._handle_log_line(
+                    "[FULL] Progress: 26% (26/100) bytes=2.0 GiB/8.0 GiB "
+                    "clean=26 infected=0 vanished=0 errors=0 elapsed=2m 1s "
+                    "avg_throughput=0.21 files/s window_throughput=0.10 files/s "
+                    "avg_data_rate=16.90 MiB/s window_data_rate=8.00 MiB/s"
+                )
+                self.assertEqual(manager._phase, "operator_paused")
+                self.assertEqual(manager._current_scan["stage"], "operator_paused")
+                self.assertEqual(manager._current_scan["processed_files"], 26)
+
+                manager._handle_log_line("[FULL] Scan resumed by operator.")
+                self.assertEqual(manager._phase, "scanning")
+                self.assertIs(manager._current_scan, current_scan)
+                self.assertEqual(manager._current_scan["stage"], "scanning")
+            finally:
+                manager.shutdown()
+
+    def test_pause_file_env_override_and_paused_phases_are_health_ready(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            custom_pause = base / "control" / "custom.pause"
+            with mock.patch.dict(
+                os.environ,
+                {"SCAN_PAUSE_FILE": str(custom_pause)},
+            ):
+                manager = clamav_ui_server.SchedulerManager(
+                    config_dir=base / "config",
+                    state_dir=base / "state",
+                )
+            try:
+                self.assertEqual(manager.pause_file_path, custom_pause)
+                self.assertIn("pausing", clamav_ui_server.UI_READY_PHASES)
+                self.assertIn("operator_paused", clamav_ui_server.UI_READY_PHASES)
+                self.assertNotIn("paused", clamav_ui_server.UI_READY_PHASES)
+            finally:
+                manager.shutdown()
+
+    def test_pause_file_env_must_be_absolute_and_is_whitelisted_for_scheduler(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            with mock.patch.dict(os.environ, {"SCAN_PAUSE_FILE": "relative/scan.pause"}):
+                with self.assertRaisesRegex(ValueError, "must be an absolute path"):
+                    clamav_ui_server.SchedulerManager(
+                        config_dir=base / "config",
+                        state_dir=base / "state",
+                    )
+
+            custom_pause = base / "control" / "scan.pause"
+            config = {
+                **clamav_ui_server.DEFAULT_CONFIG,
+                "scan_paths": [str(base)],
+            }
+            with mock.patch.dict(
+                os.environ,
+                {"SCAN_PAUSE_FILE": str(custom_pause)},
+            ):
+                runtime_env = clamav_ui_server.build_runtime_env(
+                    config,
+                    base / "state",
+                    custom_pause,
+                )
+            self.assertEqual(runtime_env["SCAN_PAUSE_FILE"], str(custom_pause))
+
+    def test_resume_can_clear_stale_pause_flag_before_ui_is_configured(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            state_dir = base / "state"
+            state_dir.mkdir()
+            pause_path = state_dir / "scan.pause"
+            clamav_ui_server.create_pause_file(pause_path)
+            manager = clamav_ui_server.SchedulerManager(
+                config_dir=base / "config",
+                state_dir=state_dir,
+            )
+            try:
+                self.assertFalse(manager.get_status()["configured"])
+                status = manager.resume_scan()
+                self.assertFalse(status["pause_requested"])
+                self.assertFalse(pause_path.exists())
+            finally:
+                manager.shutdown()
+
+    def test_enumeration_pause_message_keeps_preparation_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            manager = clamav_ui_server.SchedulerManager(
+                config_dir=base / "config",
+                state_dir=base / "state",
+            )
+            try:
+                manager._handle_log_line("=== FULL SCAN starting ===")
+                manager._handle_log_line(
+                    "[FULL] Enumeration started for /downloads (timeout=1800s)."
+                )
+                manager._handle_log_line("[FULL] Enumeration paused by operator.")
+                self.assertEqual(manager._phase, "operator_paused")
+                self.assertEqual(manager._current_scan["stage"], "operator_paused")
+                self.assertEqual(manager._current_scan["resume_stage"], "enumerating")
+                self.assertIn("Filesystem traversal is stopped", manager._current_scan["status_message"])
+
+                manager._handle_log_line("[FULL] Enumeration resumed by operator.")
+                self.assertEqual(manager._phase, "enumerating")
+                self.assertEqual(manager._current_scan["stage"], "enumerating")
+            finally:
+                manager.shutdown()
+
     def test_progress_trace_is_saved_with_completed_scan_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -865,7 +1065,8 @@ class UISchedulerManagerTests(unittest.TestCase):
                 )
                 manager._handle_log_line(
                     "[FULL] Summary: scheduled_files=100 indexed_files=100 processed_files=100 clean=100 infected=0 "
-                    "vanished=0 errors=0 quarantine_failures=0 bytes=4.0 GiB elapsed=2m 0s "
+                    "vanished=0 errors=0 quarantine_failures=0 large_media_files=0 resumed_files=40 "
+                    "resumed_bytes=1.5 GiB bytes=4.0 GiB elapsed=2m 0s "
                     "avg_throughput=0.83 files/s avg_data_rate=34.13 MiB/s"
                 )
             finally:
@@ -873,6 +1074,8 @@ class UISchedulerManagerTests(unittest.TestCase):
 
             history = clamav_ui_server.read_json(config_dir / "ui-history.json", default=[])
             self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["resumed_files"], 40)
+            self.assertEqual(history[0]["resumed_bytes"], "1.5 GiB")
             trace = history[0]["progress_trace"]
             self.assertEqual(len(trace), 2)
             self.assertEqual(trace[0]["percent"], 25)

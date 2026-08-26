@@ -6,11 +6,13 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -54,6 +56,18 @@ MAX_PERSISTED_JSON_BYTES = 4 * 1024 * 1024
 SCHEDULER_RESTART_MIN_DELAY_SECONDS = 2
 SCHEDULER_RESTART_MAX_DELAY_SECONDS = 60
 SCHEDULER_STABLE_RUNTIME_SECONDS = 60
+UI_READY_PHASES = frozenset(
+    {
+        "idle",
+        "enumerating",
+        "indexing",
+        "scanning",
+        "pausing",
+        "operator_paused",
+        "cycle_complete",
+        "waiting_lock",
+    }
+)
 
 SCAN_START_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Scanning (?P<total>\d+) files with persistent_session_workers=(?P<workers>\d+)$"
@@ -83,6 +97,10 @@ INDEXING_COMPLETE_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Indexing completed: files=(?P<files>\d+) "
     r"bytes=(?P<bytes>.+?) elapsed=(?P<elapsed>.+?)\.$"
 )
+RESUME_JOURNAL_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Resume journal validated: "
+    r"reusable_files=(?P<reusable>\d+) pending_files=(?P<pending>\d+)\.$"
+)
 NO_FILES_RE = re.compile(r"^\[(?P<label>FULL|CHANGED)\] No files found to scan\.$")
 SCAN_HEARTBEAT_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Scan heartbeat: "
@@ -105,11 +123,30 @@ PROGRESS_RE = re.compile(
     r"avg_data_rate=(?P<avg_data_rate>.+?) "
     r"window_data_rate=(?P<window_data_rate>.+)$"
 )
+PAUSE_REQUESTED_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Pause requested; waiting for active files to finish\.$"
+)
+SCAN_PAUSED_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Scan paused by operator\.$"
+)
+SCAN_RESUMED_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Scan resumed by operator\.$"
+)
+ENUMERATION_PAUSED_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Enumeration paused by operator\.$"
+)
+ENUMERATION_RESUMED_RE = re.compile(
+    r"^\[(?P<label>FULL|CHANGED)\] Enumeration resumed by operator\.$"
+)
 SUMMARY_RE = re.compile(
     r"^\[(?P<label>FULL|CHANGED)\] Summary: "
     r"scheduled_files=(?P<scheduled_files>\d+) indexed_files=(?P<indexed_files>\d+) processed_files=(?P<processed_files>\d+) "
     r"clean=(?P<clean>\d+) infected=(?P<infected>\d+) vanished=(?P<vanished>\d+) errors=(?P<errors>\d+) "
-    r"quarantine_failures=(?P<quarantine_failures>\d+) bytes=(?P<bytes>.+?) "
+    r"quarantine_failures=(?P<quarantine_failures>\d+) "
+    r"(?:large_media_files=(?P<large_media_files>\d+) )?"
+    r"(?:resumed_files=(?P<resumed_files>\d+) )?"
+    r"(?:resumed_bytes=(?P<resumed_bytes>.+?) )?"
+    r"bytes=(?P<bytes>.+?) "
     r"elapsed=(?P<elapsed>.+?) avg_throughput=(?P<avg_throughput>.+?) avg_data_rate=(?P<avg_data_rate>.+)$"
 )
 ROOT_SUMMARY_RE = re.compile(
@@ -132,6 +169,7 @@ BOOTSTRAP_ENV_KEYS = {
     "LC_ALL",
     "PYTHONUNBUFFERED",
     "PYTHONDONTWRITEBYTECODE",
+    "CLAMAV_PACKAGE_VERSION",
     "RUNTIME_DIR",
     "TMP_DIR",
     "DEFINITIONS_DIR",
@@ -153,9 +191,22 @@ BOOTSTRAP_ENV_KEYS = {
     "SCANLOG_ROTATIONS",
     "CLAMD_LOG_MAX_SIZE",
     "EVENT_DIR",
+    "SCAN_PROGRESS_DIR",
+    "SCAN_RESUME_MAX_AGE_SECONDS",
+    "SCAN_PROGRESS_POLICY_VERSION",
+    "SCAN_PROGRESS_HELPER",
+    "SCAN_PAUSE_FILE",
     "VANISHED_FILE_FAILURE_COUNT",
     "VANISHED_FILE_FAILURE_PERCENT",
     "VANISHED_FILE_FAILURE_MINIMUM",
+    "LARGE_MEDIA_ENABLED",
+    "LARGE_MEDIA_MAX_FILE_GIB",
+    "LARGE_MEDIA_CHUNK_MIB",
+    "LARGE_MEDIA_OVERLAP_KIB",
+    "LARGE_MEDIA_PROBE_TIMEOUT_SECONDS",
+    "LARGE_MEDIA_SCAN_TIMEOUT_SECONDS",
+    "MAX_LARGE_MEDIA_WORKERS",
+    "FFPROBE_BINARY",
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -625,10 +676,16 @@ def serialize_config_for_scheduler(config: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def build_runtime_env(config: dict[str, Any], state_dir: Path) -> dict[str, str]:
+def build_runtime_env(
+    config: dict[str, Any],
+    state_dir: Path,
+    pause_file_path: Path | None = None,
+) -> dict[str, str]:
     env: dict[str, str] = {key: value for key, value in os.environ.items() if key in BOOTSTRAP_ENV_KEYS}
     env.update(serialize_config_for_scheduler(config))
     env["STATE_DIR"] = str(state_dir)
+    if pause_file_path is not None:
+        env["SCAN_PAUSE_FILE"] = str(pause_file_path)
     return env
 
 
@@ -921,6 +978,92 @@ class ServiceUnavailableError(RuntimeError):
     """A required runtime resource is temporarily unavailable."""
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def pause_file_is_regular(path: Path) -> bool:
+    try:
+        value = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return stat.S_ISREG(value.st_mode) and not stat.S_ISLNK(value.st_mode)
+
+
+def normalize_pause_file_path(raw_value: str | None, state_dir: Path) -> Path:
+    value = (raw_value or "").strip()
+    path = Path(value) if value else state_dir / "scan.pause"
+    if not path.is_absolute():
+        raise ValueError(f"SCAN_PAUSE_FILE must be an absolute path: {path}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in str(path)):
+        raise ValueError("SCAN_PAUSE_FILE must not contain control characters.")
+    return path
+
+
+def create_pause_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        try:
+            existing = path.lstat()
+        except FileNotFoundError:
+            return create_pause_file(path)
+        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+            raise ValueError(f"Refusing unsafe scan pause file: {path}")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            current = path.lstat()
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise ValueError(f"Refusing unsafe scan pause file: {path}")
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(path.parent)
+        return
+
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"Refusing unsafe scan pause file: {path}")
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+
+
+def remove_pause_file(path: Path) -> None:
+    try:
+        value = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+        raise ValueError(f"Refusing unsafe scan pause file: {path}")
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
 class SchedulerManager:
     def __init__(self, config_dir: Path, state_dir: Path) -> None:
         self.config_dir = config_dir
@@ -929,6 +1072,10 @@ class SchedulerManager:
         self.history_path = config_dir / "ui-history.json"
         self.manual_full_request_path = state_dir / "manual_full_scan_request.env"
         self.manual_changed_request_path = state_dir / "manual_changed_scan_request.env"
+        self.pause_file_path = normalize_pause_file_path(
+            os.environ.get("SCAN_PAUSE_FILE"),
+            state_dir,
+        )
         self.static_dir = Path("/usr/local/share/clamav-ui")
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -1059,6 +1206,48 @@ class SchedulerManager:
             self._restart_scheduler_locked()
             return self._status_payload_locked()
 
+    def pause_scan(self) -> dict[str, Any]:
+        with self._lock:
+            if self._config is None or self._config_error:
+                raise ValueError("UI mode is not configured yet.")
+            try:
+                create_pause_file(self.pause_file_path)
+            except ValueError:
+                raise
+            except OSError as exc:
+                raise ServiceUnavailableError(
+                    f"Scan pause file could not be persisted: {self.pause_file_path} ({exc})"
+                ) from exc
+            if self._current_scan is not None and self._phase not in {"pausing", "operator_paused"}:
+                self._current_scan["resume_stage"] = self._current_scan.get("stage", "scanning")
+                self._current_scan["stage"] = "pausing"
+                self._current_scan["status_message"] = (
+                    "Pause requested. The current scan is reaching a safe pause point."
+                )
+                self._phase = "pausing"
+            self._last_event = "Scan pause requested."
+            return self._status_payload_locked()
+
+    def resume_scan(self) -> dict[str, Any]:
+        with self._lock:
+            try:
+                remove_pause_file(self.pause_file_path)
+            except ValueError:
+                raise
+            except OSError as exc:
+                raise ServiceUnavailableError(
+                    f"Scan pause file could not be removed: {self.pause_file_path} ({exc})"
+                ) from exc
+            if self._current_scan is not None and self._phase in {"pausing", "operator_paused"}:
+                resume_stage = str(self._current_scan.pop("resume_stage", "scanning"))
+                if resume_stage not in {"enumerating", "indexing", "scanning"}:
+                    resume_stage = "scanning"
+                self._current_scan["stage"] = resume_stage
+                self._current_scan["status_message"] = "Scan resume requested."
+                self._phase = resume_stage
+            self._last_event = "Scan resume requested."
+            return self._status_payload_locked()
+
     def queue_manual_full_scan(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             if self._config is None or self._config_error:
@@ -1078,6 +1267,7 @@ class SchedulerManager:
             )
 
             request_lines = [
+                f"REQUEST_ID={uuid.uuid4().hex}",
                 f"REQUEST_TARGET_PATHS={':'.join(target_paths)}",
                 f"REQUEST_IGNORE_PATHS={':'.join(ignore_paths)}",
                 f"REQUEST_CREATED_AT={int(time.time())}",
@@ -1134,6 +1324,7 @@ class SchedulerManager:
                 reference_epoch = max(0, int(time.time()) - lookback_seconds)
 
             request_lines = [
+                f"REQUEST_ID={uuid.uuid4().hex}",
                 f"REQUEST_MODE={mode}",
                 f"REQUEST_REFERENCE_EPOCH={reference_epoch}",
                 f"REQUEST_LOOKBACK_SECONDS={lookback_seconds}",
@@ -1199,7 +1390,7 @@ class SchedulerManager:
         elif not scheduler_running and phase not in {"unconfigured", "config_error", "restart_wait"}:
             phase = "stopped"
 
-        active_scan_phases = {"enumerating", "indexing", "scanning"}
+        active_scan_phases = {"enumerating", "indexing", "scanning", "pausing", "operator_paused"}
         current_scan = deepcopy(self._current_scan) if scheduler_running and phase in active_scan_phases else None
 
         payload = {
@@ -1223,6 +1414,7 @@ class SchedulerManager:
             "scanlog": self._config["scanlog"] if self._config else DEFAULT_CONFIG["scanlog"],
             "pending_manual_full_request": self._read_manual_request_locked(self.manual_full_request_path),
             "pending_manual_changed_request": self._read_manual_request_locked(),
+            "pause_requested": pause_file_is_regular(self.pause_file_path),
         }
         if self._config is not None:
             payload["effective_force_full_flag"] = serialize_config_for_scheduler(self._config)["FORCE_FULL_FLAG"]
@@ -1293,7 +1485,7 @@ class SchedulerManager:
             self._schedule_restart_locked(f"Scanner preflight failed: {exc}")
             return
 
-        env = build_runtime_env(self._config, self.state_dir)
+        env = build_runtime_env(self._config, self.state_dir, self.pause_file_path)
         self._attach_log_file(Path(self._config["scanlog"]), replay=True)
         try:
             self._process = subprocess.Popen(
@@ -1710,6 +1902,83 @@ class SchedulerManager:
             self._last_event = line
             return
 
+        resume_journal_match = RESUME_JOURNAL_RE.match(line)
+        if resume_journal_match:
+            if replay:
+                self._last_event = line
+                return
+            label = resume_journal_match.group("label")
+            reusable = int(resume_journal_match.group("reusable"))
+            pending = int(resume_journal_match.group("pending"))
+            if self._current_scan is not None and self._current_scan.get("label") == label:
+                self._current_scan.update(
+                    {
+                        "resumed_files": reusable,
+                        "processed_files": reusable,
+                        "pending_files": pending,
+                        "status_message": (
+                            f"Validated {reusable} durable completions; {pending} files remain."
+                        ),
+                    }
+                )
+            self._last_event = line
+            return
+
+        pause_requested_match = PAUSE_REQUESTED_RE.match(line)
+        if pause_requested_match:
+            if replay:
+                self._last_event = line
+                return
+            if self._current_scan is not None:
+                if self._current_scan.get("stage") not in {"pausing", "operator_paused"}:
+                    self._current_scan["resume_stage"] = self._current_scan.get("stage", "scanning")
+                self._current_scan["stage"] = "pausing"
+                self._current_scan["status_message"] = (
+                    "Pause requested. Waiting for active file scans to finish."
+                )
+            self._phase = "pausing"
+            self._last_event = line
+            return
+
+        worker_paused_match = SCAN_PAUSED_RE.match(line)
+        enumeration_paused_match = ENUMERATION_PAUSED_RE.match(line)
+        scan_paused_match = worker_paused_match or enumeration_paused_match
+        if scan_paused_match:
+            if replay:
+                self._last_event = line
+                return
+            if self._current_scan is not None:
+                if self._current_scan.get("stage") not in {"pausing", "operator_paused"}:
+                    self._current_scan["resume_stage"] = self._current_scan.get("stage", "scanning")
+                self._current_scan["stage"] = "operator_paused"
+                if enumeration_paused_match:
+                    self._current_scan["status_message"] = (
+                        "Scan paused by operator. Filesystem traversal is stopped."
+                    )
+                else:
+                    self._current_scan["status_message"] = (
+                        "Scan paused by operator. No new files are being assigned to workers."
+                    )
+            self._phase = "operator_paused"
+            self._last_event = line
+            return
+
+        scan_resumed_match = SCAN_RESUMED_RE.match(line) or ENUMERATION_RESUMED_RE.match(line)
+        if scan_resumed_match:
+            if replay:
+                self._last_event = line
+                return
+            resume_stage = "scanning"
+            if self._current_scan is not None:
+                resume_stage = str(self._current_scan.pop("resume_stage", "scanning"))
+                if resume_stage not in {"enumerating", "indexing", "scanning"}:
+                    resume_stage = "scanning"
+                self._current_scan["stage"] = resume_stage
+                self._current_scan["status_message"] = "Scan resumed by operator."
+            self._phase = resume_stage
+            self._last_event = line
+            return
+
         if line.startswith("=== Scan cycle paused due to unavailable scan path ==="):
             self._phase = "paused"
             self._current_scan = None
@@ -1782,7 +2051,6 @@ class SchedulerManager:
             if self._current_scan is not None and self._current_scan.get("label") == label:
                 self._current_scan.update(
                     {
-                        "stage": "scanning",
                         "processed_files": int(heartbeat_match.group("processed")),
                         "total_files": int(heartbeat_match.group("total")),
                         "queued_files": int(heartbeat_match.group("queued")),
@@ -1792,14 +2060,16 @@ class SchedulerManager:
                         "vanished": int(heartbeat_match.group("vanished")),
                         "errors": int(heartbeat_match.group("errors")),
                         "elapsed": heartbeat_match.group("elapsed"),
-                        "status_message": (
-                            f"Workers are active: {heartbeat_match.group('processed')} files completed, "
-                            f"{heartbeat_match.group('queued')} still queued."
-                        ),
                         "updated_at": utc_now_iso(),
                     }
                 )
-            self._phase = "scanning"
+                if self._phase not in {"pausing", "operator_paused"}:
+                    self._current_scan["stage"] = "scanning"
+                    self._current_scan["status_message"] = (
+                        f"Workers are active: {heartbeat_match.group('processed')} files completed, "
+                        f"{heartbeat_match.group('queued')} still queued."
+                    )
+                    self._phase = "scanning"
             self._last_event = line
             return
 
@@ -1828,8 +2098,10 @@ class SchedulerManager:
                     "started_at": self._current_cycle_started_at or utc_now_iso(),
                     "progress_trace": [],
                 }
-            self._phase = "scanning"
-            self._current_scan["stage"] = "scanning"
+            paused_phase = self._phase in {"pausing", "operator_paused"}
+            if not paused_phase:
+                self._phase = "scanning"
+                self._current_scan["stage"] = "scanning"
             self._current_scan_trace.append(build_progress_trace_point(progress_match))
             self._current_scan.update(
                 {
@@ -1872,6 +2144,9 @@ class SchedulerManager:
                 "vanished": int(summary_match.group("vanished")),
                 "errors": int(summary_match.group("errors")),
                 "quarantine_failures": int(summary_match.group("quarantine_failures")),
+                "large_media_files": int(summary_match.group("large_media_files") or 0),
+                "resumed_files": int(summary_match.group("resumed_files") or 0),
+                "resumed_bytes": summary_match.group("resumed_bytes") or "0 B",
                 "bytes": summary_match.group("bytes"),
                 "elapsed": summary_match.group("elapsed"),
                 "avg_throughput": summary_match.group("avg_throughput"),
@@ -2016,7 +2291,7 @@ class UIRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             status_payload = MANAGER.get_status()
-            ready_phases = {"idle", "enumerating", "indexing", "scanning", "cycle_complete", "waiting_lock"}
+            ready_phases = UI_READY_PHASES
             configured = bool(status_payload["configured"])
             scheduler_running = bool(status_payload["scheduler_running"])
             phase = str(status_payload["phase"])
@@ -2150,6 +2425,36 @@ class UIRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/actions/restart-scanner":
             try:
                 status = MANAGER.restart_scanner()
+            except ValueError as exc:
+                json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except Exception as exc:  # pragma: no cover - defensive HTTP path
+                self._handle_internal_error(exc)
+                return
+            json_response(self, HTTPStatus.OK, {"ok": True, "status": status})
+            return
+
+        if parsed.path == "/api/actions/pause-scan":
+            try:
+                status = MANAGER.pause_scan()
+            except ServiceUnavailableError as exc:
+                self._handle_service_unavailable(exc)
+                return
+            except ValueError as exc:
+                json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except Exception as exc:  # pragma: no cover - defensive HTTP path
+                self._handle_internal_error(exc)
+                return
+            json_response(self, HTTPStatus.OK, {"ok": True, "status": status})
+            return
+
+        if parsed.path == "/api/actions/resume-scan":
+            try:
+                status = MANAGER.resume_scan()
+            except ServiceUnavailableError as exc:
+                self._handle_service_unavailable(exc)
+                return
             except ValueError as exc:
                 json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return

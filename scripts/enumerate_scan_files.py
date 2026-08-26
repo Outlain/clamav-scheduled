@@ -8,6 +8,7 @@ import json
 import os
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 
 
 READ_SIZE = 64 * 1024
-POLL_SECONDS = 1.0
+POLL_SECONDS = 0.25
 TERMINATION_GRACE_SECONDS = 10.0
 DEFAULT_HEARTBEAT_SECONDS = 30
 MAX_DIAGNOSTIC_LINES = 100
@@ -106,6 +107,55 @@ def terminate_process_group(process: subprocess.Popen[bytes], sig: signal.Signal
         return
 
 
+def terminate_process_group_safely(
+    process: subprocess.Popen[bytes],
+    sig: signal.Signals,
+    *,
+    stopped: bool,
+) -> None:
+    if stopped:
+        terminate_process_group(process, signal.SIGCONT)
+    terminate_process_group(process, sig)
+
+
+def pause_file_exists(pause_file: Path) -> bool:
+    try:
+        info = pause_file.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(
+            f"pause file must be a regular file and not a symlink: {pause_file}"
+        )
+    return True
+
+
+def wait_for_initial_resume(
+    *,
+    label: str,
+    pause_file: Path,
+    heartbeat_seconds: int,
+    logger: DualLogger,
+) -> None:
+    if not pause_file_exists(pause_file):
+        return
+
+    logger.emit(f"[{label}] Enumeration paused by operator.")
+    paused_started = time.monotonic()
+    next_heartbeat = paused_started + heartbeat_seconds
+    while pause_file_exists(pause_file):
+        now = time.monotonic()
+        if now >= next_heartbeat:
+            logger.emit(
+                f"[{label}] Enumeration pause heartbeat: process_started=false "
+                f"paused_seconds={int(now - paused_started)}."
+            )
+            while next_heartbeat <= now:
+                next_heartbeat += heartbeat_seconds
+        time.sleep(min(POLL_SECONDS, max(0.0, next_heartbeat - now)))
+    logger.emit(f"[{label}] Enumeration resumed by operator.")
+
+
 def normalized_return_code(return_code: int) -> int:
     if return_code >= 0:
         return min(return_code, 255)
@@ -121,8 +171,18 @@ def run_enumeration(
     timeout_seconds: int,
     heartbeat_seconds: int,
     find_binary: str,
+    pause_file: Path,
     logger: DualLogger,
 ) -> int:
+    if not pause_file.is_absolute():
+        raise ValueError("pause-file must be absolute")
+    wait_for_initial_resume(
+        label=label,
+        pause_file=pause_file,
+        heartbeat_seconds=heartbeat_seconds,
+        logger=logger,
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("wb"):
         pass
@@ -153,6 +213,10 @@ def run_enumeration(
     timed_out = False
     termination_deadline: float | None = None
     kill_sent = False
+    process_stopped = False
+    pause_started: float | None = None
+    paused_total = 0.0
+    next_pause_heartbeat = 0.0
 
     def emit_diagnostic(line: bytes) -> None:
         nonlocal diagnostic_lines, suppressed_diagnostics
@@ -167,10 +231,38 @@ def run_enumeration(
     try:
         while selector.get_map() or process.poll() is None:
             now = time.monotonic()
-            if not timed_out and now >= deadline:
+            pause_requested = pause_file_exists(pause_file)
+            if (
+                pause_requested
+                and not timed_out
+                and not process_stopped
+                and process.poll() is None
+            ):
+                terminate_process_group(process, signal.SIGSTOP)
+                process_stopped = True
+                pause_started = now
+                next_pause_heartbeat = now + heartbeat_seconds
+                logger.emit(f"[{label}] Enumeration paused by operator.")
+            elif not pause_requested and process_stopped:
+                terminate_process_group(process, signal.SIGCONT)
+                process_stopped = False
+                assert pause_started is not None
+                pause_duration = max(0.0, now - pause_started)
+                paused_total += pause_duration
+                deadline += pause_duration
+                next_heartbeat += pause_duration
+                previous_heartbeat += pause_duration
+                pause_started = None
+                logger.emit(f"[{label}] Enumeration resumed by operator.")
+
+            if not process_stopped and not timed_out and now >= deadline:
                 timed_out = True
                 termination_deadline = now + TERMINATION_GRACE_SECONDS
-                terminate_process_group(process, signal.SIGTERM)
+                terminate_process_group_safely(
+                    process,
+                    signal.SIGTERM,
+                    stopped=process_stopped,
+                )
             elif (
                 timed_out
                 and process.poll() is None
@@ -179,10 +271,17 @@ def run_enumeration(
                 and not kill_sent
             ):
                 kill_sent = True
-                terminate_process_group(process, signal.SIGKILL)
+                terminate_process_group_safely(
+                    process,
+                    signal.SIGKILL,
+                    stopped=process_stopped,
+                )
 
-            wait_for = min(POLL_SECONDS, max(0.0, next_heartbeat - now))
-            if not timed_out:
+            if process_stopped:
+                wait_for = min(POLL_SECONDS, max(0.0, next_pause_heartbeat - now))
+            else:
+                wait_for = min(POLL_SECONDS, max(0.0, next_heartbeat - now))
+            if not timed_out and not process_stopped:
                 wait_for = min(wait_for, max(0.0, deadline - now))
             elif termination_deadline is not None and not kill_sent:
                 wait_for = min(wait_for, max(0.0, termination_deadline - now))
@@ -202,7 +301,18 @@ def run_enumeration(
                         emit_diagnostic(diagnostic)
 
             now = time.monotonic()
-            if now >= next_heartbeat and process.poll() is None:
+            if process_stopped and now >= next_pause_heartbeat and process.poll() is None:
+                assert pause_started is not None
+                logger.emit(
+                    f"[{label}] Enumeration pause heartbeat: process_started=true "
+                    f"visited_entries={traversal.visited_entries} "
+                    f"paused_seconds={int(now - pause_started)} "
+                    f"active_elapsed={int(pause_started - started - paused_total)}s "
+                    f"latest_path={display_text(traversal.latest_path)}"
+                )
+                while next_pause_heartbeat <= now:
+                    next_pause_heartbeat += heartbeat_seconds
+            elif not process_stopped and now >= next_heartbeat and process.poll() is None:
                 window_seconds = max(1, int(now - previous_heartbeat))
                 new_entries = traversal.visited_entries - previous_entries
                 try:
@@ -215,7 +325,7 @@ def run_enumeration(
                     f"new_entries={new_entries} "
                     f"window_seconds={window_seconds} "
                     f"raw_list_bytes={raw_list_bytes} "
-                    f"elapsed={int(now - started)}s "
+                    f"elapsed={int(now - started - paused_total)}s "
                     f"latest_path={display_text(traversal.latest_path)}"
                 )
                 previous_entries = traversal.visited_entries
@@ -243,7 +353,11 @@ def run_enumeration(
     finally:
         selector.close()
         if process.poll() is None:
-            terminate_process_group(process, signal.SIGKILL)
+            terminate_process_group_safely(
+                process,
+                signal.SIGKILL,
+                stopped=process_stopped,
+            )
             process.wait()
         process.stdout.close()
         process.stderr.close()
@@ -262,6 +376,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_HEARTBEAT_SECONDS,
     )
     parser.add_argument("--find-binary", default="find")
+    parser.add_argument("--pause-file", required=True, type=Path)
     parser.add_argument("--scanlog", required=True, type=Path)
     return parser.parse_args()
 
@@ -280,6 +395,8 @@ def main() -> int:
             raise ValueError("output must be absolute")
         if args.reference_file and not os.path.isabs(args.reference_file):
             raise ValueError("reference-file must be absolute")
+        if not args.pause_file.is_absolute():
+            raise ValueError("pause-file must be absolute")
         return run_enumeration(
             label=args.label,
             source_path=args.source_path,
@@ -288,9 +405,10 @@ def main() -> int:
             timeout_seconds=args.timeout_seconds,
             heartbeat_seconds=args.heartbeat_seconds,
             find_binary=args.find_binary,
+            pause_file=args.pause_file,
             logger=logger,
         )
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         detail = display_text(str(exc))
         try:
             logger.emit(f"[ERROR] [{args.label}] Enumeration helper failed: detail={detail}")

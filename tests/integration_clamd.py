@@ -256,7 +256,7 @@ def main() -> int:
                     raise AssertionError("quarantine destination is not mode 0600")
 
                 results_path = base / "results.jsonl"
-                writer = scanner_module.ResultsWriter(str(results_path))
+                writer = scanner_module.ResultsWriter(str(results_path), "f" * 32)
                 writer.write(
                     "INFECTED",
                     entry.size_bytes,

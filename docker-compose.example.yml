@@ -20,6 +20,11 @@ services:
       UI_PORT: 8080
       CONFIG_DIR: /config
       STATE_DIR: /state
+      SCAN_PROGRESS_DIR: /state/scan-progress
+      SCAN_PAUSE_FILE: /state/scan.pause
+      # Completed per-file scan work is reusable for 30 days after a restart.
+      # Set 0 for no age limit; file identities are still revalidated.
+      SCAN_RESUME_MAX_AGE_SECONDS: ${SCAN_RESUME_MAX_AGE_SECONDS:-2592000}
       EVENT_DIR: /events
       RUNTIME_DIR: /tmp/clamav-runtime
       UI_MAX_REQUEST_THREADS: 32
@@ -87,7 +92,10 @@ services:
       - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
       - /opt/docker/clamav-shared/logs/clamav-scheduled:/var/log/clamav:rw
       - /opt/docker/clamav-shared/events/clamav-scheduled:/events:rw
-      - /opt/docker/clamav-shared/state/clamav-scheduled:/state:rw
+      # This is private scanner state, not shared application data. Keep this
+      # host path on the Docker host's local SSD/NVMe (not NFS/SMB, /mnt/media,
+      # or another network mount) so restart journals do not add network I/O.
+      - ${SCHEDULED_STATE_HOST_PATH:-/opt/docker/clamav-shared/state/clamav-scheduled}:/state:rw
       - /opt/docker/clamav-shared/quarantine/clamav-scheduled:/quarantine:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777

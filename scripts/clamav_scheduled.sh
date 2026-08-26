@@ -25,6 +25,11 @@ umask 077
 : "${EXCLUDE_PATHS:=}"
 : "${FORCE_FULL_POLL_INTERVAL:=60}"
 : "${STATE_DIR:=/state}"
+: "${SCAN_PROGRESS_DIR:=${STATE_DIR}/scan-progress}"
+: "${SCAN_PAUSE_FILE:=${STATE_DIR}/scan.pause}"
+: "${SCAN_RESUME_MAX_AGE_SECONDS:=2592000}"
+: "${SCAN_PROGRESS_POLICY_VERSION:=scheduled-resume-v1}"
+: "${CLAMAV_PACKAGE_VERSION:=unknown}"
 : "${RUNTIME_DIR:=/tmp/clamav-runtime}"
 : "${TMP_DIR:=${RUNTIME_DIR}/work}"
 : "${DEFINITIONS_DIR:=/var/lib/clamav}"
@@ -62,6 +67,7 @@ umask 077
 : "${FFPROBE_BINARY:=/usr/bin/ffprobe}"
 : "${ENUMERATION_HELPER:=/usr/local/bin/enumerate_scan_files.py}"
 : "${SCHEDULE_HELPER:=/usr/local/bin/calendar_schedule.py}"
+: "${SCAN_PROGRESS_HELPER:=/usr/local/bin/scan_progress.py}"
 
 reject_deprecated_env() {
   VAR_NAME="$1"
@@ -282,6 +288,8 @@ PRIMARY_SCAN_PATH=$(get_primary_scan_path "$SCAN_PATHS")
 
 reject_control_characters "TZ" "$TZ"
 reject_control_characters "SCAN_PATH_MARKER" "$SCAN_PATH_MARKER"
+reject_control_characters "SCAN_PROGRESS_POLICY_VERSION" "$SCAN_PROGRESS_POLICY_VERSION"
+reject_control_characters "CLAMAV_PACKAGE_VERSION" "$CLAMAV_PACKAGE_VERSION"
 case "$SCAN_PATH_MARKER" in
   ''|.|..|*/*)
     if [ -n "$SCAN_PATH_MARKER" ]; then
@@ -292,6 +300,8 @@ case "$SCAN_PATH_MARKER" in
 esac
 
 STATE_DIR=$(normalize_absolute_path "STATE_DIR" "$STATE_DIR")
+SCAN_PROGRESS_DIR=$(normalize_absolute_path "SCAN_PROGRESS_DIR" "$SCAN_PROGRESS_DIR")
+SCAN_PAUSE_FILE=$(normalize_absolute_path "SCAN_PAUSE_FILE" "$SCAN_PAUSE_FILE")
 RUNTIME_DIR=$(normalize_absolute_path "RUNTIME_DIR" "$RUNTIME_DIR")
 TMP_DIR=$(normalize_absolute_path "TMP_DIR" "$TMP_DIR")
 DEFINITIONS_DIR=$(normalize_absolute_path "DEFINITIONS_DIR" "$DEFINITIONS_DIR")
@@ -301,6 +311,7 @@ SCANLOG=$(normalize_absolute_path "SCANLOG" "$SCANLOG")
 EVENT_DIR=$(normalize_absolute_path "EVENT_DIR" "$EVENT_DIR")
 FFPROBE_BINARY=$(normalize_absolute_path "FFPROBE_BINARY" "$FFPROBE_BINARY")
 SCHEDULE_HELPER=$(normalize_absolute_path "SCHEDULE_HELPER" "$SCHEDULE_HELPER")
+SCAN_PROGRESS_HELPER=$(normalize_absolute_path "SCAN_PROGRESS_HELPER" "$SCAN_PROGRESS_HELPER")
 CLAMD_SOCKET="$RUNTIME_DIR/clamd.sock"
 CLAMD_CONFIG="$RUNTIME_DIR/clamd.conf"
 CLAMD_PID_FILE="$RUNTIME_DIR/clamd.pid"
@@ -392,6 +403,7 @@ validate_bounded_int "FORCE_FULL_POLL_INTERVAL" "$FORCE_FULL_POLL_INTERVAL" 1 36
 validate_bounded_int "PATH_CHECK_TIMEOUT" "$PATH_CHECK_TIMEOUT" 1 300
 validate_bounded_int "PATH_ENUMERATION_TIMEOUT" "$PATH_ENUMERATION_TIMEOUT" 1 86400
 validate_bounded_int "PATH_UNAVAILABLE_RETRY_INTERVAL" "$PATH_UNAVAILABLE_RETRY_INTERVAL" 1 86400
+validate_bounded_int "SCAN_RESUME_MAX_AGE_SECONDS" "$SCAN_RESUME_MAX_AGE_SECONDS" 0 31536000
 validate_bounded_int "DEFINITIONS_WAIT_TIMEOUT" "$DEFINITIONS_WAIT_TIMEOUT" 1 3600
 validate_bounded_int "DEFINITIONS_MAX_AGE_SECONDS" "$DEFINITIONS_MAX_AGE_SECONDS" 60 2678400
 validate_bounded_int "CLAMD_MAX_RECURSION" "$CLAMD_MAX_RECURSION" 1 100
@@ -509,6 +521,11 @@ if [ ! -r "$SCHEDULE_HELPER" ]; then
   exit 1
 fi
 
+if [ ! -r "$SCAN_PROGRESS_HELPER" ]; then
+  echo "[ERROR] Durable scan-progress helper is unavailable: ${SCAN_PROGRESS_HELPER}" >&2
+  exit 1
+fi
+
 if ! validate_calendar_config changed_scan "$CHANGED_SCAN_DAYS" "$CHANGED_SCAN_MONTHS" "$CHANGED_SCAN_MONTH_DAYS" "$CHANGED_SCAN_TIMES"; then
   echo "[ERROR] Changed-file calendar schedule is invalid." >&2
   exit 1
@@ -537,7 +554,8 @@ ensure_writable_directory() {
 }
 
 SCANLOG_DIR=$(dirname -- "$SCANLOG")
-for REQUIRED_DIRECTORY in "$QUARANTINE_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$SCANLOG_DIR" "$EVENT_DIR"; do
+SCAN_PAUSE_DIR=$(dirname -- "$SCAN_PAUSE_FILE")
+for REQUIRED_DIRECTORY in "$QUARANTINE_DIR" "$STATE_DIR" "$SCAN_PROGRESS_DIR" "$SCAN_PAUSE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$SCANLOG_DIR" "$EVENT_DIR"; do
   if ! mkdir -p -- "$REQUIRED_DIRECTORY"; then
     echo "[ERROR] Could not create required writable directory: ${REQUIRED_DIRECTORY}" >&2
     exit 1
@@ -545,6 +563,8 @@ for REQUIRED_DIRECTORY in "$QUARANTINE_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DI
 done
 ensure_writable_directory "$QUARANTINE_DIR" "Quarantine directory"
 ensure_writable_directory "$STATE_DIR" "State directory"
+ensure_writable_directory "$SCAN_PROGRESS_DIR" "Durable scan-progress directory"
+ensure_writable_directory "$SCAN_PAUSE_DIR" "Scan-pause control directory"
 ensure_writable_directory "$RUNTIME_DIR" "Runtime directory"
 ensure_writable_directory "$TMP_DIR" "Temporary work directory"
 ensure_writable_directory "$SCANLOG_DIR" "Scan-log directory"
@@ -596,7 +616,7 @@ for SCAN_PATH_PERMISSION_CHECK do
       exit 1
       ;;
   esac
-  for INTERNAL_PATH in "$STATE_DIR" "$RUNTIME_DIR" "$TMP_DIR" "$DEFINITIONS_DIR" "$SCANLOG" "$EVENT_DIR"; do
+  for INTERNAL_PATH in "$STATE_DIR" "$SCAN_PROGRESS_DIR" "$SCAN_PAUSE_FILE" "$RUNTIME_DIR" "$TMP_DIR" "$DEFINITIONS_DIR" "$SCANLOG" "$EVENT_DIR"; do
     case "$INTERNAL_PATH" in
       "$SCAN_PATH_PERMISSION_CHECK"|"$SCAN_PATH_PERMISSION_CHECK"/*)
         echo "[ERROR] Mutable state, runtime files, definitions, and logs must be outside scan roots (path: ${INTERNAL_PATH}, root: ${SCAN_PATH_PERMISSION_CHECK})." >&2
@@ -612,7 +632,7 @@ if ! : >> "$SCANLOG"; then
 fi
 
 echo "=== Starting scheduled ClamAV scanner ===" | tee -a "$SCANLOG"
-echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_MONTHS=$CHANGED_SCAN_MONTHS CHANGED_SCAN_MONTH_DAYS=$CHANGED_SCAN_MONTH_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_MONTHS=$FULL_SCAN_MONTHS FULL_SCAN_MONTH_DAYS=$FULL_SCAN_MONTH_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL FORCE_FULL_POLL_INTERVAL=$FORCE_FULL_POLL_INTERVAL SCAN_PATHS=$SCAN_PATHS EXCLUDE_PATHS=$EXCLUDE_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR EVENT_DIR=$EVENT_DIR DEFINITIONS_DIR=$DEFINITIONS_DIR DEFINITIONS_MAX_AGE_SECONDS=$DEFINITIONS_MAX_AGE_SECONDS PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER VANISHED_FILE_FAILURE_COUNT=$VANISHED_FILE_FAILURE_COUNT VANISHED_FILE_FAILURE_PERCENT=$VANISHED_FILE_FAILURE_PERCENT VANISHED_FILE_FAILURE_MINIMUM=$VANISHED_FILE_FAILURE_MINIMUM LARGE_MEDIA_ENABLED=$LARGE_MEDIA_ENABLED LARGE_MEDIA_MAX_FILE_GIB=$LARGE_MEDIA_MAX_FILE_GIB LARGE_MEDIA_CHUNK_MIB=$LARGE_MEDIA_CHUNK_MIB LARGE_MEDIA_OVERLAP_KIB=$LARGE_MEDIA_OVERLAP_KIB MAX_LARGE_MEDIA_WORKERS=$MAX_LARGE_MEDIA_WORKERS" | tee -a "$SCANLOG"
+echo "TZ=$TZ MAXTHREADS=$MAXTHREADS FULL_SCAN_PARALLEL_JOBS=$FULL_SCAN_PARALLEL_JOBS CHANGED_SCAN_PARALLEL_JOBS=$CHANGED_SCAN_PARALLEL_JOBS FULL_CHUNK_SIZE=$FULL_CHUNK_SIZE CHANGED_CHUNK_SIZE=$CHANGED_CHUNK_SIZE FULL_PROGRESS_STEPS=$FULL_PROGRESS_STEPS CHANGED_PROGRESS_STEPS=$CHANGED_PROGRESS_STEPS CHANGED_SCAN_DAYS=$CHANGED_SCAN_DAYS CHANGED_SCAN_MONTHS=$CHANGED_SCAN_MONTHS CHANGED_SCAN_MONTH_DAYS=$CHANGED_SCAN_MONTH_DAYS CHANGED_SCAN_TIMES=$CHANGED_SCAN_TIMES FULL_SCAN_DAYS=$FULL_SCAN_DAYS FULL_SCAN_MONTHS=$FULL_SCAN_MONTHS FULL_SCAN_MONTH_DAYS=$FULL_SCAN_MONTH_DAYS FULL_SCAN_TIMES=$FULL_SCAN_TIMES SCAN_FAILURE_RETRY_INTERVAL=$SCAN_FAILURE_RETRY_INTERVAL FORCE_FULL_POLL_INTERVAL=$FORCE_FULL_POLL_INTERVAL SCAN_PATHS=$SCAN_PATHS EXCLUDE_PATHS=$EXCLUDE_PATHS QUARANTINE_DIR=$QUARANTINE_DIR STATE_DIR=$STATE_DIR SCAN_PROGRESS_DIR=$SCAN_PROGRESS_DIR SCAN_PAUSE_FILE=$SCAN_PAUSE_FILE SCAN_RESUME_MAX_AGE_SECONDS=$SCAN_RESUME_MAX_AGE_SECONDS EVENT_DIR=$EVENT_DIR DEFINITIONS_DIR=$DEFINITIONS_DIR DEFINITIONS_MAX_AGE_SECONDS=$DEFINITIONS_MAX_AGE_SECONDS PATH_CHECK_TIMEOUT=$PATH_CHECK_TIMEOUT PATH_ENUMERATION_TIMEOUT=$PATH_ENUMERATION_TIMEOUT PATH_UNAVAILABLE_RETRY_INTERVAL=$PATH_UNAVAILABLE_RETRY_INTERVAL SCAN_PATH_MARKER=$SCAN_PATH_MARKER VANISHED_FILE_FAILURE_COUNT=$VANISHED_FILE_FAILURE_COUNT VANISHED_FILE_FAILURE_PERCENT=$VANISHED_FILE_FAILURE_PERCENT VANISHED_FILE_FAILURE_MINIMUM=$VANISHED_FILE_FAILURE_MINIMUM LARGE_MEDIA_ENABLED=$LARGE_MEDIA_ENABLED LARGE_MEDIA_MAX_FILE_GIB=$LARGE_MEDIA_MAX_FILE_GIB LARGE_MEDIA_CHUNK_MIB=$LARGE_MEDIA_CHUNK_MIB LARGE_MEDIA_OVERLAP_KIB=$LARGE_MEDIA_OVERLAP_KIB MAX_LARGE_MEDIA_WORKERS=$MAX_LARGE_MEDIA_WORKERS" | tee -a "$SCANLOG"
 
 echo "Waiting up to ${DEFINITIONS_WAIT_TIMEOUT}s for external definitions..." | tee -a "$SCANLOG"
 if ! python3 /usr/local/bin/clamav_healthcheck.py --wait; then
@@ -806,6 +826,7 @@ get_scan_root_for_path() {
 }
 
 load_manual_full_request() {
+  MANUAL_FULL_REQUEST_ID=""
   MANUAL_FULL_REQUEST_TARGET_PATHS=""
   MANUAL_FULL_REQUEST_IGNORE_PATHS=""
   MANUAL_FULL_REQUEST_CREATED_AT=""
@@ -814,6 +835,9 @@ load_manual_full_request() {
 
   while IFS='=' read -r KEY VALUE || [ -n "$KEY" ]; do
     case "$KEY" in
+      REQUEST_ID)
+        MANUAL_FULL_REQUEST_ID="$VALUE"
+        ;;
       REQUEST_TARGET_PATHS)
         MANUAL_FULL_REQUEST_TARGET_PATHS="$VALUE"
         ;;
@@ -834,10 +858,22 @@ load_manual_full_request() {
   MANUAL_FULL_REQUEST_TARGET_PATHS=$(normalize_absolute_path_list "MANUAL_FULL_REQUEST_TARGET_PATHS" "$MANUAL_FULL_REQUEST_TARGET_PATHS")
   MANUAL_FULL_REQUEST_IGNORE_PATHS=$(normalize_absolute_path_list "MANUAL_FULL_REQUEST_IGNORE_PATHS" "$MANUAL_FULL_REQUEST_IGNORE_PATHS")
 
+  if [ -n "$MANUAL_FULL_REQUEST_ID" ]; then
+    case "$MANUAL_FULL_REQUEST_ID" in
+      *[!0-9a-f]*)
+        return 2
+        ;;
+    esac
+    [ "${#MANUAL_FULL_REQUEST_ID}" -eq 32 ] || return 2
+  else
+    MANUAL_FULL_REQUEST_ID="legacy-$(sha256sum "$MANUAL_FULL_REQUEST_FILE" | awk '{print $1}')"
+  fi
+
   return 0
 }
 
 load_manual_changed_request() {
+  MANUAL_CHANGED_REQUEST_ID=""
   MANUAL_CHANGED_REQUEST_MODE=""
   MANUAL_CHANGED_REFERENCE_EPOCH=""
   MANUAL_CHANGED_LOOKBACK_SECONDS=0
@@ -849,6 +885,9 @@ load_manual_changed_request() {
 
   while IFS='=' read -r KEY VALUE || [ -n "$KEY" ]; do
     case "$KEY" in
+      REQUEST_ID)
+        MANUAL_CHANGED_REQUEST_ID="$VALUE"
+        ;;
       REQUEST_MODE)
         MANUAL_CHANGED_REQUEST_MODE="$VALUE"
         ;;
@@ -889,7 +928,36 @@ load_manual_changed_request() {
   MANUAL_CHANGED_REQUEST_TARGET_PATHS=$(normalize_absolute_path_list "MANUAL_CHANGED_REQUEST_TARGET_PATHS" "$MANUAL_CHANGED_REQUEST_TARGET_PATHS")
   MANUAL_CHANGED_REQUEST_IGNORE_PATHS=$(normalize_absolute_path_list "MANUAL_CHANGED_REQUEST_IGNORE_PATHS" "$MANUAL_CHANGED_REQUEST_IGNORE_PATHS")
 
+  if [ -n "$MANUAL_CHANGED_REQUEST_ID" ]; then
+    case "$MANUAL_CHANGED_REQUEST_ID" in
+      *[!0-9a-f]*)
+        return 2
+        ;;
+    esac
+    [ "${#MANUAL_CHANGED_REQUEST_ID}" -eq 32 ] || return 2
+  else
+    MANUAL_CHANGED_REQUEST_ID="legacy-$(sha256sum "$MANUAL_CHANGED_REQUEST_FILE" | awk '{print $1}')"
+  fi
+
   return 0
+}
+
+consume_manual_request_if_matching() {
+  LABEL="$1"
+  REQUEST_FILE="$2"
+  EXPECTED_ID="$3"
+
+  [ -f "$REQUEST_FILE" ] || return 0
+  CURRENT_ID=$(sed -n 's/^REQUEST_ID=//p' "$REQUEST_FILE" | head -n 1)
+  if [ -z "$CURRENT_ID" ]; then
+    CURRENT_ID="legacy-$(sha256sum "$REQUEST_FILE" | awk '{print $1}')"
+  fi
+  if [ "$CURRENT_ID" != "$EXPECTED_ID" ]; then
+    echo "[MANUAL] [$LABEL] A newer on-demand request is queued; leaving it in place." | tee -a "$SCANLOG"
+    return 0
+  fi
+  rm -f -- "$REQUEST_FILE"
+  echo "[MANUAL] [$LABEL] Completed on-demand request was consumed." | tee -a "$SCANLOG"
 }
 
 manual_full_request_should_wake() {
@@ -1070,7 +1138,8 @@ check_scan_path_health() {
 
 capture_scan_root_guard() {
   LABEL="$1"
-  GUARD_FILE="$TMP_DIR/${LABEL}_scan_roots.json"
+  GUARD_FILE="${2:-}"
+  [ -n "$GUARD_FILE" ] || GUARD_FILE="$TMP_DIR/${LABEL}_scan_roots.json"
   if python3 /usr/local/bin/scan_root_guard.py capture --roots "$SCAN_PATHS" --marker "$SCAN_PATH_MARKER" --output "$GUARD_FILE"; then
     return 0
   fi
@@ -1082,7 +1151,8 @@ capture_scan_root_guard() {
 
 verify_scan_root_guard() {
   LABEL="$1"
-  GUARD_FILE="$TMP_DIR/${LABEL}_scan_roots.json"
+  GUARD_FILE="${2:-}"
+  [ -n "$GUARD_FILE" ] || GUARD_FILE="$TMP_DIR/${LABEL}_scan_roots.json"
   if python3 /usr/local/bin/scan_root_guard.py verify --input "$GUARD_FILE"; then
     return 0
   fi
@@ -1127,6 +1197,7 @@ append_path_scan_list() {
       --output "$RAW_LIST_FILE" \
       --reference-file "$REFERENCE_FILE" \
       --timeout-seconds "$PATH_ENUMERATION_TIMEOUT" \
+      --pause-file "$SCAN_PAUSE_FILE" \
       --scanlog "$SCANLOG"; then
       RC=0
     else
@@ -1138,6 +1209,7 @@ append_path_scan_list() {
       --source-path "$SOURCE_PATH" \
       --output "$RAW_LIST_FILE" \
       --timeout-seconds "$PATH_ENUMERATION_TIMEOUT" \
+      --pause-file "$SCAN_PAUSE_FILE" \
       --scanlog "$SCANLOG"; then
       RC=0
     else
@@ -1183,11 +1255,13 @@ build_scan_list() {
   LIST_FILE="$2"
   REFERENCE_EPOCH="$3"
   EXTRA_IGNORE_PATHS="${4:-}"
+  GUARD_FILE="${5:-}"
+  [ -n "$GUARD_FILE" ] || GUARD_FILE="$TMP_DIR/${LABEL}_scan_roots.json"
   PATH_COUNT=0
   TOTAL_LIST_FILES=0
   OLD_IFS="$IFS"
 
-  capture_scan_root_guard "$LABEL" || return 2
+  capture_scan_root_guard "$LABEL" "$GUARD_FILE" || return 2
   : > "$LIST_FILE"
 
   IFS=':'
@@ -1234,11 +1308,13 @@ build_targeted_scan_list() {
   REFERENCE_EPOCH="$3"
   TARGET_PATHS="$4"
   EXTRA_IGNORE_PATHS="${5:-}"
+  GUARD_FILE="${6:-}"
+  [ -n "$GUARD_FILE" ] || GUARD_FILE="$TMP_DIR/${LABEL}_scan_roots.json"
   TARGET_COUNT=0
   TOTAL_LIST_FILES=0
   OLD_IFS="$IFS"
 
-  capture_scan_root_guard "$LABEL" || return 2
+  capture_scan_root_guard "$LABEL" "$GUARD_FILE" || return 2
   : > "$LIST_FILE"
 
   IFS=':'
@@ -1273,18 +1349,147 @@ build_targeted_scan_list() {
   echo "[$LABEL] File-list build completed: eligible_files=${TOTAL_LIST_FILES} sources=${TARGET_COUNT}." | tee -a "$SCANLOG"
 }
 
+scan_progress_fingerprint() {
+  LABEL="$1"
+  BUILD_MODE="$2"
+  TARGET_PATHS="$3"
+  IGNORE_PATHS="$4"
+  ADVANCES_CHECKPOINTS="$5"
+
+  {
+    printf '%s\n' \
+      "progress_policy=${SCAN_PROGRESS_POLICY_VERSION}" \
+      "clamav_package=${CLAMAV_PACKAGE_VERSION}" \
+      "label=${LABEL}" \
+      "build_mode=${BUILD_MODE}" \
+      "target_paths=${TARGET_PATHS}" \
+      "ignore_paths=${IGNORE_PATHS}" \
+      "advances_checkpoints=${ADVANCES_CHECKPOINTS}" \
+      "scan_paths=${SCAN_PATHS}" \
+      "exclude_paths=${EXCLUDE_PATHS}" \
+      "quarantine_dir=${QUARANTINE_DIR}" \
+      "scan_path_marker=${SCAN_PATH_MARKER}" \
+      "clamd_max_scan_size=${CLAMD_MAX_SCAN_SIZE}" \
+      "clamd_max_file_size=${CLAMD_MAX_FILE_SIZE}" \
+      "clamd_max_recursion=${CLAMD_MAX_RECURSION}" \
+      "clamd_max_files=${CLAMD_MAX_FILES}" \
+      "clamd_max_scan_time=${CLAMD_MAX_SCAN_TIME}" \
+      "max_scheduled_files=${MAX_SCHEDULED_FILES}" \
+      "vanished_failure_count=${VANISHED_FILE_FAILURE_COUNT}" \
+      "vanished_failure_percent=${VANISHED_FILE_FAILURE_PERCENT}" \
+      "vanished_failure_minimum=${VANISHED_FILE_FAILURE_MINIMUM}" \
+      "large_media_enabled=${LARGE_MEDIA_ENABLED}" \
+      "large_media_max_file_gib=${LARGE_MEDIA_MAX_FILE_GIB}" \
+      "large_media_chunk_mib=${LARGE_MEDIA_CHUNK_MIB}" \
+      "large_media_overlap_kib=${LARGE_MEDIA_OVERLAP_KIB}" \
+      "large_media_probe_timeout_seconds=${LARGE_MEDIA_PROBE_TIMEOUT_SECONDS}" \
+      "large_media_scan_timeout_seconds=${LARGE_MEDIA_SCAN_TIMEOUT_SECONDS}" \
+      "ffprobe_binary=${FFPROBE_BINARY}"
+  } | sha256sum | awk '{print "sha256:" $1}'
+}
+
+prepare_scan_progress() {
+  LABEL="$1"
+  FINGERPRINT="$2"
+  CUTOFF_EPOCH="$3"
+  REFERENCE_EPOCH="$4"
+  REQUEST_IDENTITY="$5"
+  REQUEST_MODE="$6"
+
+  if ! PROGRESS_OUTPUT=$(python3 "$SCAN_PROGRESS_HELPER" prepare \
+    --progress-root "$SCAN_PROGRESS_DIR" \
+    --fingerprint "$FINGERPRINT" \
+    --label "$LABEL" \
+    --cutoff-epoch "$CUTOFF_EPOCH" \
+    --reference-epoch "$REFERENCE_EPOCH" \
+    --request-identity "$REQUEST_IDENTITY" \
+    --request-mode "$REQUEST_MODE" \
+    --max-age-seconds "$SCAN_RESUME_MAX_AGE_SECONDS"); then
+    echo "[ERROR] [$LABEL] Could not prepare durable scan progress." | tee -a "$SCANLOG"
+    return 1
+  fi
+  eval "$PROGRESS_OUTPUT"
+}
+
+mark_scan_progress_ready() {
+  LABEL="$1"
+  if ! PROGRESS_OUTPUT=$(python3 "$SCAN_PROGRESS_HELPER" mark-ready \
+    --progress-root "$SCAN_PROGRESS_DIR" \
+    --scan-id "$PROGRESS_SCAN_ID"); then
+    echo "[ERROR] [$LABEL] Could not publish the durable file manifest." | tee -a "$SCANLOG"
+    return 1
+  fi
+  eval "$PROGRESS_OUTPUT"
+}
+
+clear_scan_progress() {
+  LABEL="$1"
+  SCAN_ID="$2"
+  if python3 "$SCAN_PROGRESS_HELPER" clear \
+    --progress-root "$SCAN_PROGRESS_DIR" \
+    --scan-id "$SCAN_ID" >/dev/null; then
+    echo "[$LABEL] Durable active-scan progress was cleared after successful completion." | tee -a "$SCANLOG"
+    return 0
+  fi
+  echo "[ERROR] [$LABEL] The scan succeeded, but durable active-scan progress could not be cleared; one-shot request flags were left intact." | tee -a "$SCANLOG"
+  return 1
+}
+
+check_all_scan_paths_health() {
+  LABEL="$1"
+  OLD_IFS="$IFS"
+  IFS=':'
+  set -- $SCAN_PATHS
+  IFS="$OLD_IFS"
+  for SCAN_PATH do
+    check_scan_path_health "$LABEL" "$SCAN_PATH" || return 1
+  done
+}
+
+resume_manifest_is_safe() {
+  LABEL="$1"
+  GUARD_FILE="$2"
+  EXPECTED_SCAN_ID="$3"
+
+  # A missing/unreadable root or marker may be a transient outage. Preserve
+  # the exact session and wait rather than enumerating a mountpoint fallback.
+  check_all_scan_paths_health "$LABEL" || return 2
+  if ! verify_scan_root_guard "$LABEL" "$GUARD_FILE"; then
+    if [ -n "$SCAN_PATH_MARKER" ]; then
+      # check_all_scan_paths_health just proved that every configured root is
+      # available and contains its marker. A host reboot/remount can legitimately
+      # change st_dev while leaving the intended marked filesystem mounted. Old
+      # per-file results must not cross that identity boundary, so discard only
+      # this expected session and force a complete fresh enumeration.
+      if python3 "$SCAN_PROGRESS_HELPER" clear \
+        --progress-root "$SCAN_PROGRESS_DIR" \
+        --scan-id "$EXPECTED_SCAN_ID" >/dev/null; then
+        echo "[WARN] [$LABEL] The marked scan root was remounted with a new identity; discarded the saved session and will build a fresh file manifest." | tee -a "$SCANLOG"
+        return 3
+      fi
+      echo "[ERROR] [$LABEL] The marked scan root identity changed, but the expected durable session could not be discarded safely." | tee -a "$SCANLOG"
+      return 2
+    fi
+    echo "[WARN] [$LABEL] Saved progress was retained, but it cannot resume until the original scan-root identity returns; configure SCAN_PATH_MARKER to permit safe re-enumeration after a verified remount." | tee -a "$SCANLOG"
+    return 2
+  fi
+  return 0
+}
+
 run_scan_list() {
   LIST_FILE="$1"
   LABEL="$2"
   CONFIGURED_PARALLEL_JOBS="$3"
   REQUESTED_CHUNK_SIZE="$4"
   PROGRESS_STEPS="$5"
-
-  RESULTS_FILE="$TMP_DIR/${LABEL}_results.jsonl"
+  RESULTS_FILE="$6"
+  GUARD_FILE="$7"
+  SCAN_ID="$8"
   if python3 /usr/local/bin/clamd_session_scan.py \
     --socket "$CLAMD_SOCKET" \
     --list-file "$LIST_FILE" \
     --results-file "$RESULTS_FILE" \
+    --scan-id "$SCAN_ID" \
     --quarantine-dir "$QUARANTINE_DIR" \
     --configured-workers "$CONFIGURED_PARALLEL_JOBS" \
     --requested-progress-interval "$REQUESTED_CHUNK_SIZE" \
@@ -1307,8 +1512,9 @@ run_scan_list() {
     --large-media-probe-timeout "$LARGE_MEDIA_PROBE_TIMEOUT_SECONDS" \
     --large-media-scan-timeout "$LARGE_MEDIA_SCAN_TIMEOUT_SECONDS" \
     --large-media-workers "$MAX_LARGE_MEDIA_WORKERS" \
-    --ffprobe-binary "$FFPROBE_BINARY"; then
-    if ensure_clamd_alive && verify_scan_root_guard "$LABEL"; then
+    --ffprobe-binary "$FFPROBE_BINARY" \
+    --pause-file "$SCAN_PAUSE_FILE"; then
+    if ensure_clamd_alive && verify_scan_root_guard "$LABEL" "$GUARD_FILE"; then
       echo "[$LABEL] Completed successfully." | tee -a "$SCANLOG"
       return 0
     fi
@@ -1378,6 +1584,30 @@ while true; do
   evaluate_changed_trigger
   evaluate_full_trigger
 
+  ACTIVE_PROGRESS_LABEL=""
+  if PROGRESS_STATUS_OUTPUT=$(python3 "$SCAN_PROGRESS_HELPER" status --progress-root "$SCAN_PROGRESS_DIR" 2>>"$SCANLOG"); then
+    eval "$PROGRESS_STATUS_OUTPUT"
+    if [ "${PROGRESS_STATE:-NONE}" = "READY" ]; then
+      ACTIVE_PROGRESS_LABEL="$PROGRESS_LABEL"
+      case "$ACTIVE_PROGRESS_LABEL" in
+        FULL)
+          FULL_DUE=1
+          FULL_NEXT_WAKE_EPOCH="$NOW"
+          ;;
+        CHANGED)
+          # Finish an interrupted changed scan before starting a newly due
+          # full scan; otherwise the full prepare step would replace its
+          # compatible saved manifest.
+          CHANGED_DUE=1
+          CHANGED_NEXT_WAKE_EPOCH="$NOW"
+          FULL_DUE=0
+          ;;
+      esac
+    fi
+  else
+    echo "[WARN] Durable active-scan status could not be read; the due scan will safely validate or rebuild it." | tee -a "$SCANLOG"
+  fi
+
   CYCLE_ABORT=0
 
   if [ "$FULL_DUE" -eq 0 ] && [ "$CHANGED_DUE" -eq 0 ]; then
@@ -1394,12 +1624,14 @@ while true; do
   if [ "$FULL_DUE" -eq 1 ]; then
     echo "=== FULL SCAN starting ===" | tee -a "$SCANLOG"
 
-    FULL_LIST="$TMP_DIR/full_list.nul"
     FULL_SCAN_CUTOFF=$(date +%s)
     FULL_TARGET_PATHS="$SCAN_PATHS"
     FULL_IGNORE_PATHS=""
     FULL_ADVANCES_CHECKPOINTS=1
     FULL_BUILD_MODE="scan_paths"
+    FULL_REQUEST_MODE="scheduled"
+    FULL_REQUEST_IDENTITY="scheduled-full"
+    FULL_REQUEST_ID=""
 
     if [ "$FULL_MANUAL_REQUEST" -eq 1 ]; then
       [ -n "$MANUAL_FULL_REQUEST_TARGET_PATHS" ] && FULL_TARGET_PATHS="$MANUAL_FULL_REQUEST_TARGET_PATHS"
@@ -1410,29 +1642,62 @@ while true; do
       if [ -n "$MANUAL_FULL_REQUEST_TARGET_PATHS" ] || [ -n "$MANUAL_FULL_REQUEST_IGNORE_PATHS" ]; then
         FULL_ADVANCES_CHECKPOINTS=0
       fi
+      FULL_REQUEST_MODE="manual-full"
+      FULL_REQUEST_ID="$MANUAL_FULL_REQUEST_ID"
+      FULL_REQUEST_IDENTITY="manual-full:${FULL_REQUEST_ID}"
       IGNORE_DESC="$FULL_IGNORE_PATHS"
       [ -n "$IGNORE_DESC" ] || IGNORE_DESC="<none>"
       echo "[MANUAL] Starting on-demand full scan over target paths ${FULL_TARGET_PATHS} with ignore paths ${IGNORE_DESC}." | tee -a "$SCANLOG"
+    elif [ "$FORCE" -eq 1 ]; then
+      FULL_REQUEST_MODE="force-full"
+      FULL_REQUEST_IDENTITY="force-full"
     fi
 
-    if [ "$FULL_BUILD_MODE" = "target_paths" ]; then
-      FULL_BUILD_OK=0
-      if build_targeted_scan_list "FULL" "$FULL_LIST" 0 "$FULL_TARGET_PATHS" "$FULL_IGNORE_PATHS"; then
-        FULL_BUILD_OK=1
-      else
-        RC=$?
+    FULL_BUILD_OK=0
+    FULL_FINGERPRINT=$(scan_progress_fingerprint "FULL" "$FULL_BUILD_MODE" "$FULL_TARGET_PATHS" "$FULL_IGNORE_PATHS" "$FULL_ADVANCES_CHECKPOINTS")
+    FULL_PREPARE_ATTEMPTS=0
+    while [ "$FULL_BUILD_OK" -eq 0 ] && [ "$FULL_PREPARE_ATTEMPTS" -lt 2 ]; do
+      FULL_PREPARE_ATTEMPTS=$((FULL_PREPARE_ATTEMPTS + 1))
+      if ! prepare_scan_progress "FULL" "$FULL_FINGERPRINT" "$FULL_SCAN_CUTOFF" 0 "$FULL_REQUEST_IDENTITY" "$FULL_REQUEST_MODE"; then
+        RC=1
+        break
       fi
-    else
-      FULL_BUILD_OK=0
-      if build_scan_list "FULL" "$FULL_LIST" 0 "$FULL_IGNORE_PATHS"; then
-        FULL_BUILD_OK=1
+
+      FULL_SCAN_ID="$PROGRESS_SCAN_ID"
+      FULL_SCAN_CUTOFF="$PROGRESS_CUTOFF_EPOCH"
+      FULL_LIST="$PROGRESS_FILES_NUL"
+      FULL_RESULTS="$PROGRESS_COMPLETED_JSONL"
+      FULL_ROOT_GUARD="$PROGRESS_ROOTS_JSON"
+
+      if [ "$PROGRESS_ACTION" = "RESUME" ]; then
+        echo "[FULL] Restart-safe progress found: completed_records=${PROGRESS_COMPLETED_RECORDS} original_cutoff=${FULL_SCAN_CUTOFF}." | tee -a "$SCANLOG"
+        if resume_manifest_is_safe "FULL" "$FULL_ROOT_GUARD" "$FULL_SCAN_ID"; then
+          FULL_BUILD_OK=1
+        else
+          RC=$?
+          if [ "$RC" -eq 3 ] && [ "$FULL_PREPARE_ATTEMPTS" -lt 2 ]; then
+            FULL_SCAN_CUTOFF=$(date +%s)
+            continue
+          fi
+        fi
+      elif [ "$FULL_BUILD_MODE" = "target_paths" ]; then
+        if build_targeted_scan_list "FULL" "$FULL_LIST" 0 "$FULL_TARGET_PATHS" "$FULL_IGNORE_PATHS" "$FULL_ROOT_GUARD" && mark_scan_progress_ready "FULL"; then
+          FULL_BUILD_OK=1
+        else
+          RC=$?
+        fi
       else
-        RC=$?
+        if build_scan_list "FULL" "$FULL_LIST" 0 "$FULL_IGNORE_PATHS" "$FULL_ROOT_GUARD" && mark_scan_progress_ready "FULL"; then
+          FULL_BUILD_OK=1
+        else
+          RC=$?
+        fi
       fi
-    fi
+      break
+    done
 
     if [ "$FULL_BUILD_OK" -eq 1 ]; then
-      if run_scan_list "$FULL_LIST" "FULL" "$FULL_SCAN_PARALLEL_JOBS" "$FULL_CHUNK_SIZE" "$FULL_PROGRESS_STEPS"; then
+      if run_scan_list "$FULL_LIST" "FULL" "$FULL_SCAN_PARALLEL_JOBS" "$FULL_CHUNK_SIZE" "$FULL_PROGRESS_STEPS" "$FULL_RESULTS" "$FULL_ROOT_GUARD" "$FULL_SCAN_ID"; then
         if [ "$FULL_ADVANCES_CHECKPOINTS" -eq 1 ]; then
           FULL_SUCCESS_EPOCH=$(date +%s)
           NEW_CHANGED_EPOCH="$LAST_CHANGED_EPOCH"
@@ -1454,24 +1719,32 @@ while true; do
         else
           echo "[FULL] Scoped on-demand full scan completed; scheduled full and changed checkpoints were left unchanged." | tee -a "$SCANLOG"
         fi
-        emit_scheduled_recovery "Scheduled scanning recovered after a successful full scan" || true
-        NEXT_FULL_RETRY_EPOCH=0
-        echo "=== FULL SCAN finished ===" | tee -a "$SCANLOG"
-
         if [ "$FULL_ADVANCES_CHECKPOINTS" -eq 1 ] && [ "$CHANGED_DUE" -eq 1 ] && [ "$CHANGED_MANUAL_REQUEST" -eq 0 ]; then
           CHANGED_DUE=0
           echo "[CHANGED] Skipping changed-files scan because the successful full scan already covered files through $(date -d "@$FULL_SCAN_CUTOFF")." | tee -a "$SCANLOG"
         fi
 
+        # Commit checkpoints first, then retire this exact durable session,
+        # and only then consume one-shot triggers. If the clear fails, the
+        # matching request remains available and the completed journal can be
+        # retried without changing the job identity. If a later trigger removal
+        # fails, the safe outcome is an extra scan rather than a lost request.
+        if ! clear_scan_progress "FULL" "$FULL_SCAN_ID"; then
+          exit 1
+        fi
+
         if [ "$FULL_MANUAL_REQUEST" -eq 1 ] && [ -f "$MANUAL_FULL_REQUEST_FILE" ]; then
-          rm -f -- "$MANUAL_FULL_REQUEST_FILE"
-          echo "[MANUAL] On-demand full scan finished successfully; request consumed." | tee -a "$SCANLOG"
+          consume_manual_request_if_matching "FULL" "$MANUAL_FULL_REQUEST_FILE" "$FULL_REQUEST_ID"
         fi
 
         if [ "$FORCE" -eq 1 ] && [ -f "$FORCE_FULL_FLAG" ] && [ "$FULL_ADVANCES_CHECKPOINTS" -eq 1 ]; then
           rm -f -- "$FORCE_FULL_FLAG"
           echo "[FORCE] Flag consumed (deleted): $FORCE_FULL_FLAG" | tee -a "$SCANLOG"
         fi
+
+        emit_scheduled_recovery "Scheduled scanning recovered after a successful full scan" || true
+        NEXT_FULL_RETRY_EPOCH=0
+        echo "=== FULL SCAN finished ===" | tee -a "$SCANLOG"
       else
         NEXT_FULL_RETRY_EPOCH=$(( $(date +%s) + SCAN_FAILURE_RETRY_INTERVAL ))
         if [ "$FULL_MANUAL_REQUEST" -eq 1 ]; then
@@ -1505,17 +1778,24 @@ while true; do
 
   if [ "$CHANGED_DUE" -eq 1 ] && [ "$CYCLE_ABORT" -eq 0 ]; then
     echo "=== CHANGED-FILES scan starting ===" | tee -a "$SCANLOG"
-    CHANGED_LIST="$TMP_DIR/changed_list.nul"
     CHANGED_SCAN_CUTOFF=$(date +%s)
     CHANGED_REFERENCE_EPOCH="$LAST_CHANGED_EPOCH"
     CHANGED_TARGET_PATHS="$SCAN_PATHS"
     CHANGED_IGNORE_PATHS=""
     CHANGED_BUILD_MODE="scan_paths"
+    CHANGED_ADVANCES_CHECKPOINTS=1
+    CHANGED_REQUEST_MODE="scheduled"
+    CHANGED_REQUEST_IDENTITY="scheduled-changed:${CHANGED_REFERENCE_EPOCH}"
+    CHANGED_REQUEST_ID=""
 
     if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
       CHANGED_REFERENCE_EPOCH="$MANUAL_CHANGED_REFERENCE_EPOCH"
       [ -n "$MANUAL_CHANGED_REQUEST_TARGET_PATHS" ] && CHANGED_TARGET_PATHS="$MANUAL_CHANGED_REQUEST_TARGET_PATHS"
       CHANGED_IGNORE_PATHS="$MANUAL_CHANGED_REQUEST_IGNORE_PATHS"
+      CHANGED_ADVANCES_CHECKPOINTS=0
+      CHANGED_REQUEST_MODE="manual-changed"
+      CHANGED_REQUEST_ID="$MANUAL_CHANGED_REQUEST_ID"
+      CHANGED_REQUEST_IDENTITY="manual-changed:${CHANGED_REQUEST_ID}"
       if [ -n "$MANUAL_CHANGED_REQUEST_TARGET_PATHS" ]; then
         CHANGED_BUILD_MODE="target_paths"
       fi
@@ -1524,29 +1804,54 @@ while true; do
       echo "[MANUAL] Starting on-demand changed scan from reference epoch ${CHANGED_REFERENCE_EPOCH} over target paths ${CHANGED_TARGET_PATHS} with ignore paths ${IGNORE_DESC}." | tee -a "$SCANLOG"
     fi
 
-    if [ "$CHANGED_BUILD_MODE" = "target_paths" ]; then
-      CHANGED_BUILD_OK=0
-      if build_targeted_scan_list "CHANGED" "$CHANGED_LIST" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_TARGET_PATHS" "$CHANGED_IGNORE_PATHS"; then
-        CHANGED_BUILD_OK=1
-      else
-        RC=$?
+    CHANGED_BUILD_OK=0
+    CHANGED_FINGERPRINT=$(scan_progress_fingerprint "CHANGED" "$CHANGED_BUILD_MODE" "$CHANGED_TARGET_PATHS" "$CHANGED_IGNORE_PATHS" "$CHANGED_ADVANCES_CHECKPOINTS")
+    CHANGED_PREPARE_ATTEMPTS=0
+    while [ "$CHANGED_BUILD_OK" -eq 0 ] && [ "$CHANGED_PREPARE_ATTEMPTS" -lt 2 ]; do
+      CHANGED_PREPARE_ATTEMPTS=$((CHANGED_PREPARE_ATTEMPTS + 1))
+      if ! prepare_scan_progress "CHANGED" "$CHANGED_FINGERPRINT" "$CHANGED_SCAN_CUTOFF" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_REQUEST_IDENTITY" "$CHANGED_REQUEST_MODE"; then
+        RC=1
+        break
       fi
-    else
-      CHANGED_BUILD_OK=0
-      if build_scan_list "CHANGED" "$CHANGED_LIST" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_IGNORE_PATHS"; then
-        CHANGED_BUILD_OK=1
+
+      CHANGED_SCAN_ID="$PROGRESS_SCAN_ID"
+      CHANGED_SCAN_CUTOFF="$PROGRESS_CUTOFF_EPOCH"
+      CHANGED_REFERENCE_EPOCH="$PROGRESS_REFERENCE_EPOCH"
+      CHANGED_LIST="$PROGRESS_FILES_NUL"
+      CHANGED_RESULTS="$PROGRESS_COMPLETED_JSONL"
+      CHANGED_ROOT_GUARD="$PROGRESS_ROOTS_JSON"
+
+      if [ "$PROGRESS_ACTION" = "RESUME" ]; then
+        echo "[CHANGED] Restart-safe progress found: completed_records=${PROGRESS_COMPLETED_RECORDS} original_cutoff=${CHANGED_SCAN_CUTOFF} reference_epoch=${CHANGED_REFERENCE_EPOCH}." | tee -a "$SCANLOG"
+        if resume_manifest_is_safe "CHANGED" "$CHANGED_ROOT_GUARD" "$CHANGED_SCAN_ID"; then
+          CHANGED_BUILD_OK=1
+        else
+          RC=$?
+          if [ "$RC" -eq 3 ] && [ "$CHANGED_PREPARE_ATTEMPTS" -lt 2 ]; then
+            CHANGED_SCAN_CUTOFF=$(date +%s)
+            continue
+          fi
+        fi
+      elif [ "$CHANGED_BUILD_MODE" = "target_paths" ]; then
+        if build_targeted_scan_list "CHANGED" "$CHANGED_LIST" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_TARGET_PATHS" "$CHANGED_IGNORE_PATHS" "$CHANGED_ROOT_GUARD" && mark_scan_progress_ready "CHANGED"; then
+          CHANGED_BUILD_OK=1
+        else
+          RC=$?
+        fi
       else
-        RC=$?
+        if build_scan_list "CHANGED" "$CHANGED_LIST" "$CHANGED_REFERENCE_EPOCH" "$CHANGED_IGNORE_PATHS" "$CHANGED_ROOT_GUARD" && mark_scan_progress_ready "CHANGED"; then
+          CHANGED_BUILD_OK=1
+        else
+          RC=$?
+        fi
       fi
-    fi
+      break
+    done
 
     if [ "$CHANGED_BUILD_OK" -eq 1 ]; then
-      if run_scan_list "$CHANGED_LIST" "CHANGED" "$CHANGED_SCAN_PARALLEL_JOBS" "$CHANGED_CHUNK_SIZE" "$CHANGED_PROGRESS_STEPS"; then
+      if run_scan_list "$CHANGED_LIST" "CHANGED" "$CHANGED_SCAN_PARALLEL_JOBS" "$CHANGED_CHUNK_SIZE" "$CHANGED_PROGRESS_STEPS" "$CHANGED_RESULTS" "$CHANGED_ROOT_GUARD" "$CHANGED_SCAN_ID"; then
         NEXT_CHANGED_RETRY_EPOCH=0
-        if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
-          rm -f -- "$MANUAL_CHANGED_REQUEST_FILE"
-          echo "[MANUAL] On-demand changed scan finished successfully; request consumed." | tee -a "$SCANLOG"
-        else
+        if [ "$CHANGED_MANUAL_REQUEST" -eq 0 ]; then
           if ! update_checkpoints "$LAST_FULL_EPOCH" "$CHANGED_SCAN_CUTOFF"; then
             echo "[ERROR] Atomic checkpoint update failed after the changed-files scan; stopping so it will be retried." | tee -a "$SCANLOG"
             mark_scheduled_failure || true
@@ -1554,6 +1859,16 @@ while true; do
             exit 1
           fi
           LAST_CHANGED_EPOCH="$CHANGED_SCAN_CUTOFF"
+        fi
+
+        # See the full-scan ordering above: do not remove a manual request
+        # until the corresponding durable session is safely retired.
+        if ! clear_scan_progress "CHANGED" "$CHANGED_SCAN_ID"; then
+          exit 1
+        fi
+
+        if [ "$CHANGED_MANUAL_REQUEST" -eq 1 ]; then
+          consume_manual_request_if_matching "CHANGED" "$MANUAL_CHANGED_REQUEST_FILE" "$CHANGED_REQUEST_ID"
         fi
         emit_scheduled_recovery "Scheduled scanning recovered after a successful changed-file scan" || true
       else
